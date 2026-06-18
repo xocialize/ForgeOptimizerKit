@@ -28,7 +28,10 @@ let package = Package(
         // Thin CLI over the library — the "library + thin CLI" form factor (PRD §3). No arg-parser dep.
         .executableTarget(
             name: "forge",
-            dependencies: ["ForgeOptimizerKit"],
+            dependencies: [
+                "ForgeOptimizerKit",
+                .product(name: "MediaMeasure", package: "media-bridge"),   // for `forge score` (SSIMULACRA2 parity)
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(name: "ForgeOptimizerKitTests", dependencies: ["ForgeOptimizerKit"]),

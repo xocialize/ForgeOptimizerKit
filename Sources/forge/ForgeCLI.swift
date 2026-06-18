@@ -1,5 +1,8 @@
 import Foundation
+import CoreGraphics
+import ImageIO
 import ForgeOptimizerKit
+import MediaMeasure
 
 // `forge` — a thin CLI over ForgeOptimizerKit, dependency-free (no swift-argument-parser, to stay
 // minimal/net-clean). Phase A surfaces the two file-based verbs; `conform` is in-memory glue.
@@ -57,6 +60,17 @@ struct ForgeCLI {
                     }
                 }
 
+            case "score":
+                // Our pure-Swift SSIMULACRA2 on a (reference, distorted) pair — for parity diffing
+                // against the canonical libjxl `ssimulacra2` binary. Same dimensions required.
+                guard args.count >= 3 else { usage(); exit(2) }
+                guard let ref = loadCGImage(URL(fileURLWithPath: args[1])),
+                      let dist = loadCGImage(URL(fileURLWithPath: args[2])) else {
+                    FileHandle.standardError.write(Data("error: could not load image(s)\n".utf8)); exit(1)
+                }
+                let score = try SSIMULACRA2.score(reference: ref, distorted: dist)
+                print(String(format: "%.4f", score))
+
             default:
                 usage(); exit(2)
             }
@@ -87,6 +101,7 @@ struct ForgeCLI {
           forge analyze  <file>
           forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
           forge sweep    <file-or-dir>    re-baseline CSV: each image × all presets
+          forge score    <ref> <distorted>   our SSIMULACRA2 (parity-diff vs canonical)
 
         """.utf8))
     }
@@ -111,6 +126,11 @@ struct ForgeCLI {
     }
 
     static func pct(_ f: Double) -> String { String(format: "%.0f%%", f * 100) }
+
+    static func loadCGImage(_ url: URL) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
 
     static func statusWord(_ s: Status) -> String {
         switch s {
