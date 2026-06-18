@@ -39,6 +39,24 @@ struct ForgeCLI {
                 print("— \(s.optimized) optimized · \(s.skipped) skipped · \(s.failed) failed · "
                       + "saved \(pct(s.savedFraction)) (\(bytes(s.bytesIn)) → \(bytes(s.bytesOut)))")
 
+            case "sweep":
+                // Re-baseline harness: every image × {max, balanced, aggressive} → CSV. Measures in
+                // memory (no files written). Stills only (.inMemory video is unsupported in Phase A).
+                guard args.count >= 2 else { usage(); exit(2) }
+                let files = imageFiles(under: URL(fileURLWithPath: args[1]))
+                print("file,preset,floor,ssimu2,before_bytes,after_bytes,saved_fraction,status")
+                for f in files {
+                    for (name, q): (String, QualityTarget) in
+                        [("max", .max), ("balanced", .balanced), ("aggressive", .aggressive)] {
+                        for await r in try forge.optimize(.url(f), to: .inMemory, Options(quality: q)) {
+                            let score = r.after.qualityScore.map { String(format: "%.2f", $0) } ?? ""
+                            print("\(f.lastPathComponent),\(name),\(Int(q.floor)),\(score),"
+                                  + "\(r.before.bytes),\(r.after.bytes),"
+                                  + "\(String(format: "%.4f", r.savedFraction)),\(statusWord(r.status))")
+                        }
+                    }
+                }
+
             default:
                 usage(); exit(2)
             }
@@ -68,6 +86,7 @@ struct ForgeCLI {
         forge — ForgeOptimizer CLI (Phase A)
           forge analyze  <file>
           forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
+          forge sweep    <file-or-dir>    re-baseline CSV: each image × all presets
 
         """.utf8))
     }
@@ -92,4 +111,26 @@ struct ForgeCLI {
     }
 
     static func pct(_ f: Double) -> String { String(format: "%.0f%%", f * 100) }
+
+    static func statusWord(_ s: Status) -> String {
+        switch s {
+        case .optimized: return "optimized"
+        case .skipped: return "skipped"
+        case .failed: return "failed"
+        }
+    }
+
+    /// A single image, or all images directly under a directory (sorted, non-recursive).
+    static func imageFiles(under root: URL) -> [URL] {
+        let fm = FileManager.default
+        let exts: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "tiff", "tif"]
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else { return [] }
+        if !isDir.boolValue {
+            return exts.contains(root.pathExtension.lowercased()) ? [root] : []
+        }
+        let items = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+        return items.filter { exts.contains($0.pathExtension.lowercased()) }
+                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
 }

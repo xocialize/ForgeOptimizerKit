@@ -4,6 +4,12 @@ import CoreGraphics
 // conform — the in-memory inter-segment glue (PRD §"conform"). Resize/crop an artifact to the next
 // pipeline stage's input spec. Phase A is image + `.fast` (CoreGraphics high-quality resample, fully
 // headless — no CoreImage/Metal). `.quality` upscales route through Real-ESRGAN in Phase B.
+//
+// METAL-FRIENDLY DIRECTION (CLAUDE.md doctrine): this `CGImage` form is the headless/CLI + stills
+// backend and the CPU fallback. The real pipeline/preview currency is `CVPixelBuffer`/`IOSurface`
+// (GPU-resident, zero-copy with Metal + the MetalView preview). The `CVPixelBuffer` conform form, with
+// a Metal-backed resampler (CoreImage Metal `CIContext` / MPS), lands with the frame loop / UI — built
+// Metal-first. Keep this `CGImage` path as the fallback even then.
 
 public extension ForgeOptimizer {
 
