@@ -26,18 +26,24 @@ public enum Destination: Sendable {
 
 // MARK: - Options
 
-/// The perceptual floor an `optimize` must clear — an SSIMULACRA2 score in [0, 100].
+/// The perceptual floor an `optimize` must clear — an SSIMULACRA2 score in [0, 100], anchored to the
+/// metric authors' MOS scale (cloudinary/ssimulacra2): 70 = high ("artifacts perceptible, but not
+/// annoying" — the `cjxl -d 2.5` distribution standard) · 80 = very high (not noticeable side-by-side)
+/// · 85 = excellent (not noticeable in-place) · 90 = visually lossless (not noticeable in a flicker
+/// test). The ladder is deliberately *spread* across that range so the tiers actually differentiate —
+/// the old clustered 90/85/80 all sat in "indistinguishable" territory (no room to compress).
+/// NB: brand-sensitive signage may warrant a higher-floor profile (see Corpus/README re-baseline).
 public enum QualityTarget: Sendable {
-    case max          // ≥ 90 — visually lossless
-    case balanced     // ≥ 85 — default
-    case aggressive   // ≥ 80 — smallest acceptable
+    case max          // ≥ 90 — visually lossless (hero / archival)
+    case balanced     // ≥ 80 — very high, not noticeable side-by-side (default)
+    case aggressive   // ≥ 70 — high; the standard distribution target (smallest acceptable)
     case custom(Double)
 
     public var floor: Double {
         switch self {
         case .max: return 90
-        case .balanced: return 85
-        case .aggressive: return 80
+        case .balanced: return 80
+        case .aggressive: return 70
         case .custom(let v): return v
         }
     }
