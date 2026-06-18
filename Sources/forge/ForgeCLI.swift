@@ -68,7 +68,12 @@ struct ForgeCLI {
                       let dist = loadCGImage(URL(fileURLWithPath: args[2])) else {
                     FileHandle.standardError.write(Data("error: could not load image(s)\n".utf8)); exit(1)
                 }
-                let score = try SSIMULACRA2.score(reference: ref, distorted: dist)
+                let score: Double
+                if args.contains("--metal"), let gpu = SSIMULACRA2Metal() {
+                    score = try gpu.score(reference: ref, distorted: dist)   // GPU blur backend
+                } else {
+                    score = try SSIMULACRA2.score(reference: ref, distorted: dist)
+                }
                 print(String(format: "%.4f", score))
 
             default:
