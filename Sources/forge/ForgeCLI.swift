@@ -76,6 +76,17 @@ struct ForgeCLI {
                 }
                 print(String(format: "%.4f", score))
 
+            case "vscore":
+                // Per-frame SSIMULACRA2 of a video pair (same resolution), aggregated. GPU-scored.
+                guard args.count >= 3 else { usage(); exit(2) }
+                let stride = args.firstIndex(of: "--stride").flatMap {
+                    args.count > $0 + 1 ? Int(args[$0 + 1]) : nil } ?? 24
+                let vs = try VideoQuality.videoScore(reference: URL(fileURLWithPath: args[1]),
+                                                     distorted: URL(fileURLWithPath: args[2]),
+                                                     sampleStride: stride)
+                print(String(format: "mean %.2f · min %.2f · p10 %.2f · %d frames scored",
+                             vs.mean, vs.minimum, vs.p10, vs.framesScored))
+
             default:
                 usage(); exit(2)
             }
