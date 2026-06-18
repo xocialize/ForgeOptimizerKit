@@ -82,6 +82,42 @@ final class ForgeOptimizerKitTests: XCTestCase {
         XCTAssertTrue(results.contains { if case .failed = $0.status { return true }; return false })
     }
 
+    func testEnhanceSeamRunsBeforeEncode() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let src = tmp.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(96, 96), to: src)
+        let out = tmp.appendingPathComponent("out")
+
+        // enhance ON + an enhancer that doubles dimensions → it runs, the upscaled image flows into
+        // encode (after.width == 192), recipe records restore + upscale.
+        let forge = ForgeOptimizer(enhancer: DoublingEnhancer())
+        var on: [OptimizeResult] = []
+        for await r in try forge.optimize(.url(src), to: .directory(out),
+                                          Options(quality: .balanced, enhance: .on, upscale: .x2)) {
+            on.append(r)
+        }
+        let r = try XCTUnwrap(on.first)
+        XCTAssertEqual(r.after.width, 192)
+        XCTAssertEqual(r.after.height, 192)
+        XCTAssertTrue(r.recipe.restored)
+        XCTAssertEqual(r.recipe.upscaled, 2)
+
+        // enhance OFF → the enhancer is NOT applied (dims unchanged, recipe.restored == false).
+        let off = ForgeOptimizer(enhancer: DoublingEnhancer())
+        var offResults: [OptimizeResult] = []
+        for await r in try off.optimize(.url(src), to: .directory(out),
+                                        Options(quality: .balanced, enhance: .off)) {
+            offResults.append(r)
+        }
+        let r2 = try XCTUnwrap(offResults.first)
+        XCTAssertEqual(r2.after.width, 96)
+        XCTAssertFalse(r2.recipe.restored)
+    }
+
     // MARK: - Fixtures
 
     private let forge = ForgeOptimizer()
@@ -112,5 +148,21 @@ private extension ForgeOptimizer {
     /// Test convenience: optimize a URL list into a directory.
     func optimizeStream(_ urls: [URL], into dir: URL) throws -> AsyncStream<OptimizeResult> {
         try optimize(.urls(urls), to: .directory(dir))
+    }
+}
+
+/// Test enhancer: doubles the image dimensions (stands in for an engine restore/upscale).
+private struct DoublingEnhancer: ImageEnhancer {
+    func enhance(_ image: CGImage, options: Options) async throws -> CGImage {
+        let w = image.width * 2, h = image.height * 2
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return image
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? image
     }
 }

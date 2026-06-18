@@ -11,7 +11,13 @@ import MediaMeasure
 /// build + test from the CLI. The engine (enhance, perceptual analyze, `.quality` conform) is Phase B.
 public struct ForgeOptimizer: Sendable {
 
-    public init() {}
+    /// Phase-B engine-backed restore/upscale (supplied by the UI/app layer). `nil` = media-bridge-only;
+    /// the Kit stays engine-free. Applied before encode when `Options.enhance != .off`.
+    private let enhancer: (any ImageEnhancer)?
+
+    public init(enhancer: (any ImageEnhancer)? = nil) {
+        self.enhancer = enhancer
+    }
 
     // MARK: - analyze (read-only)
 
@@ -94,19 +100,18 @@ public struct ForgeOptimizer: Sendable {
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date) async throws -> OptimizeResult {
         switch mediaKind(of: url) {
-        case .image: return try optimizeImage(url, to: destination, options, start: start)
+        case .image: return try await optimizeImage(url, to: destination, options, start: start)
         case .video: return try await optimizeVideo(url, to: destination, options, start: start)
         case .unknown: throw ForgeError.unsupportedMedia(url)
         }
     }
 
-    /// Image path: target-quality HEIC via media-bridge's SSIMULACRA2-guided search. The headline.
+    /// Image path: optional engine enhance → target-quality HEIC via media-bridge's SSIMULACRA2 search.
     private func optimizeImage(_ url: URL, to destination: Destination, _ options: Options,
-                               start: Date) throws -> OptimizeResult {
+                               start: Date) async throws -> OptimizeResult {
         let inBytes = fileSize(url)
-        guard let cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
+        guard var cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
 
-        let encoded = try ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor)
         var recipe = AppliedRecipe()
         recipe.codec = "HEIC"
         recipe.qualityFloor = options.quality.floor
@@ -114,8 +119,22 @@ public struct ForgeOptimizer: Sendable {
 
         let before = MediaStats(bytes: inBytes, width: cg.width, height: cg.height)
 
-        // Honest skip: if the target-quality re-encode isn't smaller, keep the original.
-        guard encoded.data.count < inBytes else {
+        // Phase B: engine-backed restore/upscale before encode (opt-in + enhancer present).
+        let enhanced = options.enhance != .off && enhancer != nil
+        if enhanced, let enhancer {
+            cg = try await enhancer.enhance(cg, options: options)
+            recipe.restored = true
+            switch options.upscale {
+            case .none: break
+            case .x2: recipe.upscaled = 2
+            case .x4: recipe.upscaled = 4
+            }
+        }
+
+        let encoded = try ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor)
+
+        // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
+        guard enhanced || encoded.data.count < inBytes else {
             return OptimizeResult(
                 input: url, kind: .image, output: .none, recipe: recipe, before: before,
                 after: MediaStats(bytes: inBytes, width: cg.width, height: cg.height,
