@@ -76,6 +76,17 @@ struct ForgeCLI {
                 }
                 print(String(format: "%.4f", score))
 
+            case "voptimize":
+                // Video target-quality: smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor.
+                guard args.count >= 4 else { usage(); exit(2) }
+                let floor = quality(from: args).floor
+                let r = try await VideoQualityTarget.encode(input: URL(fileURLWithPath: args[1]),
+                                                            output: URL(fileURLWithPath: args[2]),
+                                                            targetScore: floor)
+                print(String(format: "✔ %.1f Mbps · p10 %.1f · %@ → %@ (−%.0f%%) · met=%@",
+                             Double(r.bitrate) / 1_000_000, r.score, bytes(r.inputBytes), bytes(r.outputBytes),
+                             r.savedFraction * 100, r.metTarget ? "yes" : "no"))
+
             case "vscore":
                 // Per-frame SSIMULACRA2 of a video pair (same resolution), aggregated. GPU-scored.
                 guard args.count >= 3 else { usage(); exit(2) }
