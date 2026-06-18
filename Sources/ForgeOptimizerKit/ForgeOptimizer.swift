@@ -154,24 +154,26 @@ public struct ForgeOptimizer: Sendable {
             status: .optimized, elapsed: Date().timeIntervalSince(start))
     }
 
-    /// Video path (Phase A): normalize → native HEVC mp4. Target-quality (SSIMULACRA2 floor search)
-    /// waits on media-bridge's per-frame aggregation — see LESSONS.md.
+    /// Video path: **target-quality** — smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor
+    /// (GPU-scored), audio passthrough-muxed. Same resolution, smaller, perceptually equivalent.
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date) async throws -> OptimizeResult {
-        let inBytes = fileSize(url)
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
-        let nr = try await MediaBridge.normalizeVideoToHEVC(input: url, output: outURL)
-        let outBytes = fileSize(outURL)
-
+        let r = try await VideoQualityTarget.encode(input: url, output: outURL,
+                                                    targetScore: options.quality.floor)
         var recipe = AppliedRecipe()
         recipe.codec = "HEVC"
         recipe.normalized = true
+        recipe.qualityFloor = options.quality.floor
 
+        let before = MediaStats(bytes: r.inputBytes, width: r.width, height: r.height)
+        let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
+                               qualityScore: r.score)
+        let didOptimize = r.metTarget && r.outputBytes < r.inputBytes
         return OptimizeResult(
-            input: url, kind: .video, output: .file(outURL), recipe: recipe,
-            before: MediaStats(bytes: inBytes, width: nr.width, height: nr.height),
-            after: MediaStats(bytes: outBytes, width: nr.width, height: nr.height),
-            status: outBytes < inBytes ? .optimized : .skipped("normalized output not smaller"),
+            input: url, kind: .video, output: .file(outURL), recipe: recipe, before: before, after: after,
+            status: didOptimize ? .optimized
+                                : .skipped(r.metTarget ? "not smaller than source" : "couldn't reach floor"),
             elapsed: Date().timeIntervalSince(start))
     }
 
