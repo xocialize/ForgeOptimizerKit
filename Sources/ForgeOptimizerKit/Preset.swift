@@ -57,10 +57,11 @@ public extension Preset {
 
 public extension Options {
     /// Build options from a named preset — the clean entry point for a host (Marquee Studio) wiring its
-    /// optimize action: `Options(preset: .visuallyLossless)`.
-    init(preset: Preset, enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
-         output: OutputFormat = .auto, stripMetadata: Bool = false) {
-        self.init(quality: preset.quality, enhance: enhance, upscale: upscale,
-                  output: output, stripMetadata: stripMetadata)
+    /// optimize action: `Options(preset: .visuallyLossless)` or `Options(preset: .visuallyLossless,
+    /// resolution: .maxHeight(1080))` to also step 4K→HD.
+    init(preset: Preset, resolution: ResolutionTarget = .source, enhance: EnhancePolicy = .off,
+         upscale: UpscaleFactor = .none, output: OutputFormat = .auto, stripMetadata: Bool = false) {
+        self.init(quality: preset.quality, resolution: resolution, enhance: enhance,
+                  upscale: upscale, output: output, stripMetadata: stripMetadata)
     }
 }

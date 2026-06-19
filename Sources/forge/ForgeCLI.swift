@@ -32,7 +32,7 @@ struct ForgeCLI {
                 guard args.count >= 3 else { usage(); exit(2) }
                 let url = URL(fileURLWithPath: args[1])
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
-                let options = Options(quality: quality(from: args))
+                let options = Options(quality: quality(from: args), resolution: resolution(from: args))
                 var results: [OptimizeResult] = []
                 for await r in try forge.optimize(.url(url), to: .directory(outDir), options) {
                     report(r)
@@ -78,13 +78,17 @@ struct ForgeCLI {
 
             case "voptimize":
                 // Video target-quality: smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor.
+                // `--max-height N` steps the resolution down (e.g. 1080 = 4K→HD) before the search.
                 guard args.count >= 4 else { usage(); exit(2) }
                 let floor = quality(from: args).floor
+                let maxH = args.firstIndex(of: "--max-height").flatMap {
+                    args.count > $0 + 1 ? Int(args[$0 + 1]) : nil }
                 let r = try await VideoQualityTarget.encode(input: URL(fileURLWithPath: args[1]),
                                                             output: URL(fileURLWithPath: args[2]),
-                                                            targetScore: floor)
-                print(String(format: "✔ %.1f Mbps · p10 %.1f · %@ → %@ (−%.0f%%) · met=%@",
-                             Double(r.bitrate) / 1_000_000, r.score, bytes(r.inputBytes), bytes(r.outputBytes),
+                                                            targetScore: floor, maxHeight: maxH)
+                print(String(format: "✔ %d×%d · %.1f Mbps · p10 %.1f · %@ → %@ (−%.0f%%) · met=%@",
+                             r.width, r.height, Double(r.bitrate) / 1_000_000, r.score,
+                             bytes(r.inputBytes), bytes(r.outputBytes),
                              r.savedFraction * 100, r.metTarget ? "yes" : "no"))
 
             case "vscore":
@@ -134,6 +138,12 @@ struct ForgeCLI {
     }
 
     // MARK: - Parsing / formatting
+
+    static func resolution(from args: [String]) -> ResolutionTarget {
+        guard let i = args.firstIndex(of: "--max-height"), i + 1 < args.count,
+              let h = Int(args[i + 1]) else { return .source }
+        return .maxHeight(h)
+    }
 
     static func quality(from args: [String]) -> QualityTarget {
         guard let i = args.firstIndex(of: "--quality"), i + 1 < args.count else { return .balanced }

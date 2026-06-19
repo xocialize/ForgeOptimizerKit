@@ -155,18 +155,20 @@ public struct ForgeOptimizer: Sendable {
     }
 
     /// Video path: **target-quality** — smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor
-    /// (GPU-scored), audio passthrough-muxed. Same resolution, smaller, perceptually equivalent.
+    /// (GPU-scored), audio passthrough-muxed, colour preserved. Same resolution by default; `options.
+    /// resolution = .maxHeight(_)` steps it down (4K→HD), quality measured at the target resolution.
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date) async throws -> OptimizeResult {
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let r = try await VideoQualityTarget.encode(input: url, output: outURL,
-                                                    targetScore: options.quality.floor)
+                                                    targetScore: options.quality.floor,
+                                                    maxHeight: options.resolution.maxHeight)
         var recipe = AppliedRecipe()
         recipe.codec = "HEVC"
         recipe.normalized = true
         recipe.qualityFloor = options.quality.floor
 
-        let before = MediaStats(bytes: r.inputBytes, width: r.width, height: r.height)
+        let before = MediaStats(bytes: r.inputBytes, width: r.sourceWidth, height: r.sourceHeight)
         let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
                                qualityScore: r.score)
         let didOptimize = r.metTarget && r.outputBytes < r.inputBytes

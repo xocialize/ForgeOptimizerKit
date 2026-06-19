@@ -53,17 +53,29 @@ public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors o
 public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
 public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }  // `.auto` = per media kind
 
+/// Resolution stepping for `optimize` (video). `.source` keeps native resolution (same-res target-quality);
+/// `.maxHeight` steps down to ≤ that height (4K→HD), aspect preserved, never upscaling — the SR/upscale
+/// direction is the enhance path. Quality is measured at the *target* resolution.
+public enum ResolutionTarget: Sendable {
+    case source
+    case maxHeight(Int)   // e.g. .maxHeight(1080) = ≤ 1080p, .maxHeight(720) = ≤ 720p
+
+    public var maxHeight: Int? { if case .maxHeight(let h) = self { return h }; return nil }
+}
+
 public struct Options: Sendable {
     public var quality: QualityTarget
+    public var resolution: ResolutionTarget
     public var enhance: EnhancePolicy
     public var upscale: UpscaleFactor
     public var output: OutputFormat
     public var stripMetadata: Bool
 
-    public init(quality: QualityTarget = .balanced, enhance: EnhancePolicy = .off,
-                upscale: UpscaleFactor = .none, output: OutputFormat = .auto,
-                stripMetadata: Bool = false) {
+    public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
+                enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
+                output: OutputFormat = .auto, stripMetadata: Bool = false) {
         self.quality = quality
+        self.resolution = resolution
         self.enhance = enhance
         self.upscale = upscale
         self.output = output
