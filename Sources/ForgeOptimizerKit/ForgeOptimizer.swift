@@ -97,6 +97,41 @@ public struct ForgeOptimizer: Sendable {
         }
     }
 
+    /// Pipeline entry: each `OptimizeRequest` names its **exact output URL** and an optional `context`
+    /// token (echoed on the result). Per-item failures are isolated. `progress` is **stubbed** — only the
+    /// terminal `.searching`(0) → `.finalizing`(1) bookends fire today (per-iteration granularity is the
+    /// deferred implementation). Single-flight + busy-rejection live in `ForgeOptimizerService`, not here.
+    public func optimize(_ requests: [OptimizeRequest],
+                         progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        -> AsyncStream<OptimizeResult> {
+        AsyncStream { continuation in
+            Task {
+                for req in requests {
+                    let start = Date()
+                    progress?(OptimizeProgress(context: req.context, input: req.input,
+                                               phase: .searching, fraction: 0))
+                    do {
+                        try prepareDestination(.fileURL(req.output))
+                        let r = try await optimizeOne(req.input, to: .fileURL(req.output), req.options,
+                                                      start: start)
+                        continuation.yield(r.with(context: req.context))
+                    } catch {
+                        let bytes = fileSize(req.input)
+                        continuation.yield(OptimizeResult(
+                            input: req.input, kind: mediaKind(of: req.input), output: .none,
+                            recipe: AppliedRecipe(), before: MediaStats(bytes: bytes, width: 0, height: 0),
+                            after: MediaStats(bytes: bytes, width: 0, height: 0),
+                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start),
+                            context: req.context))
+                    }
+                    progress?(OptimizeProgress(context: req.context, input: req.input,
+                                               phase: .finalizing, fraction: 1))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date) async throws -> OptimizeResult {
         switch mediaKind(of: url) {
@@ -200,8 +235,14 @@ public struct ForgeOptimizer: Sendable {
     }
 
     private func prepareDestination(_ destination: Destination) throws {
-        if case .directory(let dir) = destination {
+        switch destination {
+        case .directory(let dir):
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        case .fileURL(let url):
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+        case .alongside, .inMemory:
+            break
         }
     }
 
@@ -221,6 +262,9 @@ public struct ForgeOptimizer: Sendable {
                          .appendingPathExtension(ext)
             try data.write(to: out)
             return .file(out)
+        case .fileURL(let url):                          // host-dictated exact path
+            try data.write(to: url)
+            return .file(url)
         }
     }
 
@@ -233,6 +277,8 @@ public struct ForgeOptimizer: Sendable {
             let stem = input.deletingPathExtension().lastPathComponent + suffix
             return input.deletingLastPathComponent().appendingPathComponent(stem)
                         .appendingPathExtension("mp4")
+        case .fileURL(let url):                          // host-dictated exact path
+            return url
         case .inMemory:
             throw ForgeError.notImplemented("video optimize to .inMemory (Phase A: use a directory)")
         }

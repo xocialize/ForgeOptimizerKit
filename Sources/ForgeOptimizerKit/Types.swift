@@ -21,6 +21,7 @@ public enum Source: Sendable {
 public enum Destination: Sendable {
     case directory(URL)             // write `<stem>.<ext>` into this folder (created if missing)
     case alongside(suffix: String)  // write next to the input, filename + suffix
+    case fileURL(URL)               // write EXACTLY here (host-dictated; parent created) — the pipeline path
     case inMemory                   // return bytes in the receipt, write nothing
 }
 
@@ -80,6 +81,39 @@ public struct Options: Sendable {
         self.upscale = upscale
         self.output = output
         self.stripMetadata = stripMetadata
+    }
+}
+
+// MARK: - Pipeline request (host-dictated I/O)
+
+/// A single pipeline work item: the host names the **exact output URL** (content-addressed; Forge writes
+/// there, no post-move) and may attach an opaque `context` token echoed back on the result for entity
+/// correlation. The destination-based `optimize(_:to:_)` stays the convenience path; this is the seam a
+/// host (Marquee) drives. A future `operation:` field (which verb/chain to run) is deferred to the glue
+/// layer — the request object is where it will slot in.
+public struct OptimizeRequest: Sendable {
+    public var input: URL
+    public var output: URL
+    public var options: Options
+    public var context: String?
+
+    public init(input: URL, output: URL, options: Options = .init(), context: String? = nil) {
+        self.input = input; self.output = output; self.options = options; self.context = context
+    }
+}
+
+/// Progress for one item. **Stubbed:** the type + handler are defined so a host can wire a progress
+/// surface now; today only the terminal `.searching`(0) → `.finalizing`(1) bookends fire per item.
+/// Per-iteration fractions (and mid-encode cancellation) are the deferred implementation.
+public struct OptimizeProgress: Sendable {
+    public enum Phase: Sendable { case searching, encoding, scoring, finalizing }
+    public let context: String?
+    public let input: URL
+    public let phase: Phase
+    public let fraction: Double      // 0…1
+
+    public init(context: String?, input: URL, phase: Phase, fraction: Double) {
+        self.context = context; self.input = input; self.phase = phase; self.fraction = fraction
     }
 }
 
@@ -145,10 +179,27 @@ public struct OptimizeResult: Sendable {
     public let after: MediaStats
     public let status: Status
     public let elapsed: TimeInterval
+    /// Opaque correlation token echoed from the `OptimizeRequest` (nil on the destination-based path) — the
+    /// host maps a result back to its source entity without filename matching.
+    public let context: String?
+
+    public init(input: URL, kind: MediaKind, output: Output, recipe: AppliedRecipe,
+                before: MediaStats, after: MediaStats, status: Status, elapsed: TimeInterval,
+                context: String? = nil) {
+        self.input = input; self.kind = kind; self.output = output; self.recipe = recipe
+        self.before = before; self.after = after; self.status = status; self.elapsed = elapsed
+        self.context = context
+    }
 
     public var savedBytes: Int { max(0, before.bytes - after.bytes) }
     public var savedFraction: Double {
         before.bytes > 0 ? Double(savedBytes) / Double(before.bytes) : 0
+    }
+
+    /// Same result with a correlation token attached (used by the request-based pipeline path).
+    public func with(context: String?) -> OptimizeResult {
+        OptimizeResult(input: input, kind: kind, output: output, recipe: recipe, before: before,
+                       after: after, status: status, elapsed: elapsed, context: context)
     }
 }
 
@@ -226,6 +277,7 @@ public enum ForgeError: Error, CustomStringConvertible {
     case decodeFailed(URL)
     case renderFailed(String)
     case notImplemented(String)
+    case busy                       // single-flight: a run is already in progress (host owns any queueing)
 
     public var description: String {
         switch self {
@@ -233,6 +285,7 @@ public enum ForgeError: Error, CustomStringConvertible {
         case .decodeFailed(let u): return "decode failed: \(u.lastPathComponent)"
         case .renderFailed(let s): return "render failed: \(s)"
         case .notImplemented(let s): return "not implemented: \(s)"
+        case .busy: return "optimizer busy — a run is already in progress"
         }
     }
 }

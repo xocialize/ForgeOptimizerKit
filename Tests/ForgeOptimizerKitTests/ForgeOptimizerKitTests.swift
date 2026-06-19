@@ -118,6 +118,64 @@ final class ForgeOptimizerKitTests: XCTestCase {
         XCTAssertFalse(r2.recipe.restored)
     }
 
+    func testRequestPipelineWritesExactOutputAndEchoesContext() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let src = tmp.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(96, 96), to: src)
+        // nested + host-chosen filename → Forge must create the parent and write EXACTLY here.
+        let outURL = tmp.appendingPathComponent("variants/entity-42--visually-lossless.heic")
+
+        let req = OptimizeRequest(input: src, output: outURL,
+                                  options: Options(quality: .balanced), context: "entity-42")
+        var results: [OptimizeResult] = []
+        for await r in forge.optimize([req]) { results.append(r) }
+
+        let r = try XCTUnwrap(results.first)
+        XCTAssertEqual(r.context, "entity-42", "the correlation token must echo back")
+        guard case .file(let written) = r.output else { return XCTFail("expected .file output") }
+        XCTAssertEqual(written, outURL, "must write to the host-dictated exact URL")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
+    }
+
+    func testServiceIsSingleFlightAndRejectsWhileBusy() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let src = tmp.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(96, 96), to: src)
+
+        let service = ForgeOptimizerService()
+        let first = OptimizeRequest(input: src, output: tmp.appendingPathComponent("o1.heic"))
+        let second = OptimizeRequest(input: src, output: tmp.appendingPathComponent("o2.heic"))
+
+        // Start a run but DON'T drain it → the service stays .processing (release() is gated on draining).
+        let stream1 = try await service.optimize([first])
+        let busy = await service.isBusy
+        XCTAssertTrue(busy)
+
+        // A concurrent submission is rejected, not queued (host owns queueing).
+        do {
+            _ = try await service.optimize([second])
+            XCTFail("expected ForgeError.busy")
+        } catch ForgeError.busy {
+            // expected
+        }
+
+        // Drain → releases the lock; a fresh submission then succeeds.
+        for await _ in stream1 {}
+        let idle = await service.isBusy
+        XCTAssertFalse(idle)
+        var count = 0
+        for await _ in try await service.optimize([second]) { count += 1 }
+        XCTAssertEqual(count, 1)
+    }
+
     // MARK: - Fixtures
 
     private let forge = ForgeOptimizer()
