@@ -168,8 +168,8 @@ public struct ForgeOptimizer: Sendable {
 
         // GPU-accelerate the quality-target search's SSIMULACRA2 — full-GPU per-channel path (CPU
         // fallback when no Metal device).
-        let encoded = try ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
-                                                        channelScalars: SSIMULACRA2Metal.shared?.channelScalarsFunction)
+        let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
+                                                              channelScalars: SSIMULACRA2Metal.shared?.channelScalarsFunction)
 
         // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
         guard enhanced || encoded.data.count < inBytes else {
