@@ -206,11 +206,15 @@ public struct ForgeOptimizer: Sendable {
         let before = MediaStats(bytes: r.inputBytes, width: r.sourceWidth, height: r.sourceHeight)
         let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
                                qualityScore: r.score)
+        // `output` is `.none` unless we actually optimized — the encode leaves NO file at `outURL` on a miss,
+        // so the receipt must match (no `.file` pointing at a nonexistent / not-written path → no host orphan).
         let didOptimize = r.metTarget && r.outputBytes < r.inputBytes
         return OptimizeResult(
-            input: url, kind: .video, output: .file(outURL), recipe: recipe, before: before, after: after,
+            input: url, kind: .video, output: didOptimize ? .file(outURL) : .none,
+            recipe: recipe, before: before, after: after,
             status: didOptimize ? .optimized
-                                : .skipped(r.metTarget ? "not smaller than source" : "couldn't reach floor"),
+                                : .skipped(r.metTarget ? "not smaller than source"
+                                                       : "couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
             elapsed: Date().timeIntervalSince(start),
             outputType: didOptimize ? .mpeg4Movie : nil)   // HEVC-in-mp4
     }
