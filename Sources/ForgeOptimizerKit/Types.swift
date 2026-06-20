@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 // The ForgeOptimizer I/O contract (PRD §4). Three verbs — analyze / optimize / conform — share this
 // vocabulary. Everything here is value-typed + Sendable so it crosses the AsyncStream / actor seam.
@@ -91,6 +92,10 @@ public struct Options: Sendable {
 /// correlation. The destination-based `optimize(_:to:_)` stays the convenience path; this is the seam a
 /// host (Marquee) drives. A future `operation:` field (which verb/chain to run) is deferred to the glue
 /// layer — the request object is where it will slot in.
+///
+/// **`input` is strictly read-only (contract guarantee).** Forge READS the input and writes ONLY to
+/// `output` (+ its own temp dir) — it never writes, moves, renames, or mutates the input. A host with a
+/// write-once canonical original (Marquee's `Originals/`) can rely on it staying byte-identical.
 public struct OptimizeRequest: Sendable {
     public var input: URL
     public var output: URL
@@ -182,13 +187,18 @@ public struct OptimizeResult: Sendable {
     /// Opaque correlation token echoed from the `OptimizeRequest` (nil on the destination-based path) — the
     /// host maps a result back to its source entity without filename matching.
     public let context: String?
+    /// **Authoritative output container/type.** Forge's optimize container is opinionated — **HEIC for
+    /// stills, HEVC-in-mp4 for video** — independent of the `output` URL's extension. The host reads this to
+    /// set its `content_type` (`outputType?.preferredMIMEType`) + deliverable extension
+    /// (`outputType?.preferredFilenameExtension`). nil on `.skipped`/`.failed`.
+    public let outputType: UTType?
 
     public init(input: URL, kind: MediaKind, output: Output, recipe: AppliedRecipe,
                 before: MediaStats, after: MediaStats, status: Status, elapsed: TimeInterval,
-                context: String? = nil) {
+                context: String? = nil, outputType: UTType? = nil) {
         self.input = input; self.kind = kind; self.output = output; self.recipe = recipe
         self.before = before; self.after = after; self.status = status; self.elapsed = elapsed
-        self.context = context
+        self.context = context; self.outputType = outputType
     }
 
     public var savedBytes: Int { max(0, before.bytes - after.bytes) }
@@ -199,7 +209,8 @@ public struct OptimizeResult: Sendable {
     /// Same result with a correlation token attached (used by the request-based pipeline path).
     public func with(context: String?) -> OptimizeResult {
         OptimizeResult(input: input, kind: kind, output: output, recipe: recipe, before: before,
-                       after: after, status: status, elapsed: elapsed, context: context)
+                       after: after, status: status, elapsed: elapsed, context: context,
+                       outputType: outputType)
     }
 }
 

@@ -186,7 +186,7 @@ public struct ForgeOptimizer: Sendable {
             input: url, kind: .image, output: output, recipe: recipe, before: before,
             after: MediaStats(bytes: encoded.data.count, width: cg.width, height: cg.height,
                               qualityScore: encoded.score),
-            status: .optimized, elapsed: Date().timeIntervalSince(start))
+            status: .optimized, elapsed: Date().timeIntervalSince(start), outputType: .heic)
     }
 
     /// Video path: **target-quality** — smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor
@@ -211,7 +211,8 @@ public struct ForgeOptimizer: Sendable {
             input: url, kind: .video, output: .file(outURL), recipe: recipe, before: before, after: after,
             status: didOptimize ? .optimized
                                 : .skipped(r.metTarget ? "not smaller than source" : "couldn't reach floor"),
-            elapsed: Date().timeIntervalSince(start))
+            elapsed: Date().timeIntervalSince(start),
+            outputType: didOptimize ? .mpeg4Movie : nil)   // HEVC-in-mp4
     }
 
     // MARK: - Helpers (file + classification)

@@ -136,6 +136,7 @@ final class ForgeOptimizerKitTests: XCTestCase {
 
         let r = try XCTUnwrap(results.first)
         XCTAssertEqual(r.context, "entity-42", "the correlation token must echo back")
+        XCTAssertEqual(r.outputType, .heic, "the authoritative output type surfaces (still → HEIC)")
         guard case .file(let written) = r.output else { return XCTFail("expected .file output") }
         XCTAssertEqual(written, outURL, "must write to the host-dictated exact URL")
         XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
