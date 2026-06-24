@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -15,8 +16,13 @@ public struct ForgeOptimizer: Sendable {
     /// the Kit stays engine-free. Applied before encode when `Options.enhance != .off`.
     private let enhancer: (any ImageEnhancer)?
 
-    public init(enhancer: (any ImageEnhancer)? = nil) {
+    /// Phase-B optical-flow seam (SEA-RAFT) for temporally-consistent *video* upscale. `nil` → the video
+    /// upscale path runs per-frame SR without flicker stabilization (zero flow).
+    private let flowProvider: (any VideoFlowProvider)?
+
+    public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil) {
         self.enhancer = enhancer
+        self.flowProvider = flowProvider
     }
 
     // MARK: - analyze (read-only)
@@ -194,6 +200,12 @@ public struct ForgeOptimizer: Sendable {
     /// resolution = .maxHeight(_)` steps it down (4K→HD), quality measured at the target resolution.
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date) async throws -> OptimizeResult {
+        // Upscale is a *quality* op (HD→4K), the opposite of compression — when requested and an enhancer is
+        // present, run the temporally-consistent per-frame SR pipeline (V1: standalone HEVC deliverable).
+        if options.upscale != .none, let enhancer {
+            return try await upscaleVideo(url, to: destination, options, enhancer: enhancer, start: start)
+        }
+
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let r = try await VideoQualityTarget.encode(input: url, output: outURL,
                                                     targetScore: options.quality.floor,
@@ -217,6 +229,48 @@ public struct ForgeOptimizer: Sendable {
                                                        : "couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
             elapsed: Date().timeIntervalSince(start),
             outputType: didOptimize ? .mpeg4Movie : nil)   // HEVC-in-mp4
+    }
+
+    /// V4b — temporally-consistent video upscale: per-frame engine SR (the `ImageEnhancer`, applying the
+    /// requested upscale factor) + SEA-RAFT flow-guided stabilization, written as an opaque HEVC deliverable.
+    /// Standalone (V1): the upscaled clip IS the output — composing with the SSIMULACRA2 quality-target encode
+    /// is a later refinement. Net-clean: the SR + flow models are the injected seams.
+    private func upscaleVideo(_ url: URL, to destination: Destination, _ options: Options,
+                              enhancer: any ImageEnhancer, start: Date) async throws -> OptimizeResult {
+        let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        let flowProv = self.flowProvider
+        let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
+            input: url, output: outURL,
+            enhance: { try await enhancer.enhance($0, options: options) },
+            flow: { a, b in
+                if let flowProv { return try await flowProv.flow(a, b) }
+                return DenseFlow(width: a.width, height: a.height,
+                                 uv: [Float](repeating: 0, count: a.width * a.height * 2))   // no provider → no stabilization
+            })
+
+        let inBytes = fileSize(url), outBytes = fileSize(outURL)
+        let src = await Self.videoDimensions(url), dst = await Self.videoDimensions(outURL)
+        let ok = outcome.framesWritten > 0 && outBytes > 0
+        if !ok { try? FileManager.default.removeItem(at: outURL) }
+
+        var recipe = AppliedRecipe()
+        recipe.codec = "HEVC"
+        recipe.upscaled = options.upscale == .x4 ? 4 : 2
+        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
+        let after = MediaStats(bytes: outBytes, width: dst.w, height: dst.h)
+        return OptimizeResult(
+            input: url, kind: .video, output: ok ? .file(outURL) : .none,
+            recipe: recipe, before: before, after: after,
+            status: ok ? .optimized : .skipped("upscale produced no output"),
+            elapsed: Date().timeIntervalSince(start),
+            outputType: ok ? .mpeg4Movie : nil)
+    }
+
+    /// Pixel dimensions of a video's first video track (0×0 if unreadable).
+    static func videoDimensions(_ url: URL) async -> (w: Int, h: Int) {
+        guard let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize) else { return (0, 0) }
+        return (Int(abs(size.width).rounded()), Int(abs(size.height).rounded()))
     }
 
     // MARK: - Helpers (file + classification)

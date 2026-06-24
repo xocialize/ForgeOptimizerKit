@@ -2,6 +2,9 @@ import XCTest
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import AVFoundation
+import CoreVideo
+import MediaMeasure
 @testable import ForgeOptimizerKit
 
 /// Phase-A headless coverage: the image happy path (analyze → optimize → conform) against
@@ -177,9 +180,61 @@ final class ForgeOptimizerKitTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    /// Video upscale path (V4b): `optimize` on a clip with `upscale: .x2` + an injected enhancer routes to the
+    /// temporally-consistent SR pipeline → a larger HEVC deliverable, recipe records the upscale factor.
+    func testVideoUpscaleProducesLargerHEVC() async throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("fo-vup-\(UUID())")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("clip.mp4")
+        try makeClip(at: src, w: 64, h: 48, frames: 4)
+
+        let forge = ForgeOptimizer(enhancer: DoublingEnhancer(), flowProvider: ZeroFlowProvider())
+        var result: OptimizeResult?
+        for await r in try forge.optimize(.url(src), to: .directory(tmp),
+                                          Options(quality: .balanced, upscale: .x2)) { result = r }
+
+        let r = try XCTUnwrap(result)
+        XCTAssertEqual(r.kind, .video)
+        XCTAssertEqual(r.recipe.upscaled, 2)
+        XCTAssertEqual(r.after.width, 128, "2× width")
+        XCTAssertEqual(r.after.height, 96, "2× height")
+        guard case .file(let out) = r.output else { return XCTFail("expected a file output") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+    }
+
     // MARK: - Fixtures
 
     private let forge = ForgeOptimizer()
+
+    private func makeClip(at url: URL, w: Int, h: Int, frames: Int) throws {
+        let fps = 30
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h])
+        writer.add(input); writer.startWriting(); writer.startSession(atSourceTime: .zero)
+        for i in 0..<frames {
+            while !input.isReadyForMoreMediaData { usleep(500) }
+            var pb: CVPixelBuffer?
+            CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pb)
+            let buf = pb!
+            CVPixelBufferLockBaseAddress(buf, [])
+            if let base = CVPixelBufferGetBaseAddress(buf) {
+                let p = base.assumingMemoryBound(to: UInt8.self)
+                var seed = UInt32(truncatingIfNeeded: i &* 2654435761 | 1)
+                for j in 0..<(CVPixelBufferGetBytesPerRow(buf) * h) {
+                    seed = seed &* 1664525 &+ 1013904223; p[j] = UInt8(truncatingIfNeeded: seed >> 16)
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buf, [])
+            adaptor.append(buf, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+        }
+        input.markAsFinished()
+        let sem = DispatchSemaphore(value: 0); writer.finishWriting { sem.signal() }; sem.wait()
+    }
 
     private func makeGradientImage(_ w: Int, _ h: Int) -> CGImage {
         let cs = CGColorSpaceCreateDeviceRGB()
@@ -207,6 +262,13 @@ private extension ForgeOptimizer {
     /// Test convenience: optimize a URL list into a directory.
     func optimizeStream(_ urls: [URL], into dir: URL) throws -> AsyncStream<OptimizeResult> {
         try optimize(.urls(urls), to: .directory(dir))
+    }
+}
+
+/// Test flow provider: zero displacement (stands in for SEA-RAFT; static-scene flow).
+private struct ZeroFlowProvider: VideoFlowProvider {
+    func flow(_ a: CGImage, _ b: CGImage) async throws -> DenseFlow {
+        DenseFlow(width: a.width, height: a.height, uv: [Float](repeating: 0, count: a.width * a.height * 2))
     }
 }
 
