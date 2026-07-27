@@ -180,17 +180,57 @@ public struct MediaStats: Sendable {
 public struct AppliedRecipe: Sendable, CustomStringConvertible {
     public var normalized = false
     public var restored = false           // Phase B (NAFNet)
+    /// The factor actually applied, **measured from the output pixels** — never the factor requested.
+    ///
+    /// BRIDGE-040: a fixed-4× model asked for 2× produced 4× pixels while the receipt said 2×. That was
+    /// fixed in the model, but a receipt that reports the *request* is only ever accurate by luck — the
+    /// next model that cannot honour a scale reopens it. Measuring the artifact cannot be lied to by any
+    /// enhancer, present or future, and needs no cooperation from the enhance seam.
     public var upscaled: Int? = nil       // factor, Phase B (Real-ESRGAN / SeedVR2)
+    /// What the caller asked for, when it differs from `upscaled`. Non-nil means the model did not
+    /// honour the request — surfaced rather than silently normalised away.
+    public var upscaleRequested: Int? = nil
     public var codec: String? = nil       // output format, e.g. "HEIC" / "HEVC"
     public var qualityFloor: Double? = nil
 
     public init() {}
 
+    /// Set `upscaled` from the pixels that actually came back, and record the request when it differs.
+    ///
+    /// A ratio within 2% of 1.0 counts as "no upscale happened" — reported as nil rather than as the
+    /// requested factor, because claiming an upscale that did not occur is the original BRIDGE-040 lie
+    /// in its purest form.
+    public mutating func setUpscale(measuredFrom widthBefore: Int, to widthAfter: Int,
+                                    requested: UpscaleFactor) {
+        let asked: Int? = switch requested {
+        case .none: nil
+        case .x2: 2
+        case .x4: 4
+        }
+        guard widthBefore > 0, widthAfter > 0 else { upscaled = nil; return }
+        let ratio = Double(widthAfter) / Double(widthBefore)
+        guard ratio > 1.02 else {
+            upscaled = nil
+            // Asked for an upscale and did not get one: that is the divergence worth surfacing.
+            upscaleRequested = asked
+            return
+        }
+        let actual = Int(ratio.rounded())
+        upscaled = actual
+        upscaleRequested = (asked != nil && asked != actual) ? asked : nil
+    }
+
     public var description: String {
         var parts: [String] = []
         if normalized { parts.append("normalize") }
         if restored { parts.append("restore") }
-        if let f = upscaled { parts.append("upscale×\(f)") }
+        if let f = upscaled {
+            if let asked = upscaleRequested, asked != f {
+                parts.append("upscale×\(f) (asked ×\(asked))")
+            } else {
+                parts.append("upscale×\(f)")
+            }
+        }
         if let c = codec { parts.append("→\(c)") }
         if let q = qualityFloor { parts.append("@SSIMU2≥\(Int(q))") }
         return parts.isEmpty ? "passthrough" : parts.joined(separator: " ")

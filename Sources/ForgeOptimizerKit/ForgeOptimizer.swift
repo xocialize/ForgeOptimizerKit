@@ -163,13 +163,12 @@ public struct ForgeOptimizer: Sendable {
         // Phase B: engine-backed restore/upscale before encode (opt-in + enhancer present).
         let enhanced = options.enhance != .off && enhancer != nil
         if enhanced, let enhancer {
+            let widthBefore = cg.width
             cg = try await enhancer.enhance(cg, options: options)
             recipe.restored = true
-            switch options.upscale {
-            case .none: break
-            case .x2: recipe.upscaled = 2
-            case .x4: recipe.upscaled = 4
-            }
+            // Measured, not requested (BRIDGE-062). The enhance seam returns only a CGImage, so the
+            // artifact is the only thing that can be trusted about what happened to it.
+            recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
         }
 
         // GPU-accelerate the quality-target search's SSIMULACRA2 — full-GPU per-channel path (CPU
@@ -262,7 +261,7 @@ public struct ForgeOptimizer: Sendable {
 
         var recipe = AppliedRecipe()
         recipe.codec = "HEVC"
-        recipe.upscaled = options.upscale == .x4 ? 4 : 2
+        recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
         let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
         let after = MediaStats(bytes: outBytes, width: dst.w, height: dst.h)
         return OptimizeResult(
