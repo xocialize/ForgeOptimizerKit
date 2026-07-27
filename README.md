@@ -9,9 +9,9 @@ stack. Three verbs over one media foundation:
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (SSIMULACRA2-guided) · video → normalize |
 | **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
 
-**Phase A depends on [`media-bridge`](../media-bridge) only** — pure-Swift, FFmpeg-free, zero vendored
+**Phase A depends on [`media-bridge`](https://github.com/xocialize/media-bridge) only** — pure-Swift, FFmpeg-free, zero vendored
 binaries. It builds and tests headless (no MLX, no metallib). The MLXEngine (perceptual `analyze`,
-`enhance`, `.quality` `conform`) arrives in **Phase B**. See `../../FORGEOPTIMIZER-PRD.md`.
+`enhance`, `.quality` `conform`) arrives in **Phase B**. The perceptual/enhance tier lands via [`ForgeCore`](https://github.com/xocialize/ForgeCore).
 
 ## Use
 
