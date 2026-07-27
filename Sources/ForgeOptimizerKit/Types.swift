@@ -134,11 +134,45 @@ public struct MediaStats: Sendable {
     public let height: Int
     public var qualityScore: Double?     // achieved SSIMULACRA2 on the output side; nil otherwise
 
-    public init(bytes: Int, width: Int, height: Int, qualityScore: Double? = nil) {
+    /// How a **video** score was reduced to `qualityScore` — nil for stills, where the score IS the frame.
+    ///
+    /// A video floor gates on a percentile over a sample, and `qualityScore` alone cannot say so: it is
+    /// the same `Double` a still reports for its one frame. Carrying the reduction is what lets a receipt
+    /// distinguish "every frame cleared the floor" from "the 10th percentile cleared it and the worst
+    /// frame was well below" — both defensible, not the same claim (BRIDGE-061).
+    ///
+    /// **nil-for-stills is the point**: presence marks the number as an aggregate.
+    public struct QualityAggregation: Sendable {
+        public let percentile: Int
+        public let minimum: Double
+        public let mean: Double
+        public let framesScored: Int
+        public let frameCount: Int
+
+        public init(percentile: Int, minimum: Double, mean: Double,
+                    framesScored: Int, frameCount: Int) {
+            self.percentile = percentile
+            self.minimum = minimum
+            self.mean = mean
+            self.framesScored = framesScored
+            self.frameCount = frameCount
+        }
+
+        public var summary: String {
+            String(format: "p%d gate · min %.1f · mean %.1f · scored %d/%d frames",
+                   percentile, minimum, mean, framesScored, frameCount)
+        }
+    }
+
+    public var qualityAggregation: QualityAggregation?
+
+    public init(bytes: Int, width: Int, height: Int, qualityScore: Double? = nil,
+                qualityAggregation: QualityAggregation? = nil) {
         self.bytes = bytes
         self.width = width
         self.height = height
         self.qualityScore = qualityScore
+        self.qualityAggregation = qualityAggregation
     }
 }
 

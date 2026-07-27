@@ -216,8 +216,15 @@ public struct ForgeOptimizer: Sendable {
         recipe.qualityFloor = options.quality.floor
 
         let before = MediaStats(bytes: r.inputBytes, width: r.sourceWidth, height: r.sourceHeight)
+        // Carry the reduction, not just the gating number: a bare score cannot say it is a percentile
+        // over a sample, and this field being non-nil is what marks it as an aggregate (BRIDGE-061).
         let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
-                               qualityScore: r.score)
+                               qualityScore: r.score,
+                               qualityAggregation: .init(percentile: r.aggregation.percentile,
+                                                         minimum: r.aggregation.minimum,
+                                                         mean: r.aggregation.mean,
+                                                         framesScored: r.aggregation.framesScored,
+                                                         frameCount: r.aggregation.frameCount))
         // `output` is `.none` unless we actually optimized — the encode leaves NO file at `outURL` on a miss,
         // so the receipt must match (no `.file` pointing at a nonexistent / not-written path → no host orphan).
         let didOptimize = r.metTarget && r.outputBytes < r.inputBytes
