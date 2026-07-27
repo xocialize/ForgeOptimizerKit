@@ -244,6 +244,11 @@ public struct ForgeOptimizer: Sendable {
     private func upscaleVideo(_ url: URL, to destination: Destination, _ options: Options,
                               enhancer: any ImageEnhancer, start: Date) async throws -> OptimizeResult {
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        // Measure the SOURCE before the pipeline runs. `outURL` can resolve to the input's own path, in
+        // which case reading it afterwards reports the output's geometry as the input's — which is how
+        // `before` came to describe the file that replaced it.
+        let src = await Self.videoDimensions(url)
+        let inBytes = fileSize(url)
         let flowProv = self.flowProvider
         let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
             input: url, output: outURL,
@@ -254,8 +259,8 @@ public struct ForgeOptimizer: Sendable {
                                  uv: [Float](repeating: 0, count: a.width * a.height * 2))   // no provider → no stabilization
             })
 
-        let inBytes = fileSize(url), outBytes = fileSize(outURL)
-        let src = await Self.videoDimensions(url), dst = await Self.videoDimensions(outURL)
+        let outBytes = fileSize(outURL)
+        let dst = await Self.videoDimensions(outURL)
         let ok = outcome.framesWritten > 0 && outBytes > 0
         if !ok { try? FileManager.default.removeItem(at: outURL) }
 
