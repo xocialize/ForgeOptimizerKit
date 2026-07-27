@@ -363,11 +363,18 @@ public enum ForgeError: Error, CustomStringConvertible {
     case renderFailed(String)
     case notImplemented(String)
     case busy                       // single-flight: a run is already in progress (host owns any queueing)
+    /// The host named an output path equal to the input. Refused rather than honoured: `OptimizeRequest`
+    /// guarantees the input stays byte-identical, and a host relying on that (a write-once canonical
+    /// original) would lose it silently. Derived destinations disambiguate instead; only an *explicit*
+    /// `.fileURL` reaches here, because silently renaming an explicit instruction is its own dishonesty.
+    case outputWouldOverwriteInput(URL)
 
     public var description: String {
         switch self {
         case .unsupportedMedia(let u): return "unsupported media: \(u.lastPathComponent)"
         case .decodeFailed(let u): return "decode failed: \(u.lastPathComponent)"
+        case .outputWouldOverwriteInput(let u):
+            return "output would overwrite the input (\(u.lastPathComponent)); the input is read-only"
         case .renderFailed(let s): return "render failed: \(s)"
         case .notImplemented(let s): return "not implemented: \(s)"
         case .busy: return "optimizer busy — a run is already in progress"

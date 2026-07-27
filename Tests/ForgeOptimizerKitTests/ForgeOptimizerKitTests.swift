@@ -266,14 +266,14 @@ private extension ForgeOptimizer {
 }
 
 /// Test flow provider: zero displacement (stands in for SEA-RAFT; static-scene flow).
-private struct ZeroFlowProvider: VideoFlowProvider {
+struct ZeroFlowProvider: VideoFlowProvider {
     func flow(_ a: CGImage, _ b: CGImage) async throws -> DenseFlow {
         DenseFlow(width: a.width, height: a.height, uv: [Float](repeating: 0, count: a.width * a.height * 2))
     }
 }
 
 /// Test enhancer: doubles the image dimensions (stands in for an engine restore/upscale).
-private struct DoublingEnhancer: ImageEnhancer {
+struct DoublingEnhancer: ImageEnhancer {
     func enhance(_ image: CGImage, options: Options) async throws -> CGImage {
         let w = image.width * 2, h = image.height * 2
         let cs = CGColorSpaceCreateDeviceRGB()

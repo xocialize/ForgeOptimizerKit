@@ -316,38 +316,68 @@ public struct ForgeOptimizer: Sendable {
         }
     }
 
+
+    /// Keep a derived output off the input's own path.
+    ///
+    /// `<dir>/<stem>.<ext>` lands exactly on the input whenever the destination directory is the input's
+    /// own and the extensions agree — which silently consumed the file `OptimizeRequest` promises stays
+    /// byte-identical. A derived name is Forge's to choose, so it disambiguates; an explicitly named one
+    /// is the host's, so it throws.
+    static func disambiguating(_ candidate: URL, from input: URL) -> URL {
+        guard candidate.standardizedFileURL == input.standardizedFileURL else { return candidate }
+        let ext = candidate.pathExtension
+        return candidate.deletingPathExtension()
+            .appendingPathExtension("optimized")
+            .appendingPathExtension(ext)
+    }
+
     private func write(_ data: Data, for input: URL, ext: String,
                        to destination: Destination) throws -> Output {
         switch destination {
         case .inMemory:
             return .data(data)
         case .directory(let dir):
-            let out = dir.appendingPathComponent(input.deletingPathExtension().lastPathComponent)
-                         .appendingPathExtension(ext)
+            let out = Self.disambiguating(
+                dir.appendingPathComponent(input.deletingPathExtension().lastPathComponent)
+                   .appendingPathExtension(ext), from: input)
             try data.write(to: out)
             return .file(out)
         case .alongside(let suffix):
             let stem = input.deletingPathExtension().lastPathComponent + suffix
-            let out = input.deletingLastPathComponent().appendingPathComponent(stem)
-                         .appendingPathExtension(ext)
+            let out = Self.disambiguating(
+                input.deletingLastPathComponent().appendingPathComponent(stem)
+                     .appendingPathExtension(ext), from: input)
             try data.write(to: out)
             return .file(out)
         case .fileURL(let url):                          // host-dictated exact path
+            guard url.standardizedFileURL != input.standardizedFileURL else {
+                throw ForgeError.outputWouldOverwriteInput(input)
+            }
             try data.write(to: url)
             return .file(url)
         }
     }
 
+    /// Test hook for the input-immutability guarantee — the derivation is where a collision originates.
+    func videoOutputURLForTesting(input: URL, destination: Destination) throws -> URL {
+        try resolveVideoOutputURL(for: input, to: destination)
+    }
+
     private func resolveVideoOutputURL(for input: URL, to destination: Destination) throws -> URL {
         switch destination {
         case .directory(let dir):
-            return dir.appendingPathComponent(input.deletingPathExtension().lastPathComponent)
-                      .appendingPathExtension("mp4")
+            return Self.disambiguating(
+                dir.appendingPathComponent(input.deletingPathExtension().lastPathComponent)
+                   .appendingPathExtension("mp4"), from: input)
         case .alongside(let suffix):
             let stem = input.deletingPathExtension().lastPathComponent + suffix
-            return input.deletingLastPathComponent().appendingPathComponent(stem)
-                        .appendingPathExtension("mp4")
+            return Self.disambiguating(
+                input.deletingLastPathComponent().appendingPathComponent(stem)
+                     .appendingPathExtension("mp4"), from: input)
         case .fileURL(let url):                          // host-dictated exact path
+            guard url.standardizedFileURL != input.standardizedFileURL else {
+                throw ForgeError.outputWouldOverwriteInput(input)
+            }
             return url
         case .inMemory:
             throw ForgeError.notImplemented("video optimize to .inMemory (Phase A: use a directory)")
