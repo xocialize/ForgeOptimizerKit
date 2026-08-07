@@ -90,6 +90,64 @@ final class WebOptimizeTests: XCTestCase {
                        kCMVideoCodecType_H264)
     }
 
+    /// A floor the content can't reach (noise, floor 90) must still produce the web deliverable —
+    /// the conversion is a normalize; the receipt carries the honest shortfall.
+    func testVideoFloorMissStillDeliversWebMP4() async throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("noise.mov")
+        try makeGradientClip(at: src, w: 320, h: 240, frames: 30, codec: .hevc, noise: true)
+
+        var results: [OptimizeResult] = []
+        for await r in try forge.webOptimize(.url(src), to: .directory(tmp.appendingPathComponent("o")),
+                                             Options(quality: .max)) {
+            results.append(r)
+        }
+        let r = try XCTUnwrap(results.first)
+        guard case .optimized = r.status else { return XCTFail("expected best-effort delivery, got \(r.status)") }
+        let score = try XCTUnwrap(r.after.qualityScore)
+        XCTAssertLessThan(score, 90, "precondition: the floor was genuinely missed")
+        XCTAssertEqual(r.recipe.qualityFloor, 90, "the receipt states what was asked…")
+        guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+    }
+
+    /// MKV in → automatic normalize (pure-Swift demux → HEVC mp4) → web encode. The production
+    /// "whatever this is, make it playable" path. Fixture needs the dev-machine ffmpeg (fixture
+    /// generation only — nothing links it); skips where absent.
+    func testMKVAutoNormalizesToWebMP4() async throws {
+        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("ffmpeg not installed (test-fixture generation only)")
+        }
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("clip.mkv")
+        let gen = Process()
+        gen.executableURL = URL(fileURLWithPath: ffmpeg)
+        gen.arguments = ["-hide_banner", "-loglevel", "error",
+                         "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=1",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", src.path]
+        try gen.run(); gen.waitUntilExit()
+        guard gen.terminationStatus == 0 else { throw XCTSkip("ffmpeg could not build the MKV fixture") }
+
+        var results: [OptimizeResult] = []
+        for await r in try forge.webOptimize(.url(src), to: .directory(tmp.appendingPathComponent("o")),
+                                             Options(quality: .aggressive)) {
+            results.append(r)
+        }
+        let r = try XCTUnwrap(results.first)
+        guard case .optimized = r.status else { return XCTFail("expected delivery, got \(r.status)") }
+        XCTAssertTrue(r.recipe.normalized)
+        XCTAssertEqual(r.recipe.codec, "H.264")
+        guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
+        XCTAssertEqual(out.pathExtension, "mp4")
+        let vtracks = try await AVURLAsset(url: out).loadTracks(withMediaType: .video)
+        let vfmts = try await XCTUnwrap(vtracks.first).load(.formatDescriptions)
+        XCTAssertEqual(CMFormatDescriptionGetMediaSubType(try XCTUnwrap(vfmts.first)),
+                       kCMVideoCodecType_H264)
+    }
+
     /// An H.264-in-mp4 source is already web-ready → native semantics: shrink, or skip honestly.
     /// Never a larger delivered file.
     func testWebReadyVideoSourceIsSizeGated() async throws {
@@ -187,8 +245,9 @@ final class WebOptimizeTests: XCTestCase {
 
     /// Smooth drifting gradient (compressible — the floor must be reachable) at a pinned real
     /// bitrate; no audio. Same fixture reasoning as media-bridge's WebDeliverableTests.
+    /// `noise: true` flips to incompressible LCG frames — the floor-unreachable fixture.
     private func makeGradientClip(at url: URL, w: Int, h: Int, frames: Int,
-                                  codec: AVVideoCodecType) throws {
+                                  codec: AVVideoCodecType, noise: Bool = false) throws {
         let fps = 30
         let writer = try AVAssetWriter(outputURL: url,
                                        fileType: url.pathExtension == "mp4" ? .mp4 : .mov)
@@ -209,13 +268,21 @@ final class WebOptimizeTests: XCTestCase {
             if let base = CVPixelBufferGetBaseAddress(buf) {
                 let rowBytes = CVPixelBufferGetBytesPerRow(buf)
                 let p = base.assumingMemoryBound(to: UInt8.self)
-                for y in 0..<h { for x in 0..<w {
-                    let o = y * rowBytes + x * 4
-                    p[o] = UInt8((x * 255 / w + i * 6) % 256)
-                    p[o + 1] = UInt8(y * 255 / h)
-                    p[o + 2] = UInt8((x + y) * 255 / (w + h))
-                    p[o + 3] = 255
-                } }
+                if noise {
+                    var seed = UInt32(truncatingIfNeeded: i &* 2654435761 | 1)
+                    for j in 0..<(rowBytes * h) {
+                        seed = seed &* 1664525 &+ 1013904223
+                        p[j] = UInt8(truncatingIfNeeded: seed >> 16)
+                    }
+                } else {
+                    for y in 0..<h { for x in 0..<w {
+                        let o = y * rowBytes + x * 4
+                        p[o] = UInt8((x * 255 / w + i * 6) % 256)
+                        p[o + 1] = UInt8(y * 255 / h)
+                        p[o + 2] = UInt8((x + y) * 255 / (w + h))
+                        p[o + 3] = 255
+                    } }
+                }
             }
             CVPixelBufferUnlockBaseAddress(buf, [])
             adaptor.append(buf, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))

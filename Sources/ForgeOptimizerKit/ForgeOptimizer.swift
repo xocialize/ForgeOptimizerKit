@@ -157,10 +157,14 @@ public struct ForgeOptimizer: Sendable {
 
     /// `optimize` for web platforms: same planner, same receipts, web-universal outputs — stills →
     /// **PNG** (lossless, so visually identical by definition; the measured round-trip score is on
-    /// the receipt), video → **H.264 + AAC in mp4** (the one combination every browser plays; the
-    /// same SSIMULACRA2 floor gates it). These don't compress like HEIC/HEVC — a conversion
-    /// **delivers even when larger than the source**; the honest skip applies only when the input is
-    /// already web-native (PNG / H.264-mp4) and the re-encode isn't smaller.
+    /// the receipt), video → **H.264 + AAC in mp4** (the one combination every browser plays).
+    ///
+    /// **A non-web-native input always converts.** Larger than the source is fine, a floor miss
+    /// delivers the best-effort ceiling encode (the receipt carries the honest shortfall against
+    /// `Options.quality`), and a container AVFoundation can't re-encode (MKV/WebM) is automatically
+    /// normalized through media-bridge's pure-Swift path first. The honest skip survives only where
+    /// the input is already web-native (PNG / H.264-mp4+AAC) and the re-encode isn't smaller —
+    /// there the original itself is the web deliverable.
     public func webOptimize(_ source: Source, to destination: Destination,
                             _ options: Options = .init()) throws -> AsyncStream<OptimizeResult> {
         try stream(source, to: destination, options, profile: .web)
@@ -338,22 +342,39 @@ public struct ForgeOptimizer: Sendable {
         }
 
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        let sourceBytes = fileSize(url)
         let encodeProfile: VideoQualityTarget.EncodeProfile
         var webReady = false
+        var encodeInput = url
+        var normalizedTemp: URL?
         switch profile {
         case .native:
             encodeProfile = .hevc
         case .web:
-            webReady = await Self.isWebReadyVideo(url)
+            let info = try? await MediaBridge.probe(url: url)
+            webReady = Self.isWebReady(info)
             // Already web-native → the original is a valid web deliverable, so behave like the
             // native optimize (shrink or honest-skip, source-bitrate ceiling); anything else is a
-            // conversion (2× ceiling — H.264 needs the headroom — and size never blocks delivery).
+            // conversion — 2× ceiling (H.264 needs the headroom), size never blocks delivery, and
+            // a floor miss still delivers the best-effort ceiling encode (the caller asked for a
+            // playable file; the receipt carries the honest shortfall).
             encodeProfile = webReady
                 ? .init(codec: .h264, webSafeAudio: true, ceilingScale: 1.0, requireSmaller: true)
                 : .webH264
+            // Automatic normalize: a container AVFoundation can't re-encode (MKV/WebM) routes
+            // through media-bridge's pure-Swift demux → native HEVC mp4 first; the web encode then
+            // runs on that intermediate. Non-native codecs surface normalize's own honest error.
+            if let info, !info.container.isNativeApple {
+                let temp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("forge-webnorm-\(UUID().uuidString).mp4")
+                try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                encodeInput = temp
+                normalizedTemp = temp
+            }
         }
+        defer { if let normalizedTemp { try? FileManager.default.removeItem(at: normalizedTemp) } }
 
-        let r = try await VideoQualityTarget.encode(input: url, output: outURL,
+        let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: options.quality.floor,
                                                     maxHeight: options.resolution.maxHeight,
                                                     profile: encodeProfile)
@@ -362,7 +383,8 @@ public struct ForgeOptimizer: Sendable {
         recipe.normalized = true
         recipe.qualityFloor = options.quality.floor
 
-        let before = MediaStats(bytes: r.inputBytes, width: r.sourceWidth, height: r.sourceHeight)
+        // `before` describes the ORIGINAL source, not the normalize intermediate.
+        let before = MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight)
         // Carry the reduction, not just the gating number: a bare score cannot say it is a percentile
         // over a sample, and this field being non-nil is what marks it as an aggregate (BRIDGE-061).
         let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
@@ -389,8 +411,11 @@ public struct ForgeOptimizer: Sendable {
     /// The file browsers already play as-is: mp4 container, one H.264 video stream, AAC (or no) audio.
     /// Probed, not extension-guessed; unprobeable → not web-ready → the conversion delivers.
     static func isWebReadyVideo(_ url: URL) async -> Bool {
-        guard let info = try? await MediaBridge.probe(url: url),
-              info.container == .mp4,
+        Self.isWebReady(try? await MediaBridge.probe(url: url))
+    }
+
+    static func isWebReady(_ info: MediaInfo?) -> Bool {
+        guard let info, info.container == .mp4,
               info.videoStreams.count == 1,
               info.videoStreams.first?.codecID == "V_MPEG4/ISO/AVC" else { return false }
         return info.audioStreams.allSatisfy { $0.codecID == "A_AAC" }
