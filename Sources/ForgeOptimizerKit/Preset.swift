@@ -60,8 +60,10 @@ public extension Options {
     /// optimize action: `Options(preset: .visuallyLossless)` or `Options(preset: .visuallyLossless,
     /// resolution: .maxHeight(1080))` to also step 4K→HD.
     init(preset: Preset, resolution: ResolutionTarget = .source, enhance: EnhancePolicy = .off,
-         upscale: UpscaleFactor = .none, output: OutputFormat = .auto, stripMetadata: Bool = false) {
+         upscale: UpscaleFactor = .none, output: OutputFormat = .auto, stripMetadata: Bool = false,
+         integrity: IntegrityLevel = .structural) {
         self.init(quality: preset.quality, resolution: resolution, enhance: enhance,
-                  upscale: upscale, output: output, stripMetadata: stripMetadata)
+                  upscale: upscale, output: output, stripMetadata: stripMetadata,
+                  integrity: integrity)
     }
 }

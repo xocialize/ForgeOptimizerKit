@@ -22,9 +22,14 @@ struct ForgeCLI {
             case "analyze":
                 guard args.count >= 2 else { usage(); exit(2) }
                 let url = URL(fileURLWithPath: args[1])
-                for await a in forge.analyze(.url(url)) {
+                let options = Options(integrity: args.contains("--deep") ? .deep : .structural)
+                for await a in forge.analyze(.url(url), options) {
                     print("\(a.input.lastPathComponent)  \(a.kind.rawValue)  \(a.width)×\(a.height)  "
                           + "\(a.codecID)  \(bytes(a.bytes))")
+                    print("  integrity: \(a.integrity.summary)")
+                    for c in a.integrity.checks where c.outcome != .failed {
+                        print("    ✓ \(c.name)\(c.detail.map { " — \($0)" } ?? "")")
+                    }
                     print("  recommend: \(a.recommendation)")
                     print("  note: \(a.estimate.note)")
                 }
@@ -133,7 +138,7 @@ struct ForgeCLI {
     static func usage() {
         FileHandle.standardError.write(Data("""
         forge — ForgeOptimizer CLI (Phase A)
-          forge analyze  <file>
+          forge analyze  <file> [--deep]     --deep adds decode-to-EOF integrity verification
           forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
           forge weboptimize <file> <out-dir> [--quality …]   web outputs: PNG · H.264+AAC mp4
           forge sweep    <file-or-dir>    re-baseline CSV: each image × all presets

@@ -55,6 +55,12 @@ public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors o
 public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
 public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }  // `.auto` = per media kind
 
+/// How hard `analyze` verifies file integrity. `.structural` (the default) runs millisecond byte
+/// walks — box chains, PNG CRCs, JPEG EOI, EBML sizes — safe on every ingest; `.deep` adds a full
+/// decode-to-EOF pass (costs a decode of the whole file) for incident triage and must-validate
+/// ingests. `optimize` ignores this: its encode is already a full decode.
+public enum IntegrityLevel: Sendable { case structural, deep }
+
 /// Resolution stepping for `optimize` (video). `.source` keeps native resolution (same-res target-quality);
 /// `.maxHeight` steps down to ≤ that height (4K→HD), aspect preserved, never upscaling — the SR/upscale
 /// direction is the enhance path. Quality is measured at the *target* resolution.
@@ -72,16 +78,20 @@ public struct Options: Sendable {
     public var upscale: UpscaleFactor
     public var output: OutputFormat
     public var stripMetadata: Bool
+    /// `analyze`-only: integrity verification tier (see `IntegrityLevel`).
+    public var integrity: IntegrityLevel
 
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
-                output: OutputFormat = .auto, stripMetadata: Bool = false) {
+                output: OutputFormat = .auto, stripMetadata: Bool = false,
+                integrity: IntegrityLevel = .structural) {
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance
         self.upscale = upscale
         self.output = output
         self.stripMetadata = stripMetadata
+        self.integrity = integrity
     }
 }
 
@@ -318,6 +328,44 @@ public struct SavingsEstimate: Sendable {
     public let note: String
 }
 
+/// One integrity check that actually ran during `analyze` — the receipt names its checks so a
+/// verdict can never be read as a stronger claim than the tier that produced it.
+public struct IntegrityCheck: Sendable, Equatable {
+    public enum Outcome: String, Sendable { case passed, failed, skipped }
+    public let name: String        // "box-chain", "png-chunks", "jpeg-eoi", "decode", "probe-sanity", …
+    public let outcome: Outcome
+    public let detail: String?
+
+    public init(name: String, outcome: Outcome, detail: String? = nil) {
+        self.name = name; self.outcome = outcome; self.detail = detail
+    }
+}
+
+/// The integrity half of an `Analysis`.
+///
+/// - `intact`: every check that ran passed.
+/// - `suspect`: structure is clean but a heuristic disagrees (absurd probed metadata, a probe that
+///   cannot read a file whose bytes walk fine) — usable with eyes open.
+/// - `corrupt`: a deterministic byte- or decode-level check failed; `detail` says which and where.
+/// - `unverified`: nothing beyond readability could run (unknown format, IO error).
+public struct IntegrityReport: Sendable {
+    public enum Verdict: String, Sendable { case intact, suspect, corrupt, unverified }
+    public let verdict: Verdict
+    public let checks: [IntegrityCheck]
+
+    public init(verdict: Verdict, checks: [IntegrityCheck]) {
+        self.verdict = verdict; self.checks = checks
+    }
+
+    /// The first failure's diagnosis — nil when nothing failed.
+    public var detail: String? { checks.first { $0.outcome == .failed }?.detail }
+
+    /// One line fit for a log: the verdict plus the first diagnosis when there is one.
+    public var summary: String {
+        detail.map { "\(verdict.rawValue) — \($0)" } ?? verdict.rawValue
+    }
+}
+
 public struct Analysis: Sendable {
     public let input: URL
     public let kind: MediaKind
@@ -328,6 +376,10 @@ public struct Analysis: Sendable {
     public let qualityScore: Double?        // nil in Phase A (no-reference IQA arrives in Phase B)
     public let recommendation: AppliedRecipe
     public let estimate: SavingsEstimate
+    /// Always present since 0.6.0: what integrity verification established for this file, at the
+    /// tier `Options.integrity` selected. A file that cannot be probed no longer vanishes from the
+    /// `analyze` stream — it yields an `Analysis` whose report says what is wrong with it.
+    public let integrity: IntegrityReport
 }
 
 // MARK: - Conform (inter-segment glue for model pipelines, PRD §"conform")

@@ -27,52 +27,118 @@ public struct ForgeOptimizer: Sendable {
 
     // MARK: - analyze (read-only)
 
-    /// Probe + recommend, without writing anything. Best-effort per item: a file that can't be probed
-    /// is simply omitted from the stream (a hard contract failure is a programming error, not data).
+    /// Probe + verify + recommend, without writing anything. **Every input yields an `Analysis`** —
+    /// a file that can't be probed no longer vanishes from the stream; its integrity report says
+    /// what is wrong with it (production corruption surfaces as data, not as absence).
+    /// `Options.integrity` picks the verification tier: `.structural` byte walks by default,
+    /// `.deep` adds a decode-to-EOF pass.
     public func analyze(_ source: Source, _ options: Options = .init()) -> AsyncStream<Analysis> {
         let urls = source.urls
         return AsyncStream { continuation in
             Task {
                 for url in urls {
-                    if let analysis = try? await analyzeOne(url, options) {
-                        continuation.yield(analysis)
-                    }
+                    continuation.yield(await analyzeOne(url, options))
                 }
                 continuation.finish()
             }
         }
     }
 
-    private func analyzeOne(_ url: URL, _ options: Options) async throws -> Analysis {
+    private func analyzeOne(_ url: URL, _ options: Options) async -> Analysis {
         let bytes = fileSize(url)
-        switch mediaKind(of: url) {
-        case .image:
-            let meta = try ImageBridgeFactory.makeProbe().probe(url: url)
-            var recipe = AppliedRecipe()
-            recipe.codec = "HEIC"
-            recipe.qualityFloor = options.quality.floor
-            recipe.normalized = meta.format != .heic
-            let estimate = SavingsEstimate(
-                estimatedFraction: nil,
-                note: "run optimize for actual savings (target SSIMULACRA2 ≥ \(Int(options.quality.floor)))")
-            return Analysis(input: url, kind: .image, width: meta.width, height: meta.height,
-                            bytes: bytes, codecID: meta.format.rawValue, qualityScore: nil,
-                            recommendation: recipe, estimate: estimate)
-        case .video:
-            let info = try await MediaBridge.probe(url: url)
-            let v = info.videoStreams.first
-            var recipe = AppliedRecipe()
-            recipe.codec = "HEVC"
-            recipe.normalized = !info.container.isNativeApple
-            let estimate = SavingsEstimate(
-                estimatedFraction: nil,
-                note: "video target-quality pending per-frame aggregation; optimize = normalize")
-            return Analysis(input: url, kind: .video, width: v?.width ?? 0, height: v?.height ?? 0,
-                            bytes: bytes, codecID: v?.codecID ?? "?", qualityScore: nil,
-                            recommendation: recipe, estimate: estimate)
-        case .unknown:
-            throw ForgeError.unsupportedMedia(url)
+
+        // Integrity first — its walks are magic-byte-routed, so they also cover mislabeled files
+        // the kind classifier (extension-based) gets wrong.
+        let bridge = await MediaIntegrity.verify(
+            url: url, level: options.integrity == .deep ? .deep : .structural)
+        var checks = bridge.checks.map {
+            IntegrityCheck(name: $0.name, outcome: .init(bridge: $0.outcome), detail: $0.detail)
         }
+        var verdict = IntegrityReport.Verdict(bridge: bridge.verdict)
+        let kind = mediaKind(of: url)
+
+        switch kind {
+        case .image:
+            if let meta = try? ImageBridgeFactory.makeProbe().probe(url: url) {
+                if meta.width > 0 && meta.height > 0 {
+                    checks.append(IntegrityCheck(name: "probe-sanity", outcome: .passed))
+                } else {
+                    checks.append(IntegrityCheck(name: "probe-sanity", outcome: .failed,
+                                                 detail: "probed dimensions \(meta.width)×\(meta.height)"))
+                    verdict.escalate(to: .suspect)
+                }
+                var recipe = AppliedRecipe()
+                recipe.codec = "HEIC"
+                recipe.qualityFloor = options.quality.floor
+                recipe.normalized = meta.format != .heic
+                let estimate = SavingsEstimate(
+                    estimatedFraction: nil,
+                    note: "run optimize for actual savings (target SSIMULACRA2 ≥ \(Int(options.quality.floor)))")
+                return Analysis(input: url, kind: .image, width: meta.width, height: meta.height,
+                                bytes: bytes, codecID: meta.format.rawValue, qualityScore: nil,
+                                recommendation: recipe, estimate: estimate,
+                                integrity: IntegrityReport(verdict: verdict, checks: checks))
+            }
+            return unprobeable(url, kind: kind, bytes: bytes, verdict: &verdict, checks: &checks)
+
+        case .video:
+            if let info = try? await MediaBridge.probe(url: url) {
+                let v = info.videoStreams.first
+                var sanity: [String] = []
+                if v == nil { sanity.append("no video stream") }
+                if let v, v.width <= 0 || v.height <= 0 {
+                    sanity.append("probed dimensions \(v.width)×\(v.height)")
+                }
+                if info.durationSeconds <= 0 { sanity.append("zero duration") }
+                // A "video" whose whole file implies < 8 kbps is structurally implausible — the
+                // classic symptom of a metadata shell around missing payload.
+                if info.durationSeconds >= 1, bytes > 0,
+                   Double(bytes) * 8 / info.durationSeconds < 8_000 {
+                    sanity.append(String(format: "implied bitrate %.1f kbps is implausible",
+                                         Double(bytes) * 8 / info.durationSeconds / 1000))
+                }
+                if sanity.isEmpty {
+                    checks.append(IntegrityCheck(name: "probe-sanity", outcome: .passed))
+                } else {
+                    checks.append(IntegrityCheck(name: "probe-sanity", outcome: .failed,
+                                                 detail: sanity.joined(separator: "; ")))
+                    verdict.escalate(to: .suspect)
+                }
+                var recipe = AppliedRecipe()
+                recipe.codec = "HEVC"
+                recipe.normalized = !info.container.isNativeApple
+                let estimate = SavingsEstimate(
+                    estimatedFraction: nil,
+                    note: "video target-quality pending per-frame aggregation; optimize = normalize")
+                return Analysis(input: url, kind: .video, width: v?.width ?? 0, height: v?.height ?? 0,
+                                bytes: bytes, codecID: v?.codecID ?? "?", qualityScore: nil,
+                                recommendation: recipe, estimate: estimate,
+                                integrity: IntegrityReport(verdict: verdict, checks: checks))
+            }
+            return unprobeable(url, kind: kind, bytes: bytes, verdict: &verdict, checks: &checks)
+
+        case .unknown:
+            return unprobeable(url, kind: kind, bytes: bytes, verdict: &verdict, checks: &checks)
+        }
+    }
+
+    /// The diagnostic `Analysis` for a file the probe cannot read (or an unknown kind): the
+    /// integrity walk usually explains *why*, and a byte-clean file the probe still rejects is
+    /// exactly the "usable with eyes open" case `suspect` exists for.
+    private func unprobeable(_ url: URL, kind: MediaKind, bytes: Int,
+                             verdict: inout IntegrityReport.Verdict,
+                             checks: inout [IntegrityCheck]) -> Analysis {
+        if kind != .unknown {
+            checks.append(IntegrityCheck(name: "probe", outcome: .failed,
+                                         detail: "media probe cannot read this file"))
+            verdict.escalate(to: .suspect)
+        }
+        let report = IntegrityReport(verdict: verdict, checks: checks)
+        return Analysis(input: url, kind: kind, width: 0, height: 0, bytes: bytes, codecID: "?",
+                        qualityScore: nil, recommendation: AppliedRecipe(),
+                        estimate: SavingsEstimate(estimatedFraction: nil,
+                                                  note: "not optimizable: \(report.summary)"),
+                        integrity: report)
     }
 
     // MARK: - optimize
@@ -517,6 +583,40 @@ public struct ForgeOptimizer: Sendable {
             return url
         case .inMemory:
             throw ForgeError.notImplemented("video optimize to .inMemory (Phase A: use a directory)")
+        }
+    }
+}
+
+// MARK: - Integrity vocabulary mapping (Kit types stay media-bridge-free; the seam maps here)
+
+private extension IntegrityCheck.Outcome {
+    init(bridge: MediaIntegrity.Check.Outcome) {
+        switch bridge {
+        case .passed: self = .passed
+        case .failed: self = .failed
+        case .skipped: self = .skipped
+        }
+    }
+}
+
+private extension IntegrityReport.Verdict {
+    init(bridge: MediaIntegrity.Report.Verdict) {
+        switch bridge {
+        case .intact: self = .intact
+        case .corrupt: self = .corrupt
+        case .unverified: self = .unverified
+        }
+    }
+
+    /// Upgrade toward severity, never downgrade — `corrupt` is terminal, `suspect` beats
+    /// `intact`/`unverified`.
+    mutating func escalate(to new: Self) {
+        switch (self, new) {
+        case (.corrupt, _): break
+        case (_, .corrupt): self = .corrupt
+        case (.suspect, _): break
+        case (_, .suspect): self = .suspect
+        default: break
         }
     }
 }

@@ -5,7 +5,7 @@ stack. Three verbs over one media foundation:
 
 | Verb | What it does | Phase A backing |
 |---|---|---|
-| **analyze** | probe + recommend a recipe, read-only → `Analysis` | structural (media-bridge probe) |
+| **analyze** | probe + **verify integrity** + recommend, read-only → `Analysis` (corrupt files yield a diagnosis, never vanish) | probe + millisecond byte walks (box chains · PNG CRCs · JPEG EOI · EBML sizes); `Options(integrity: .deep)` adds decode-to-EOF |
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (SSIMULACRA2-guided) · video → normalize |
 | **webOptimize** | same optimizer, web-universal outputs: stills → **PNG** (lossless), video → **H.264 + AAC mp4** | PNG w/ measured round-trip score · target-quality H.264 (same SSIMULACRA2 floor) |
 | **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
@@ -48,7 +48,7 @@ aborts the run. `Summary(results)` aggregates.
 ## CLI
 
 ```
-forge analyze  <file>
+forge analyze  <file> [--deep]                       # --deep = decode-to-EOF verification
 forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
 forge weboptimize <file> <out-dir> [--quality …]     # web outputs: PNG · H.264+AAC mp4
 ```
