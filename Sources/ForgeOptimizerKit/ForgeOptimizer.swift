@@ -77,10 +77,31 @@ public struct ForgeOptimizer: Sendable {
 
     // MARK: - optimize
 
+    /// Which deliverable family `optimize` targets. `.native` is the opinionated Apple set (HEIC
+    /// stills, HEVC-in-mp4 video); `.web` is the universal set every browser decodes (PNG stills,
+    /// H.264 + AAC mp4). Internal: the public surface is the verb pair `optimize` / `webOptimize`.
+    enum OutputProfile: Sendable { case native, web }
+
     /// Stream a receipt per input. Per-item failures are isolated (yielded as `.failed`), so one bad
     /// file never aborts a bulk run. Throws only on up-front contract errors (e.g. unwritable folder).
     public func optimize(_ source: Source, to destination: Destination,
                          _ options: Options = .init()) throws -> AsyncStream<OptimizeResult> {
+        try stream(source, to: destination, options, profile: .native)
+    }
+
+    /// `optimize` for web platforms: same planner, same receipts, web-universal outputs — stills →
+    /// **PNG** (lossless, so visually identical by definition; the measured round-trip score is on
+    /// the receipt), video → **H.264 + AAC in mp4** (the one combination every browser plays; the
+    /// same SSIMULACRA2 floor gates it). These don't compress like HEIC/HEVC — a conversion
+    /// **delivers even when larger than the source**; the honest skip applies only when the input is
+    /// already web-native (PNG / H.264-mp4) and the re-encode isn't smaller.
+    public func webOptimize(_ source: Source, to destination: Destination,
+                            _ options: Options = .init()) throws -> AsyncStream<OptimizeResult> {
+        try stream(source, to: destination, options, profile: .web)
+    }
+
+    private func stream(_ source: Source, to destination: Destination, _ options: Options,
+                        profile: OutputProfile) throws -> AsyncStream<OptimizeResult> {
         try prepareDestination(destination)
         let urls = source.urls
         return AsyncStream { continuation in
@@ -88,7 +109,8 @@ public struct ForgeOptimizer: Sendable {
                 for url in urls {
                     let start = Date()
                     do {
-                        continuation.yield(try await optimizeOne(url, to: destination, options, start: start))
+                        continuation.yield(try await optimizeOne(url, to: destination, options,
+                                                                 start: start, profile: profile))
                     } catch {
                         let bytes = fileSize(url)
                         continuation.yield(OptimizeResult(
@@ -110,6 +132,21 @@ public struct ForgeOptimizer: Sendable {
     public func optimize(_ requests: [OptimizeRequest],
                          progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
         -> AsyncStream<OptimizeResult> {
+        run(requests, progress: progress, profile: .native)
+    }
+
+    /// Pipeline form of `webOptimize` — the host-dictated-URL seam, web-universal outputs. Name the
+    /// output URLs `.png` / `.mp4`; `outputType` on the receipt stays the authoritative type either way.
+    public func webOptimize(_ requests: [OptimizeRequest],
+                            progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        -> AsyncStream<OptimizeResult> {
+        run(requests, progress: progress, profile: .web)
+    }
+
+    private func run(_ requests: [OptimizeRequest],
+                     progress: (@Sendable (OptimizeProgress) -> Void)?,
+                     profile: OutputProfile)
+        -> AsyncStream<OptimizeResult> {
         AsyncStream { continuation in
             Task {
                 for req in requests {
@@ -119,7 +156,7 @@ public struct ForgeOptimizer: Sendable {
                     do {
                         try prepareDestination(.fileURL(req.output))
                         let r = try await optimizeOne(req.input, to: .fileURL(req.output), req.options,
-                                                      start: start)
+                                                      start: start, profile: profile)
                         continuation.yield(r.with(context: req.context))
                     } catch {
                         let bytes = fileSize(req.input)
@@ -139,23 +176,26 @@ public struct ForgeOptimizer: Sendable {
     }
 
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
-                             start: Date) async throws -> OptimizeResult {
+                             start: Date, profile: OutputProfile = .native) async throws -> OptimizeResult {
         switch mediaKind(of: url) {
-        case .image: return try await optimizeImage(url, to: destination, options, start: start)
-        case .video: return try await optimizeVideo(url, to: destination, options, start: start)
+        case .image: return try await optimizeImage(url, to: destination, options, start: start,
+                                                    profile: profile)
+        case .video: return try await optimizeVideo(url, to: destination, options, start: start,
+                                                    profile: profile)
         case .unknown: throw ForgeError.unsupportedMedia(url)
         }
     }
 
-    /// Image path: optional engine enhance → target-quality HEIC via media-bridge's SSIMULACRA2 search.
+    /// Image path: optional engine enhance → target-quality HEIC via media-bridge's SSIMULACRA2
+    /// search (`.native`), or lossless PNG with the measured round-trip score (`.web`).
     private func optimizeImage(_ url: URL, to destination: Destination, _ options: Options,
-                               start: Date) async throws -> OptimizeResult {
+                               start: Date, profile: OutputProfile) async throws -> OptimizeResult {
         let inBytes = fileSize(url)
         guard var cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
 
         var recipe = AppliedRecipe()
-        recipe.codec = "HEIC"
-        recipe.qualityFloor = options.quality.floor
+        recipe.codec = profile == .web ? "PNG" : "HEIC"
+        recipe.qualityFloor = profile == .web ? nil : options.quality.floor   // PNG has no floor: lossless
         recipe.normalized = true
 
         let before = MediaStats(bytes: inBytes, width: cg.width, height: cg.height)
@@ -171,46 +211,88 @@ public struct ForgeOptimizer: Sendable {
             recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
         }
 
-        // GPU-accelerate the quality-target search's SSIMULACRA2 — full-GPU per-channel path (CPU
-        // fallback when no Metal device).
-        let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
-                                                              channelScalars: SSIMULACRA2Metal.shared?.channelScalarsFunction)
+        // GPU-accelerate the SSIMULACRA2 — full-GPU per-channel path (CPU fallback when no Metal device).
+        let scalars = SSIMULACRA2Metal.shared?.channelScalarsFunction
+        let data: Data
+        let score: Double
+        switch profile {
+        case .native:
+            let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
+                                                                  channelScalars: scalars)
+            data = encoded.data; score = encoded.score
+        case .web:
+            let encoded = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
+            data = encoded.data; score = encoded.score
+        }
 
         // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
-        guard enhanced || encoded.data.count < inBytes else {
+        // Native: skip whenever the re-encode isn't smaller. Web: a conversion delivers even when
+        // larger (PNG from a lossy source usually is — that's the point); skip only when the input is
+        // already web-native PNG, where the original itself is the better web deliverable.
+        let sizeGated = profile == .native || isPNGSource(url)
+        guard enhanced || !sizeGated || data.count < inBytes else {
+            let why = profile == .web
+                ? "already web-ready (PNG); re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
+                : "re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
             return OptimizeResult(
                 input: url, kind: .image, output: .none, recipe: recipe, before: before,
                 after: MediaStats(bytes: inBytes, width: cg.width, height: cg.height,
-                                  qualityScore: encoded.score),
-                status: .skipped("re-encode (\(encoded.data.count) B) ≥ source (\(inBytes) B)"),
+                                  qualityScore: score),
+                status: .skipped(why),
                 elapsed: Date().timeIntervalSince(start))
         }
 
-        let output = try write(encoded.data, for: url, ext: "heic", to: destination)
+        let output = try write(data, for: url, ext: profile == .web ? "png" : "heic", to: destination)
         return OptimizeResult(
             input: url, kind: .image, output: output, recipe: recipe, before: before,
-            after: MediaStats(bytes: encoded.data.count, width: cg.width, height: cg.height,
-                              qualityScore: encoded.score),
-            status: .optimized, elapsed: Date().timeIntervalSince(start), outputType: .heic)
+            after: MediaStats(bytes: data.count, width: cg.width, height: cg.height,
+                              qualityScore: score),
+            status: .optimized, elapsed: Date().timeIntervalSince(start),
+            outputType: profile == .web ? .png : .heic)
     }
 
-    /// Video path: **target-quality** — smallest HEVC whose per-frame p10 SSIMULACRA2 clears the floor
-    /// (GPU-scored), audio passthrough-muxed, colour preserved. Same resolution by default; `options.
-    /// resolution = .maxHeight(_)` steps it down (4K→HD), quality measured at the target resolution.
+    /// The input's *actual* still format is PNG (probed, not extension-guessed). Unprobeable inputs
+    /// count as not-PNG: the conversion then delivers, which is the safe direction for a web verb.
+    private func isPNGSource(_ url: URL) -> Bool {
+        (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format == .png
+    }
+
+    /// Video path: **target-quality** — smallest encode whose per-frame p10 SSIMULACRA2 clears the
+    /// floor (GPU-scored), colour preserved. `.native` → HEVC, audio passthrough-muxed; `.web` →
+    /// H.264 + AAC (the mp4 every browser plays), delivered even when larger unless the source is
+    /// already web-native. Same resolution by default; `options.resolution = .maxHeight(_)` steps it
+    /// down (4K→HD), quality measured at the target resolution.
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
-                               start: Date) async throws -> OptimizeResult {
+                               start: Date, profile: OutputProfile) async throws -> OptimizeResult {
         // Upscale is a *quality* op (HD→4K), the opposite of compression — when requested and an enhancer is
         // present, run the temporally-consistent per-frame SR pipeline (V1: standalone HEVC deliverable).
         if options.upscale != .none, let enhancer {
-            return try await upscaleVideo(url, to: destination, options, enhancer: enhancer, start: start)
+            return try await upscaleVideo(url, to: destination, options, enhancer: enhancer,
+                                          start: start, profile: profile)
         }
 
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        let encodeProfile: VideoQualityTarget.EncodeProfile
+        var webReady = false
+        switch profile {
+        case .native:
+            encodeProfile = .hevc
+        case .web:
+            webReady = await Self.isWebReadyVideo(url)
+            // Already web-native → the original is a valid web deliverable, so behave like the
+            // native optimize (shrink or honest-skip, source-bitrate ceiling); anything else is a
+            // conversion (2× ceiling — H.264 needs the headroom — and size never blocks delivery).
+            encodeProfile = webReady
+                ? .init(codec: .h264, webSafeAudio: true, ceilingScale: 1.0, requireSmaller: true)
+                : .webH264
+        }
+
         let r = try await VideoQualityTarget.encode(input: url, output: outURL,
                                                     targetScore: options.quality.floor,
-                                                    maxHeight: options.resolution.maxHeight)
+                                                    maxHeight: options.resolution.maxHeight,
+                                                    profile: encodeProfile)
         var recipe = AppliedRecipe()
-        recipe.codec = "HEVC"
+        recipe.codec = encodeProfile.codecLabel
         recipe.normalized = true
         recipe.qualityFloor = options.quality.floor
 
@@ -224,25 +306,40 @@ public struct ForgeOptimizer: Sendable {
                                                          mean: r.aggregation.mean,
                                                          framesScored: r.aggregation.framesScored,
                                                          frameCount: r.aggregation.frameCount))
-        // `output` is `.none` unless we actually optimized — the encode leaves NO file at `outURL` on a miss,
-        // so the receipt must match (no `.file` pointing at a nonexistent / not-written path → no host orphan).
-        let didOptimize = r.metTarget && r.outputBytes < r.inputBytes
+        // `output` is `.none` unless the encode delivered — it leaves NO file at `outURL` otherwise,
+        // so the receipt must match (no `.file` pointing at a nonexistent path → no host orphan).
+        // `delivered` is the encode profile's own rule; don't re-derive it here.
         return OptimizeResult(
-            input: url, kind: .video, output: didOptimize ? .file(outURL) : .none,
+            input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
             recipe: recipe, before: before, after: after,
-            status: didOptimize ? .optimized
-                                : .skipped(r.metTarget ? "not smaller than source"
+            status: r.delivered ? .optimized
+                                : .skipped(r.metTarget ? (webReady ? "already web-ready; re-encode not smaller than source"
+                                                                   : "not smaller than source")
                                                        : "couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
             elapsed: Date().timeIntervalSince(start),
-            outputType: didOptimize ? .mpeg4Movie : nil)   // HEVC-in-mp4
+            outputType: r.delivered ? .mpeg4Movie : nil)   // HEVC- or H.264-in-mp4 per the profile
+    }
+
+    /// The file browsers already play as-is: mp4 container, one H.264 video stream, AAC (or no) audio.
+    /// Probed, not extension-guessed; unprobeable → not web-ready → the conversion delivers.
+    static func isWebReadyVideo(_ url: URL) async -> Bool {
+        guard let info = try? await MediaBridge.probe(url: url),
+              info.container == .mp4,
+              info.videoStreams.count == 1,
+              info.videoStreams.first?.codecID == "V_MPEG4/ISO/AVC" else { return false }
+        return info.audioStreams.allSatisfy { $0.codecID == "A_AAC" }
     }
 
     /// V4b — temporally-consistent video upscale: per-frame engine SR (the `ImageEnhancer`, applying the
     /// requested upscale factor) + SEA-RAFT flow-guided stabilization, written as an opaque HEVC deliverable.
     /// Standalone (V1): the upscaled clip IS the output — composing with the SSIMULACRA2 quality-target encode
     /// is a later refinement. Net-clean: the SR + flow models are the injected seams.
+    /// `.web` composes exactly that refinement out of necessity: the SR pipeline writes HEVC, so the
+    /// upscale lands in a temp intermediate and the web target-quality encode (H.264 + AAC, floor
+    /// measured against the upscaled intermediate) produces the deliverable.
     private func upscaleVideo(_ url: URL, to destination: Destination, _ options: Options,
-                              enhancer: any ImageEnhancer, start: Date) async throws -> OptimizeResult {
+                              enhancer: any ImageEnhancer, start: Date,
+                              profile: OutputProfile) async throws -> OptimizeResult {
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         // Measure the SOURCE before the pipeline runs. `outURL` can resolve to the input's own path, in
         // which case reading it afterwards reports the output's geometry as the input's — which is how
@@ -250,8 +347,13 @@ public struct ForgeOptimizer: Sendable {
         let src = await Self.videoDimensions(url)
         let inBytes = fileSize(url)
         let flowProv = self.flowProvider
+        let sinkURL = profile == .web
+            ? FileManager.default.temporaryDirectory
+                .appendingPathComponent("forge-upweb-\(UUID().uuidString).mp4")
+            : outURL
+        defer { if profile == .web { try? FileManager.default.removeItem(at: sinkURL) } }
         let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
-            input: url, output: outURL,
+            input: url, output: sinkURL,
             enhance: { try await enhancer.enhance($0, options: options) },
             flow: { a, b in
                 if let flowProv { return try await flowProv.flow(a, b) }
@@ -259,22 +361,56 @@ public struct ForgeOptimizer: Sendable {
                                  uv: [Float](repeating: 0, count: a.width * a.height * 2))   // no provider → no stabilization
             })
 
+        var recipe = AppliedRecipe()
+        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
+        guard outcome.framesWritten > 0, fileSize(sinkURL) > 0 else {
+            try? FileManager.default.removeItem(at: sinkURL)
+            recipe.codec = profile == .web ? "H.264" : "HEVC"
+            recipe.setUpscale(measuredFrom: src.w, to: 0, requested: options.upscale)
+            return OptimizeResult(
+                input: url, kind: .video, output: .none, recipe: recipe, before: before,
+                after: MediaStats(bytes: 0, width: 0, height: 0),
+                status: .skipped("upscale produced no output"),
+                elapsed: Date().timeIntervalSince(start))
+        }
+
+        if profile == .web {
+            // Web deliverable from the upscaled intermediate; the floor gates the *encode* (reference
+            // = the upscaled clip — visually-the-same means "same as what the SR produced").
+            let r = try await VideoQualityTarget.encode(input: sinkURL, output: outURL,
+                                                        targetScore: options.quality.floor,
+                                                        profile: .webH264)
+            let dst = r.delivered ? await Self.videoDimensions(outURL) : (w: 0, h: 0)
+            recipe.codec = "H.264"
+            recipe.qualityFloor = options.quality.floor
+            recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
+            let after = MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
+                                   qualityScore: r.score,
+                                   qualityAggregation: .init(percentile: r.aggregation.percentile,
+                                                             minimum: r.aggregation.minimum,
+                                                             mean: r.aggregation.mean,
+                                                             framesScored: r.aggregation.framesScored,
+                                                             frameCount: r.aggregation.frameCount))
+            return OptimizeResult(
+                input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
+                recipe: recipe, before: before, after: after,
+                status: r.delivered ? .optimized
+                                    : .skipped("couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
+                elapsed: Date().timeIntervalSince(start),
+                outputType: r.delivered ? .mpeg4Movie : nil)
+        }
+
         let outBytes = fileSize(outURL)
         let dst = await Self.videoDimensions(outURL)
-        let ok = outcome.framesWritten > 0 && outBytes > 0
-        if !ok { try? FileManager.default.removeItem(at: outURL) }
-
-        var recipe = AppliedRecipe()
         recipe.codec = "HEVC"
         recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
-        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
         let after = MediaStats(bytes: outBytes, width: dst.w, height: dst.h)
         return OptimizeResult(
-            input: url, kind: .video, output: ok ? .file(outURL) : .none,
+            input: url, kind: .video, output: .file(outURL),
             recipe: recipe, before: before, after: after,
-            status: ok ? .optimized : .skipped("upscale produced no output"),
+            status: .optimized,
             elapsed: Date().timeIntervalSince(start),
-            outputType: ok ? .mpeg4Movie : nil)
+            outputType: .mpeg4Movie)
     }
 
     /// Pixel dimensions of a video's first video track (0×0 if unreadable).

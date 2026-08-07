@@ -29,8 +29,22 @@ public actor ForgeOptimizerService {
         throws -> AsyncStream<OptimizeResult> {
         guard state == .idle else { throw ForgeError.busy }
         state = .processing
-        let upstream = optimizer.optimize(requests, progress: progress)
-        return AsyncStream { continuation in
+        return locked(optimizer.optimize(requests, progress: progress))
+    }
+
+    /// `optimize` with web-universal outputs (PNG stills, H.264 + AAC mp4 video) — see
+    /// `ForgeOptimizer.webOptimize`. Same single-flight lock as `optimize` (one run at a time
+    /// across both verbs).
+    public func webOptimize(_ requests: [OptimizeRequest],
+                            progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        throws -> AsyncStream<OptimizeResult> {
+        guard state == .idle else { throw ForgeError.busy }
+        state = .processing
+        return locked(optimizer.webOptimize(requests, progress: progress))
+    }
+
+    private func locked(_ upstream: AsyncStream<OptimizeResult>) -> AsyncStream<OptimizeResult> {
+        AsyncStream { continuation in
             // This Task inherits the actor's isolation, so it serialises with `state` access and a racing
             // caller sees `.processing` (→ `.busy`) until the stream is drained and `release()` runs.
             Task {

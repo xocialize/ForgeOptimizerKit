@@ -7,6 +7,7 @@ stack. Three verbs over one media foundation:
 |---|---|---|
 | **analyze** | probe + recommend a recipe, read-only → `Analysis` | structural (media-bridge probe) |
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (SSIMULACRA2-guided) · video → normalize |
+| **webOptimize** | same optimizer, web-universal outputs: stills → **PNG** (lossless), video → **H.264 + AAC mp4** | PNG w/ measured round-trip score · target-quality H.264 (same SSIMULACRA2 floor) |
 | **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
 
 **Phase A depends on [`media-bridge`](https://github.com/xocialize/media-bridge) only** — pure-Swift, FFmpeg-free, zero vendored
@@ -26,6 +27,14 @@ for await r in try forge.optimize(.url(input), to: .directory(outDir),
     print(r.recipe, r.before.bytes, "→", r.after.bytes, r.after.qualityScore ?? 0)
 }
 
+// webOptimize — same receipts, web-universal outputs: stills → PNG (lossless — visually identical
+// by definition, round-trip score measured), video → H.264 + AAC mp4 (plays in every browser).
+// These don't compress like HEIC/HEVC: a conversion delivers even when larger; only an input that
+// is already web-native (PNG / H.264-mp4) keeps the honest "not smaller → skip".
+for await r in try forge.webOptimize(.url(input), to: .directory(outDir)) {
+    print(r.recipe, r.before.bytes, "→", r.after.bytes)
+}
+
 // analyze — read-only
 for await a in forge.analyze(.urls(files)) { print(a.recommendation, a.estimate.note) }
 
@@ -41,6 +50,7 @@ aborts the run. `Summary(results)` aggregates.
 ```
 forge analyze  <file>
 forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
+forge weboptimize <file> <out-dir> [--quality …]     # web outputs: PNG · H.264+AAC mp4
 ```
 
 ## Build

@@ -9,6 +9,7 @@ import MediaMeasure
 //
 //   forge analyze  <file>
 //   forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
+//   forge weboptimize <file> <out-dir> [--quality …]     PNG · H.264+AAC mp4
 @main
 struct ForgeCLI {
     static func main() async {
@@ -28,13 +29,16 @@ struct ForgeCLI {
                     print("  note: \(a.estimate.note)")
                 }
 
-            case "optimize":
+            case "optimize", "weboptimize":
                 guard args.count >= 3 else { usage(); exit(2) }
                 let url = URL(fileURLWithPath: args[1])
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
                 let options = Options(quality: quality(from: args), resolution: resolution(from: args))
                 var results: [OptimizeResult] = []
-                for await r in try forge.optimize(.url(url), to: .directory(outDir), options) {
+                let stream = verb == "weboptimize"
+                    ? try forge.webOptimize(.url(url), to: .directory(outDir), options)
+                    : try forge.optimize(.url(url), to: .directory(outDir), options)
+                for await r in stream {
                     report(r)
                     results.append(r)
                 }
@@ -131,6 +135,7 @@ struct ForgeCLI {
         forge — ForgeOptimizer CLI (Phase A)
           forge analyze  <file>
           forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
+          forge weboptimize <file> <out-dir> [--quality …]   web outputs: PNG · H.264+AAC mp4
           forge sweep    <file-or-dir>    re-baseline CSV: each image × all presets
           forge score    <ref> <distorted>   our SSIMULACRA2 (parity-diff vs canonical)
 
