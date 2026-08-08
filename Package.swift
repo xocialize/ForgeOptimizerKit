@@ -12,7 +12,7 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.16.0"),
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.17.0"),
     ],
     targets: [
         .target(

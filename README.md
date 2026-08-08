@@ -7,7 +7,7 @@ stack. Three verbs over one media foundation:
 |---|---|---|
 | **analyze** | probe + **verify integrity** + recommend, read-only → `Analysis` (corrupt files yield a diagnosis, never vanish) | probe + millisecond byte walks (box chains · PNG CRCs · JPEG EOI · EBML sizes); `Options(integrity: .deep)` adds decode-to-EOF |
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (SSIMULACRA2-guided) · video → normalize |
-| **webOptimize** | same optimizer, web-universal outputs: stills → **PNG** (lossless), video → **H.264 + AAC mp4**. Non-web-native inputs **always convert** — auto-normalize for MKV/WebM, best-effort delivery on a floor miss | PNG w/ measured round-trip score · target-quality H.264 (same SSIMULACRA2 floor, honest shortfall on the receipt) |
+| **webOptimize** | same optimizer, web-universal outputs: stills → **PNG** (lossless), video → **H.264 + AAC mp4**. Non-web-native inputs **always convert**: web-safe streams in the wrong wrapper **remux losslessly** (re-encode ships only when smaller AND floor-met); auto-normalize for MKV/WebM; best-effort delivery on a floor miss | PNG w/ measured round-trip score · lossless passthrough remux · target-quality H.264 (same SSIMULACRA2 floor, honest shortfall on the receipt) |
 | **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
 
 **Phase A depends on [`media-bridge`](https://github.com/xocialize/media-bridge) only** — pure-Swift, FFmpeg-free, zero vendored

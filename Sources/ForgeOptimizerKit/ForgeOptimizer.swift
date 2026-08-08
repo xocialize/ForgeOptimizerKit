@@ -346,38 +346,78 @@ public struct ForgeOptimizer: Sendable {
         let encodeProfile: VideoQualityTarget.EncodeProfile
         var webReady = false
         var encodeInput = url
-        var normalizedTemp: URL?
+        var intermediates: [URL] = []
+        var remuxTemp: URL?
         switch profile {
         case .native:
             encodeProfile = .hevc
         case .web:
             let info = try? await MediaBridge.probe(url: url)
             webReady = Self.isWebReady(info)
-            // Already web-native → the original is a valid web deliverable, so behave like the
-            // native optimize (shrink or honest-skip, source-bitrate ceiling); anything else is a
-            // conversion — 2× ceiling (H.264 needs the headroom), size never blocks delivery, and
-            // a floor miss still delivers the best-effort ceiling encode (the caller asked for a
-            // playable file; the receipt carries the honest shortfall).
-            encodeProfile = webReady
-                ? .init(codec: .h264, webSafeAudio: true, ceilingScale: 1.0, requireSmaller: true)
-                : .webH264
-            // Automatic normalize: a container AVFoundation can't re-encode (MKV/WebM) routes
-            // through media-bridge's pure-Swift demux → native HEVC mp4 first; the web encode then
-            // runs on that intermediate. Non-native codecs surface normalize's own honest error.
-            if let info, !info.container.isNativeApple {
+            // Web-safe STREAMS in the wrong wrapper (an H.264+AAC .mov capture): the lossless
+            // passthrough remux is the baseline deliverable — byte-identical quality at ~source
+            // size. The search still runs (a smaller floor-clearing encode is worth having) with
+            // the remux as its input AND its size bar; whichever wins ships. A failed remux
+            // (container AVFoundation can't passthrough) falls through to the conversion path.
+            if !webReady, Self.hasWebSafeStreams(info) {
                 let temp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("forge-webnorm-\(UUID().uuidString).mp4")
-                try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
-                encodeInput = temp
-                normalizedTemp = temp
+                    .appendingPathComponent("forge-webremux-\(UUID().uuidString).mp4")
+                if (try? await MediaBridge.remuxToMP4(input: url, output: temp)) != nil {
+                    remuxTemp = temp
+                    intermediates.append(temp)
+                    encodeInput = temp
+                }
+            }
+            if remuxTemp != nil {
+                // Beat the lossless remux or don't ship: source-bitrate ceiling, strictly smaller,
+                // no best-effort (the remux IS the best effort, and it is perfect).
+                encodeProfile = .init(codec: .h264, webSafeAudio: true,
+                                      ceilingScale: 1.0, requireSmaller: true)
+            } else if webReady {
+                // Already web-native → the original is a valid web deliverable, so behave like the
+                // native optimize (shrink or honest-skip, source-bitrate ceiling).
+                encodeProfile = .init(codec: .h264, webSafeAudio: true,
+                                      ceilingScale: 1.0, requireSmaller: true)
+            } else {
+                // True conversion — 2× ceiling (H.264 needs the headroom), size never blocks
+                // delivery, and a floor miss still delivers the best-effort ceiling encode.
+                encodeProfile = .webH264
+                // Automatic normalize: a container AVFoundation can't re-encode (MKV/WebM) routes
+                // through media-bridge's pure-Swift demux → native HEVC mp4 first; the web encode
+                // then runs on that intermediate. Non-native codecs surface normalize's own error.
+                if let info, !info.container.isNativeApple {
+                    let temp = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("forge-webnorm-\(UUID().uuidString).mp4")
+                    try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                    encodeInput = temp
+                    intermediates.append(temp)
+                }
             }
         }
-        defer { if let normalizedTemp { try? FileManager.default.removeItem(at: normalizedTemp) } }
+        defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: options.quality.floor,
                                                     maxHeight: options.resolution.maxHeight,
                                                     profile: encodeProfile)
+
+        // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
+        // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
+        if !r.delivered, let remuxTemp {
+            let remuxBytes = fileSize(remuxTemp)
+            try? FileManager.default.removeItem(at: outURL)
+            try FileManager.default.moveItem(at: remuxTemp, to: outURL)
+            var recipe = AppliedRecipe()
+            recipe.codec = "H.264"
+            recipe.remuxed = true
+            return OptimizeResult(
+                input: url, kind: .video, output: .file(outURL), recipe: recipe,
+                before: MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight),
+                after: MediaStats(bytes: remuxBytes, width: r.sourceWidth, height: r.sourceHeight),
+                status: .optimized, elapsed: Date().timeIntervalSince(start),
+                outputType: .mpeg4Movie)
+        }
+
         var recipe = AppliedRecipe()
         recipe.codec = encodeProfile.codecLabel
         recipe.normalized = true
@@ -415,8 +455,13 @@ public struct ForgeOptimizer: Sendable {
     }
 
     static func isWebReady(_ info: MediaInfo?) -> Bool {
-        guard let info, info.container == .mp4,
-              info.videoStreams.count == 1,
+        hasWebSafeStreams(info) && info?.container == .mp4
+    }
+
+    /// The stream test alone: one H.264 video track and AAC (or no) audio — payloads a browser
+    /// plays regardless of wrapper. True with a non-mp4 container = the remux candidate.
+    static func hasWebSafeStreams(_ info: MediaInfo?) -> Bool {
+        guard let info, info.videoStreams.count == 1,
               info.videoStreams.first?.codecID == "V_MPEG4/ISO/AVC" else { return false }
         return info.audioStreams.allSatisfy { $0.codecID == "A_AAC" }
     }

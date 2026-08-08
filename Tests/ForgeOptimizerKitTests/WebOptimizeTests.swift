@@ -138,7 +138,10 @@ final class WebOptimizeTests: XCTestCase {
         }
         let r = try XCTUnwrap(results.first)
         guard case .optimized = r.status else { return XCTFail("expected delivery, got \(r.status)") }
-        XCTAssertTrue(r.recipe.normalized)
+        // H.264-in-MKV may legitimately arrive either way: a lossless remux (when AVFoundation can
+        // passthrough the container) or the normalize→encode chain. Both are honest deliverables;
+        // the receipt just has to say which ran.
+        XCTAssertTrue(r.recipe.normalized || r.recipe.remuxed, "\(r.recipe)")
         XCTAssertEqual(r.recipe.codec, "H.264")
         guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
         XCTAssertEqual(out.pathExtension, "mp4")
@@ -146,6 +149,62 @@ final class WebOptimizeTests: XCTestCase {
         let vfmts = try await XCTUnwrap(vtracks.first).load(.formatDescriptions)
         XCTAssertEqual(CMFormatDescriptionGetMediaSubType(try XCTUnwrap(vfmts.first)),
                        kCMVideoCodecType_H264)
+    }
+
+    /// Web-safe streams in the wrong wrapper, content the search can't beat (noise, floor 90):
+    /// the lossless remux ships — ~source size, `remuxed` on the recipe, and NO score/floor on the
+    /// receipt because nothing lossy ran. This is the IMG_0007 case: the old path delivered a 2×
+    /// best-effort re-encode; the right operation was a container change.
+    func testWebSafeMOVDeliversLosslessRemuxWhenSearchCannotBeat() async throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("capture.mov")
+        try makeGradientClip(at: src, w: 320, h: 240, frames: 30, codec: .h264, noise: true)
+        let srcBytes = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: src.path)[.size] as? Int)
+
+        var results: [OptimizeResult] = []
+        for await r in try forge.webOptimize(.url(src), to: .directory(tmp.appendingPathComponent("o")),
+                                             Options(quality: .max)) {
+            results.append(r)
+        }
+        let r = try XCTUnwrap(results.first)
+        guard case .optimized = r.status else { return XCTFail("expected remux delivery, got \(r.status)") }
+        XCTAssertTrue(r.recipe.remuxed, "the receipt must say this was a lossless rewrap: \(r.recipe)")
+        XCTAssertNil(r.after.qualityScore, "no re-encode ran — a score would be a fabricated claim")
+        XCTAssertNil(r.recipe.qualityFloor, "no floor gated a lossless passthrough")
+        XCTAssertLessThan(abs(r.after.bytes - srcBytes), max(srcBytes / 10, 64 * 1024),
+                          "a remux stays at ~source size (\(srcBytes) → \(r.after.bytes))")
+        guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
+        XCTAssertEqual(out.pathExtension, "mp4")
+        let vtracks = try await AVURLAsset(url: out).loadTracks(withMediaType: .video)
+        let vfmts = try await XCTUnwrap(vtracks.first).load(.formatDescriptions)
+        XCTAssertEqual(CMFormatDescriptionGetMediaSubType(try XCTUnwrap(vfmts.first)),
+                       kCMVideoCodecType_H264)
+    }
+
+    /// Same wrapper situation, compressible content and a modest floor: the re-encode search finds
+    /// a smaller floor-clearing encode and BEATS the remux — that must ship instead, with the full
+    /// quality receipt.
+    func testWebSafeMOVReencodeWinsWhenSmallerAndFloorMet() async throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = tmp.appendingPathComponent("capture.mov")
+        try makeGradientClip(at: src, w: 320, h: 240, frames: 30, codec: .h264)
+        let srcBytes = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: src.path)[.size] as? Int)
+
+        var results: [OptimizeResult] = []
+        for await r in try forge.webOptimize(.url(src), to: .directory(tmp.appendingPathComponent("o")),
+                                             Options(quality: .aggressive)) {
+            results.append(r)
+        }
+        let r = try XCTUnwrap(results.first)
+        guard case .optimized = r.status else { return XCTFail("expected delivery, got \(r.status)") }
+        XCTAssertFalse(r.recipe.remuxed, "a winning re-encode is not a remux")
+        XCTAssertEqual(r.recipe.qualityFloor, 70)
+        let score = try XCTUnwrap(r.after.qualityScore)
+        XCTAssertGreaterThanOrEqual(score, 70, "the floor is the constraint the winner cleared")
+        XCTAssertLessThan(r.after.bytes, srcBytes / 2,
+                          "the re-encode only ships when meaningfully smaller than the remux")
     }
 
     /// An H.264-in-mp4 source is already web-ready → native semantics: shrink, or skip honestly.

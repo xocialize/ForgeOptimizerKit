@@ -189,6 +189,9 @@ public struct MediaStats: Sendable {
 /// What actually ran — a human-auditable record, not a request.
 public struct AppliedRecipe: Sendable, CustomStringConvertible {
     public var normalized = false
+    /// Container rewrap with byte-identical streams — no re-encode ran, so no floor and no score
+    /// appear on the receipt: nothing lossy happened to measure.
+    public var remuxed = false
     public var restored = false           // Phase B (NAFNet)
     /// The factor actually applied, **measured from the output pixels** — never the factor requested.
     ///
@@ -232,6 +235,7 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
 
     public var description: String {
         var parts: [String] = []
+        if remuxed { parts.append("remux (lossless)") }
         if normalized { parts.append("normalize") }
         if restored { parts.append("restore") }
         if let f = upscaled {
