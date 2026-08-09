@@ -16,7 +16,13 @@ final class WebOptimizeTests: XCTestCase {
 
     /// JPEG in → PNG out. The PNG is (much) larger — that must NOT skip: web-normalizing a lossy
     /// source is the verb's whole point. The measured round-trip score rides the receipt.
-    func testImageDeliversPNGEvenWhenLarger() async throws {
+    /// SUPERSEDED CONTRACT, rewritten for the web-still RACE (2026-08-09): this test used to pin
+    /// "a textured JPEG converts to PNG and delivers even when larger." The race exists precisely
+    /// so photos stop inflating into PNG — a textured lossy source now re-races into a
+    /// floor-searched JPEG. The deliver-even-when-larger semantic survives where it still applies:
+    /// alpha content (JPEG can't carry it) — pinned in `testAlphaStillStaysPNG` and the honest-skip
+    /// gate tests. JPEG sources remain size-gated web-native stills (`testJPEGSourceIsSizeGated`).
+    func testTexturedJPEGRacesIntoFloorSearchedJPEG() async throws {
         let tmp = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let src = tmp.appendingPathComponent("input.jpg")
@@ -27,17 +33,21 @@ final class WebOptimizeTests: XCTestCase {
             results.append(r)
         }
         let r = try XCTUnwrap(results.first)
-        guard case .optimized = r.status else { return XCTFail("expected .optimized, got \(r.status)") }
-        XCTAssertEqual(r.outputType, .png)
-        XCTAssertEqual(r.recipe.codec, "PNG")
-        XCTAssertNil(r.recipe.qualityFloor, "PNG is lossless — there is no floor to claim")
-        XCTAssertGreaterThan(r.after.bytes, r.before.bytes,
-                             "a textured JPEG → PNG grows; delivery anyway is the semantics under test")
-        let score = try XCTUnwrap(r.after.qualityScore)
-        XCTAssertGreaterThanOrEqual(score, 99.5, "round-trip from the decoded source must measure lossless")
-        guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
-        XCTAssertEqual(out.pathExtension, "png")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+        switch r.status {
+        case .optimized:
+            XCTAssertEqual(r.outputType, .jpeg, "textured lossy content wins the race as JPEG")
+            XCTAssertEqual(r.recipe.codec, "JPEG")
+            XCTAssertNotNil(r.recipe.qualityFloor, "the lossy winner carries its floor")
+            guard case .file(let out) = r.output else { return XCTFail("expected .file output") }
+            XCTAssertEqual(out.pathExtension, "jpg")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+        case .skipped(let why):
+            // A JPEG source is a web-native still: when the race can't beat it, the honest skip
+            // (original IS the deliverable) is the correct outcome — never a larger file.
+            XCTAssertTrue(why.contains("web-ready"), "skip must cite web-native gating: \(why)")
+        case .failed(let why):
+            XCTFail("unexpected failure: \(why)")
+        }
     }
 
     /// PNG in → the size gate applies (the original is already a web deliverable): either an honest

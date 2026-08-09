@@ -264,8 +264,6 @@ public struct ForgeOptimizer: Sendable {
         guard var cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
 
         var recipe = AppliedRecipe()
-        recipe.codec = profile == .web ? "PNG" : "HEIC"
-        recipe.qualityFloor = profile == .web ? nil : options.quality.floor   // PNG has no floor: lossless
         recipe.normalized = true
 
         let before = MediaStats(bytes: inBytes, width: cg.width, height: cg.height)
@@ -281,28 +279,74 @@ public struct ForgeOptimizer: Sendable {
             recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
         }
 
+        // A host-dictated URL that NAMES a still format pins it — the host baked the path
+        // (e.g. `entity-7--web.png`) and racing to a different codec would write mislabeled
+        // bytes into it. The race runs only when the destination doesn't name a format.
+        let pinnedExt: String? = {
+            if case .fileURL(let u) = destination {
+                let e = u.pathExtension.lowercased()
+                if ["png", "jpg", "jpeg"].contains(e) { return e }
+            }
+            return nil
+        }()
+
         // GPU-accelerate the SSIMULACRA2 — full-GPU per-channel path (CPU fallback when no Metal device).
         let scalars = SSIMULACRA2Metal.shared?.channelScalarsFunction
         let data: Data
         let score: Double
+        var webExt = "png"
+        var webType: UTType = .png
         switch profile {
         case .native:
             let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
                                                                   channelScalars: scalars)
             data = encoded.data; score = encoded.score
+            recipe.codec = "HEIC"
+            recipe.qualityFloor = options.quality.floor
         case .web:
-            let encoded = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
-            data = encoded.data; score = encoded.score
+            // The web still is a RACE, not a classification: the lossless PNG always runs; a JPEG
+            // floor search runs alongside unless the image carries alpha (JPEG has none). Ship the
+            // smaller deliverable that keeps its guarantee — photos land 5–10× under PNG via JPEG,
+            // flat graphics ring + inflate under JPEG and PNG wins on size, transparency is PNG by
+            // construction. No content classifier to mis-tune; the outcome decides.
+            let png = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
+            // Gate on TRUE transparency, not channel presence: opaque-RGBA is everywhere in
+            // consumer content (screenshots, decoded video frames, editor exports), and treating
+            // the mere existence of an alpha channel as transparency silently benched the JPEG
+            // race on exactly the photos it exists for (a real 6 MP frame shipped 2.3 MB PNG
+            // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
+            var jpeg: ImageQualityTarget.Result?
+            if pinnedExt != "png", !Self.hasRealTransparency(cg) {
+                jpeg = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
+                                                               channelScalars: scalars)
+            }
+            let jpegPinned = pinnedExt == "jpg" || pinnedExt == "jpeg"
+            if let jpeg, jpegPinned || (jpeg.metTarget && jpeg.data.count < png.data.count) {
+                data = jpeg.data; score = jpeg.score
+                recipe.codec = "JPEG"
+                recipe.qualityFloor = options.quality.floor
+                webExt = "jpg"; webType = .jpeg
+            } else {
+                data = png.data; score = png.score
+                recipe.codec = "PNG"
+                recipe.qualityFloor = nil                       // PNG has no floor: lossless
+            }
         }
 
         // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
-        // Native: skip whenever the re-encode isn't smaller. Web: a conversion delivers even when
-        // larger (PNG from a lossy source usually is — that's the point); skip only when the input is
-        // already web-native PNG, where the original itself is the better web deliverable.
-        let sizeGated = profile == .native || isPNGSource(url)
+        // Native: skip whenever the re-encode isn't smaller. Web: skip only when the input is
+        // already web-native (PNG or JPEG) — the original itself is a valid web deliverable and a
+        // bigger re-encode would be a strict loss — EXCEPT when a host-pinned URL requests a
+        // DIFFERENT format: that is a format conversion, and a conversion delivers even when
+        // larger (the same semantics the video path gives non-web-native sources).
+        let webNativeFormat = profile == .web ? webNativeStillFormat(url) : nil
+        let pinnedMatchesSource = pinnedExt == nil
+            || (pinnedExt == "png" && webNativeFormat == "PNG")
+            || ((pinnedExt == "jpg" || pinnedExt == "jpeg") && webNativeFormat == "JPEG")
+        let sizeGated = profile == .native || (webNativeFormat != nil && pinnedMatchesSource)
         guard enhanced || !sizeGated || data.count < inBytes else {
             let why = profile == .web
-                ? "already web-ready (PNG); re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
+                ? "already web-ready (\(webNativeFormat ?? "web still")); re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
                 : "re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
             return OptimizeResult(
                 input: url, kind: .image, output: .none, recipe: recipe, before: before,
@@ -312,17 +356,49 @@ public struct ForgeOptimizer: Sendable {
                 elapsed: Date().timeIntervalSince(start))
         }
 
-        let output = try write(data, for: url, ext: profile == .web ? "png" : "heic", to: destination)
+        let output = try write(data, for: url, ext: profile == .web ? webExt : "heic", to: destination)
         return OptimizeResult(
             input: url, kind: .image, output: output, recipe: recipe, before: before,
             after: MediaStats(bytes: data.count, width: cg.width, height: cg.height,
                               qualityScore: score),
             status: .optimized, elapsed: Date().timeIntervalSince(start),
-            outputType: profile == .web ? .png : .heic)
+            outputType: profile == .web ? webType : .heic)
     }
 
     /// The input's *actual* still format is PNG (probed, not extension-guessed). Unprobeable inputs
     /// count as not-PNG: the conversion then delivers, which is the safe direction for a web verb.
+    /// Whether any pixel actually USES the alpha channel (< 255). Channel PRESENCE is not
+    /// transparency — opaque-RGBA must not disqualify JPEG. Full-res alpha-only render + scan;
+    /// single-digit milliseconds at 6 MP, early-exits on the first transparent pixel.
+    static func hasRealTransparency(_ image: CGImage) -> Bool {
+        guard [.first, .last, .premultipliedFirst, .premultipliedLast].contains(image.alphaInfo)
+        else { return false }
+        let w = image.width, h = image.height
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
+        else { return true }    // cannot inspect → assume transparency (PNG is the safe format)
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let base = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return true }
+        let rowBytes = ctx.bytesPerRow
+        for y in 0..<h {
+            let row = base + y * rowBytes
+            for x in 0..<w where row[x] != 255 { return true }
+        }
+        return false
+    }
+
+    /// "PNG"/"JPEG" when the source is already a web-native still (the honest-skip gate names the
+    /// actual format), nil otherwise.
+    private func webNativeStillFormat(_ url: URL) -> String? {
+        switch (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format {
+        case .png: return "PNG"
+        case .jpeg: return "JPEG"
+        default: return nil
+        }
+    }
+
     private func isPNGSource(_ url: URL) -> Bool {
         (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format == .png
     }
