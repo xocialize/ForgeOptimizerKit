@@ -371,13 +371,11 @@ public struct ForgeOptimizer: Sendable {
             if remuxTemp != nil {
                 // Beat the lossless remux or don't ship: source-bitrate ceiling, strictly smaller,
                 // no best-effort (the remux IS the best effort, and it is perfect).
-                encodeProfile = .init(codec: .h264, webSafeAudio: true,
-                                      ceilingScale: 1.0, requireSmaller: true)
+                encodeProfile = .webH264Shrink
             } else if webReady {
                 // Already web-native → the original is a valid web deliverable, so behave like the
                 // native optimize (shrink or honest-skip, source-bitrate ceiling).
-                encodeProfile = .init(codec: .h264, webSafeAudio: true,
-                                      ceilingScale: 1.0, requireSmaller: true)
+                encodeProfile = .webH264Shrink
             } else {
                 // True conversion — 2× ceiling (H.264 needs the headroom), size never blocks
                 // delivery, and a floor miss still delivers the best-effort ceiling encode.
