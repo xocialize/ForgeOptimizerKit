@@ -62,7 +62,9 @@ public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }  // `.au
 public enum IntegrityLevel: Sendable { case structural, deep }
 
 /// Resolution stepping for `optimize` (video). `.source` keeps native resolution (same-res target-quality);
-/// `.maxHeight` steps down to ≤ that height (4K→HD), aspect preserved, never upscaling — the SR/upscale
+/// `.maxHeight` steps down to ≤ that resolution CLASS — it caps the SHORT side, so a 1080×1920
+/// portrait phone clip IS 1080p and stays untouched (media-bridge 0.24.0 semantics), aspect
+/// preserved, never upscaling — the SR/upscale
 /// direction is the enhance path. Quality is measured at the *target* resolution.
 public enum ResolutionTarget: Sendable {
     case source
