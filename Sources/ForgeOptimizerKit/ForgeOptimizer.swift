@@ -260,6 +260,12 @@ public struct ForgeOptimizer: Sendable {
     /// search (`.native`), or lossless PNG with the measured round-trip score (`.web`).
     private func optimizeImage(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date, profile: OutputProfile) async throws -> OptimizeResult {
+        // An ANIMATED GIF is motion content wearing a still extension: on the web profile it
+        // converts to an H.264 mp4 (typically ~10× smaller) through the same floor search as any
+        // video. Single-frame GIFs fall through to the still race like every other image.
+        if profile == .web, isGIF(url), GIFVideo.frameCount(url) > 1 {
+            return try await optimizeAnimatedGIF(url, to: destination, options, start: start)
+        }
         let inBytes = fileSize(url)
         guard var cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
 
@@ -367,6 +373,50 @@ public struct ForgeOptimizer: Sendable {
 
     /// The input's *actual* still format is PNG (probed, not extension-guessed). Unprobeable inputs
     /// count as not-PNG: the conversion then delivers, which is the safe direction for a web verb.
+    /// The animated-GIF → web-mp4 conversion: GIFVideo renders the near-lossless mezzanine
+    /// (per-frame timing, white-composited), and the standard webH264 floor search produces the
+    /// deliverable — conversion semantics (best-effort, delivers even when larger; a GIF is never
+    /// web-native video). The receipt reads like any video normalize; the output name/extension
+    /// follow the video rules (.mp4).
+    private func optimizeAnimatedGIF(_ url: URL, to destination: Destination, _ options: Options,
+                                     start: Date) async throws -> OptimizeResult {
+        let sourceBytes = fileSize(url)
+        let mezz = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-gif-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: mezz) }
+        _ = try await GIFVideo.renderMezzanine(input: url, output: mezz)
+
+        let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        let r = try await VideoQualityTarget.encode(input: mezz, output: outURL,
+                                                    targetScore: options.quality.floor,
+                                                    maxHeight: options.resolution.maxHeight,
+                                                    profile: .webH264)
+        var recipe = AppliedRecipe()
+        recipe.codec = "H.264"
+        recipe.normalized = true
+        recipe.qualityFloor = options.quality.floor
+        let before = MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight)
+        let after = MediaStats(bytes: r.delivered ? r.outputBytes : sourceBytes,
+                               width: r.width, height: r.height,
+                               qualityScore: r.score,
+                               qualityAggregation: .init(percentile: r.aggregation.percentile,
+                                                         minimum: r.aggregation.minimum,
+                                                         mean: r.aggregation.mean,
+                                                         framesScored: r.aggregation.framesScored,
+                                                         frameCount: r.aggregation.frameCount))
+        return OptimizeResult(
+            input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
+            recipe: recipe, before: before, after: after,
+            status: r.delivered ? .optimized
+                                : .skipped("couldn't produce the GIF→mp4 deliverable"),
+            elapsed: Date().timeIntervalSince(start),
+            outputType: r.delivered ? .mpeg4Movie : nil)
+    }
+
+    private func isGIF(_ url: URL) -> Bool {
+        UTType(filenameExtension: url.pathExtension)?.conforms(to: .gif) == true
+    }
+
     /// Whether any pixel actually USES the alpha channel (< 255). Channel PRESENCE is not
     /// transparency — opaque-RGBA must not disqualify JPEG. Full-res alpha-only render + scan;
     /// single-digit milliseconds at 6 MP, early-exits on the first transparent pixel.

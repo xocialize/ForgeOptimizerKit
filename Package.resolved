@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/media-bridge.git",
       "state" : {
-        "revision" : "8cda1c4f322e95896614b6b719088ea55007ea58",
-        "version" : "0.25.1"
+        "revision" : "a016bab726cd45b259a45169b25574ee89f58145",
+        "version" : "0.26.0"
       }
     }
   ],
