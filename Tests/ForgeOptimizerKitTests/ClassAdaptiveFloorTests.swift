@@ -31,6 +31,31 @@ final class ClassAdaptiveFloorTests: XCTestCase {
         XCTAssertEqual(ContentClassifier.classify(overshoot: 0.1, bitsPerPixel: 0.0387), .general)
     }
 
+    // MARK: - HEVC calibration (native-profile sweep 2026-08-09; the guard moves, the rule doesn't)
+
+    func testHEVCTextClassifiesGraphic() {
+        // smarter (text) on HEVC: +4.3 @ bpp 0.0061 → graphic.
+        XCTAssertEqual(ContentClassifier.classify(overshoot: 4.3, bitsPerPixel: 0.0061, hevc: true),
+                       .graphic)
+    }
+
+    func testHEVCGuardExcludesWhatTheH264GuardAdmitted() {
+        // sevilla on HEVC landed bpp 0.0149 — INSIDE the H.264 guard (0.015) by one
+        // ten-thousandth, saved only by overshoot. The HEVC guard (0.009) excludes it outright,
+        // so both signals carry margin instead of one doing all the work.
+        XCTAssertEqual(ContentClassifier.classify(overshoot: 4.5, bitsPerPixel: 0.0149, hevc: true),
+                       .general, "hypothetical high-overshoot sevilla-class must still be general on HEVC")
+        // characters4k on HEVC: +3.2 @ 0.0108 — under the overshoot bar AND outside the HEVC guard.
+        XCTAssertEqual(ContentClassifier.classify(overshoot: 3.2, bitsPerPixel: 0.0108, hevc: true),
+                       .general)
+    }
+
+    func testH264ThresholdsUnchangedByTheHEVCSplit() {
+        // The H.264 corpus points must classify exactly as before the codec split.
+        XCTAssertEqual(ContentClassifier.classify(overshoot: 5.2, bitsPerPixel: 0.0078), .graphic)
+        XCTAssertEqual(ContentClassifier.classify(overshoot: 0.9, bitsPerPixel: 0.0087), .general)
+    }
+
     // MARK: - the ratchet rule
 
     func testRaisedFloorsAreStrictlyAboveTheirPresets() {

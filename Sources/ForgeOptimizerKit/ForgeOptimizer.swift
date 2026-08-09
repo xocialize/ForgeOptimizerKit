@@ -553,7 +553,8 @@ public struct ForgeOptimizer: Sendable {
         var floorRaisedFrom: Double? = nil
         if chosen.delivered, chosen.metTarget,
            let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
-                                                        preset: options.quality),
+                                                        preset: options.quality,
+                                                        hevc: encodeProfile.codec == .hevc),
            raised > effectiveFloor {
             let stash = outURL.deletingLastPathComponent()
                 .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
@@ -612,7 +613,8 @@ public struct ForgeOptimizer: Sendable {
     /// signals fall out of the search that already ran: floor overshoot and emitted bits-per-pixel
     /// (duration/fps loaded from the encode input's metadata — milliseconds, no decode).
     private static func classRaisedFloor(for r: VideoQualityTarget.Result, input: URL,
-                                         preset: QualityTarget) async throws -> Double? {
+                                         preset: QualityTarget,
+                                         hevc: Bool) async throws -> Double? {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard duration > 0, r.width > 0, r.height > 0,
@@ -620,7 +622,8 @@ public struct ForgeOptimizer: Sendable {
         let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
         let fps = fpsRaw > 0 ? fpsRaw : 30
         let bpp = Double(r.outputBytes) * 8 / (Double(r.width * r.height) * fps * duration)
-        let cls = ContentClassifier.classify(overshoot: r.score - preset.floor, bitsPerPixel: bpp)
+        let cls = ContentClassifier.classify(overshoot: r.score - preset.floor, bitsPerPixel: bpp,
+                                             hevc: hevc)
         return ContentClassifier.raisedFloor(preset: preset, class: cls)
     }
 

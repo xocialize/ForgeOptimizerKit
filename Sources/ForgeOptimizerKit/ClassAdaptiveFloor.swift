@@ -35,8 +35,10 @@ enum ContentClassifier {
     /// Thresholds calibrated on the 9-clip IBM_Pairs balanced-floor sweep (2026-08-09) — see
     /// `classcal.csv` provenance in the session notes; both signals must agree (AND, not OR) so
     /// a tight-landing low-bpp photographic clip is never misclassified.
-    static func classify(overshoot: Double, bitsPerPixel: Double) -> ContentClass {
-        (overshoot >= Calibration.minOvershoot && bitsPerPixel <= Calibration.maxGraphicBPP)
+    static func classify(overshoot: Double, bitsPerPixel: Double,
+                         hevc: Bool = false) -> ContentClass {
+        let bppGuard = hevc ? Calibration.maxGraphicBPPHEVC : Calibration.maxGraphicBPP
+        return (overshoot >= Calibration.minOvershoot && bitsPerPixel <= bppGuard)
             ? .graphic : .general
     }
 
@@ -66,6 +68,14 @@ enum ContentClassifier {
     enum Calibration {
         static let minOvershoot: Double = 4
         static let maxGraphicBPP: Double = 0.015
+        /// HEVC clears at lower bpp across the board (its efficiency shifts the whole scatter),
+        /// so the H.264 guard stops guarding: the 2026-08-09 native-profile sweep put general
+        /// content at 0.0108 (characters) and 0.0149 (sevilla) — inside the 0.015 H.264 guard,
+        /// saved only by their overshoot. 0.009 sits mid-gap between the text exemplar (0.0061)
+        /// and the nearest general (0.0108), so BOTH signals carry margin on HEVC. Overshoot
+        /// threshold transfers unchanged (text +4.3 vs +3.2 next — thinner than H.264's gap but
+        /// on the right side; single-text-exemplar caveat applies to both codecs).
+        static let maxGraphicBPPHEVC: Double = 0.009
         static let graphicMaxFloor: Double = 94
         static let graphicBalancedFloor: Double = 90
         static let graphicAggressiveFloor: Double = 82
