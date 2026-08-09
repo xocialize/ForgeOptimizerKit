@@ -416,34 +416,86 @@ public struct ForgeOptimizer: Sendable {
                 outputType: .mpeg4Movie)
         }
 
+        // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static content
+        // clears the preset floor with huge overshoot at tiny bitrates AND is the class where
+        // artifacts glare on signage, so a delivered preset-floor result gets one re-run at the
+        // class floor. The first deliverable is stashed and restored if the re-run cannot deliver —
+        // a stricter attempt must never cost the result already in hand. Ratchet-up only; `.custom`
+        // floors are exempt inside `raisedFloor`.
+        var chosen = r
+        var effectiveFloor = options.quality.floor
+        var floorRaisedFrom: Double? = nil
+        if chosen.delivered, chosen.metTarget,
+           let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
+                                                        preset: options.quality),
+           raised > effectiveFloor {
+            let stash = outURL.deletingLastPathComponent()
+                .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
+            try FileManager.default.moveItem(at: outURL, to: stash)
+            let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                            targetScore: raised,
+                                                            maxHeight: options.resolution.maxHeight,
+                                                            profile: encodeProfile)
+            if rerun.delivered, rerun.metTarget {
+                chosen = rerun
+                floorRaisedFrom = effectiveFloor
+                effectiveFloor = raised
+                try? FileManager.default.removeItem(at: stash)
+            } else {
+                try? FileManager.default.removeItem(at: outURL)
+                try FileManager.default.moveItem(at: stash, to: outURL)
+            }
+        }
+
         var recipe = AppliedRecipe()
         recipe.codec = encodeProfile.codecLabel
         recipe.normalized = true
-        recipe.qualityFloor = options.quality.floor
+        recipe.qualityFloor = effectiveFloor
+        if let floorRaisedFrom {
+            recipe.floorRaisedFrom = floorRaisedFrom
+            recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
+        }
 
         // `before` describes the ORIGINAL source, not the normalize intermediate.
-        let before = MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight)
+        let before = MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight)
         // Carry the reduction, not just the gating number: a bare score cannot say it is a percentile
         // over a sample, and this field being non-nil is what marks it as an aggregate (BRIDGE-061).
-        let after = MediaStats(bytes: r.outputBytes, width: r.width, height: r.height,
-                               qualityScore: r.score,
-                               qualityAggregation: .init(percentile: r.aggregation.percentile,
-                                                         minimum: r.aggregation.minimum,
-                                                         mean: r.aggregation.mean,
-                                                         framesScored: r.aggregation.framesScored,
-                                                         frameCount: r.aggregation.frameCount))
+        let after = MediaStats(bytes: chosen.outputBytes, width: chosen.width, height: chosen.height,
+                               qualityScore: chosen.score,
+                               qualityAggregation: .init(percentile: chosen.aggregation.percentile,
+                                                         minimum: chosen.aggregation.minimum,
+                                                         mean: chosen.aggregation.mean,
+                                                         framesScored: chosen.aggregation.framesScored,
+                                                         frameCount: chosen.aggregation.frameCount))
         // `output` is `.none` unless the encode delivered — it leaves NO file at `outURL` otherwise,
         // so the receipt must match (no `.file` pointing at a nonexistent path → no host orphan).
         // `delivered` is the encode profile's own rule; don't re-derive it here.
         return OptimizeResult(
-            input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
+            input: url, kind: .video, output: chosen.delivered ? .file(outURL) : .none,
             recipe: recipe, before: before, after: after,
-            status: r.delivered ? .optimized
-                                : .skipped(r.metTarget ? (webReady ? "already web-ready; re-encode not smaller than source"
-                                                                   : "not smaller than source")
-                                                       : "couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
+            status: chosen.delivered ? .optimized
+                                : .skipped(chosen.metTarget ? (webReady ? "already web-ready; re-encode not smaller than source"
+                                                                        : "not smaller than source")
+                                                            : "couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
             elapsed: Date().timeIntervalSince(start),
-            outputType: r.delivered ? .mpeg4Movie : nil)   // HEVC- or H.264-in-mp4 per the profile
+            outputType: chosen.delivered ? .mpeg4Movie : nil)   // HEVC- or H.264-in-mp4 per the profile
+    }
+
+    /// The class ratchet's decision: classify the preset-floor result mechanically and return the
+    /// raised floor a fragile class earns under this preset, or nil (keep the preset floor). The
+    /// signals fall out of the search that already ran: floor overshoot and emitted bits-per-pixel
+    /// (duration/fps loaded from the encode input's metadata — milliseconds, no decode).
+    private static func classRaisedFloor(for r: VideoQualityTarget.Result, input: URL,
+                                         preset: QualityTarget) async throws -> Double? {
+        let asset = AVURLAsset(url: input)
+        let duration = try await asset.load(.duration).seconds
+        guard duration > 0, r.width > 0, r.height > 0,
+              let vtrack = try await asset.loadTracks(withMediaType: .video).first else { return nil }
+        let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
+        let fps = fpsRaw > 0 ? fpsRaw : 30
+        let bpp = Double(r.outputBytes) * 8 / (Double(r.width * r.height) * fps * duration)
+        let cls = ContentClassifier.classify(overshoot: r.score - preset.floor, bitsPerPixel: bpp)
+        return ContentClassifier.raisedFloor(preset: preset, class: cls)
     }
 
     /// The file browsers already play as-is: mp4 container, one H.264 video stream, AAC (or no) audio.

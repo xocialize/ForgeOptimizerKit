@@ -205,6 +205,13 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     public var upscaleRequested: Int? = nil
     public var codec: String? = nil       // output format, e.g. "HEIC" / "HEVC"
     public var qualityFloor: Double? = nil
+    /// The preset floor the class ratchet RAISED from, when it did (nil = no raise ran). The
+    /// effective floor lives in `qualityFloor`; both appear on the receipt because a raised floor
+    /// is a stronger promise than the preset made, and the reader deserves to know which held.
+    public var floorRaisedFrom: Double? = nil
+    /// The mechanically-detected content class that justified the raise (e.g. "graphic"). Set only
+    /// alongside `floorRaisedFrom` — a classification that changed nothing is not receipt material.
+    public var contentClass: String? = nil
 
     public init() {}
 
@@ -246,7 +253,13 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
             }
         }
         if let c = codec { parts.append("→\(c)") }
-        if let q = qualityFloor { parts.append("@SSIMU2≥\(Int(q))") }
+        if let q = qualityFloor {
+            if let base = floorRaisedFrom, let cls = contentClass {
+                parts.append("@SSIMU2≥\(Int(q)) (raised from \(Int(base)) · \(cls))")
+            } else {
+                parts.append("@SSIMU2≥\(Int(q))")
+            }
+        }
         return parts.isEmpty ? "passthrough" : parts.joined(separator: " ")
     }
 }
