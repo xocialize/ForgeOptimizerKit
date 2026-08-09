@@ -389,7 +389,7 @@ public struct ForgeOptimizer: Sendable {
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let r = try await VideoQualityTarget.encode(input: mezz, output: outURL,
                                                     targetScore: options.quality.floor,
-                                                    maxHeight: options.resolution.maxHeight,
+                                                    maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: .webH264)
         var recipe = AppliedRecipe()
         recipe.codec = "H.264"
@@ -522,7 +522,7 @@ public struct ForgeOptimizer: Sendable {
 
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: options.quality.floor,
-                                                    maxHeight: options.resolution.maxHeight,
+                                                    maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile)
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
@@ -560,7 +560,7 @@ public struct ForgeOptimizer: Sendable {
             try FileManager.default.moveItem(at: outURL, to: stash)
             let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                             targetScore: raised,
-                                                            maxHeight: options.resolution.maxHeight,
+                                                            maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                             profile: encodeProfile)
             if rerun.delivered, rerun.metTarget {
                 chosen = rerun

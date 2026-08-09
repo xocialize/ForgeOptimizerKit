@@ -38,6 +38,15 @@ public extension Preset {
         id: "balanced", name: "Balanced",
         floorLabel: "SSIMU2 ≥ 80", useCase: "Default", quality: .balanced)
 
+    /// ≥ 75 **+ the 1080p rung by default** — the consumer-web semantic (CONSUMER-PLAYBOOK §6,
+    /// research-grounded): consumer viewing is a no-reference condition, measured platform
+    /// practice spans p10 ~75–85, and the rung collapses the camera-grain cost curve. A distinct
+    /// documented promise (graphic content still ratchets UP to 90 under it) — never a silent
+    /// weakening of `balanced`.
+    static let consumer = Preset(
+        id: "consumer", name: "Consumer Web",
+        floorLabel: "SSIMU2 ≥ 75 · 1080p", useCase: "Phone footage · sharing", quality: .consumer)
+
     /// ≥ 70 — high; the standard distribution target (smallest acceptable).
     static let aggressive = Preset(
         id: "aggressive", name: "Aggressive",
@@ -46,7 +55,7 @@ public extension Preset {
     /// The canonical ladder, highest-floor first. Hosts render this verbatim for parity; a host may
     /// present a subset (e.g. signage might show only Visually Lossless + Balanced) but should not
     /// invent floors outside it without a deliberate `.custom` preset.
-    static let standard: [Preset] = [.visuallyLossless, .balanced, .aggressive]
+    static let standard: [Preset] = [.visuallyLossless, .balanced, .consumer, .aggressive]
 
     /// The preset in `standard` whose floor matches `target`, if any (for reflecting an `Options` choice
     /// back onto the picker selection).

@@ -38,6 +38,14 @@ public enum Destination: Sendable {
 public enum QualityTarget: Sendable {
     case max          // ≥ 90 — visually lossless (hero / archival)
     case balanced     // ≥ 80 — very high, not noticeable side-by-side (default)
+    /// ≥ 75 + the 1080p ladder rung by default — the CONSUMER web semantic, research-grounded
+    /// (CONSUMER-PLAYBOOK §6): consumer viewing is a no-reference condition (the SSIMULACRA2
+    /// author anchor at 70 = "without reference, an average observer does not notice artifacts");
+    /// measured consumer-platform practice spans p10 ~75–85 with grain rungs below 70; and p10
+    /// aggregation makes 75 stricter than it sounds — the WORST DECILE of frames sits at "high".
+    /// This is a distinct documented promise, not a weakening of `balanced`: graphic content
+    /// still ratchets UP (text → 90) under it.
+    case consumer
     case aggressive   // ≥ 70 — high; the standard distribution target (smallest acceptable)
     case custom(Double)
 
@@ -45,9 +53,19 @@ public enum QualityTarget: Sendable {
         switch self {
         case .max: return 90
         case .balanced: return 80
+        case .consumer: return 75
         case .aggressive: return 70
         case .custom(let v): return v
         }
+    }
+
+    /// The default resolution class this target implies when the caller didn't choose one.
+    /// Only `.consumer` implies a rung (1080p — every consumer platform's default viewing rung;
+    /// it also collapses the camera-grain cost curve, the preset's whole point). Others: nil =
+    /// keep the source resolution unless the caller says otherwise.
+    public var impliedMaxHeight: Int? {
+        if case .consumer = self { return 1080 }
+        return nil
     }
 }
 

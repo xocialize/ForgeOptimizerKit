@@ -47,6 +47,9 @@ enum ContentClassifier {
         switch preset {
         case .max:        return Calibration.graphicMaxFloor
         case .balanced:   return Calibration.graphicBalancedFloor
+        // Consumer keeps balanced's graphic mapping: a text screenshot deserves the same
+        // visually-lossless tier regardless of which ladder entry the camera content rode in on.
+        case .consumer:   return Calibration.graphicBalancedFloor
         case .aggressive: return Calibration.graphicAggressiveFloor
         case .custom:     return nil
         }

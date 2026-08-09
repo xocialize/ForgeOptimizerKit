@@ -160,6 +160,7 @@ struct ForgeCLI {
         switch args[i + 1] {
         case "max": return .max
         case "balanced": return .balanced
+        case "consumer": return .consumer
         case "aggressive": return .aggressive
         default: return Double(args[i + 1]).map { .custom($0) } ?? .balanced
         }
