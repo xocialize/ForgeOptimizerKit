@@ -52,9 +52,17 @@ struct ForgeCLI {
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
                 let options = Options(quality: quality(from: args), resolution: resolution(from: args))
                 var results: [OptimizeResult] = []
+                // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
+                // a 4K floor search is minutes of real work and the phases are worth naming. Only
+                // detail-bearing events print — stills are near-instant and stay silent.
+                let narrate: @Sendable (OptimizeProgress) -> Void = { p in
+                    guard let detail = p.detail else { return }
+                    let item = p.itemCount > 1 ? "[\(p.itemIndex + 1)/\(p.itemCount)] " : ""
+                    FileHandle.standardError.write(Data("⋯ \(item)\(p.input.lastPathComponent)  \(detail)\n".utf8))
+                }
                 let stream = verb == "weboptimize"
-                    ? try forge.webOptimize(.url(url), to: .directory(outDir), options)
-                    : try forge.optimize(.url(url), to: .directory(outDir), options)
+                    ? try forge.webOptimize(.url(url), to: .directory(outDir), options, progress: narrate)
+                    : try forge.optimize(.url(url), to: .directory(outDir), options, progress: narrate)
                 for await r in stream {
                     if json { emitJSON(resultJSON(r)) } else { report(r) }
                     results.append(r)

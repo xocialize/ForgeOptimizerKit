@@ -91,6 +91,26 @@ for await r in try forge.webOptimize(.url(phoneClip), to: .directory(outDir),
     }
 }
 
+// progress — a 4K floor search is minutes of real work; narrate it instead of spinning.
+// `detail` carries the human stage line (bookend events carry none); `itemIndex`/`itemCount`
+// locate the item in a batch. The handler fires on the optimizer's task — hop to your actor
+// before touching UI (a console log needs no hop).
+for await r in try forge.webOptimize(.url(master), to: .directory(outDir),
+                                     Options(quality: .consumer),
+                                     progress: { p in
+    guard let detail = p.detail else { return }
+    print("[\(p.itemIndex + 1)/\(p.itemCount)] \(detail)")
+}) {
+    print(r.recipe)
+}
+// [1/1] Preparing source — probing container and streams
+// [1/1] Searching for the smallest H.264 that clears SSIMULACRA2 ≥ 75 — several encode+score
+//       passes (a large master can take a couple of minutes)
+// [1/1] Graphic content detected — re-running the search at the raised floor (SSIMULACRA2 ≥ 90)
+//                                   ← only when the class ratchet actually fires
+// Per-pass lines ("pass 3/6 · trying 8.2 Mbps · best −62%") arrive with the media-bridge
+// SearchProgress adoption — same handler, richer `detail`.
+
 // analyze — read-only; corrupt files yield a diagnosis, never vanish
 for await a in forge.analyze(.urls(files)) { print(a.recommendation, a.estimate.note) }
 
@@ -105,10 +125,16 @@ aborts the run; `Summary(results)` aggregates. The host-dictated-URL pipeline fo
 ## CLI
 
 ```
-forge analyze  <file> [--deep]                 # --deep = decode-to-EOF verification
-forge optimize <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
-forge weboptimize <file> <out-dir> [--quality …]
+forge analyze     <file> [--deep] [--json]     # --deep = decode-to-EOF verification
+forge optimize    <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
+                  [--max-height N] [--json]
+forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--json]
+forge sweep | score | vscore | voptimize …     # run `forge` bare for the full surface
 ```
+
+`--json` streams NDJSON receipts on stdout (one object per item + a summary; exit 1 on any
+per-item failure). Optimize verbs narrate their stages to **stderr** as they happen — the same
+`progress:` events as the library example above — so stdout stays machine-clean either way.
 
 ## Build
 
