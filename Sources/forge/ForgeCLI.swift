@@ -10,8 +10,8 @@ import MediaMeasure
 // (PRD §3) and deliberately has no CLI form.
 //
 //   forge analyze     <file> [--deep] [--json]
-//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--json]
-//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--json]
+//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--json]
+//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--json]
 //   forge sweep       <file-or-dir>
 //   forge score       <ref> <distorted> [--metal]
 //   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink]
@@ -50,7 +50,9 @@ struct ForgeCLI {
                 guard args.count >= 3 else { usage(); exit(2) }
                 let url = URL(fileURLWithPath: args[1])
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
-                let options = Options(quality: quality(from: args), resolution: resolution(from: args))
+                let options = Options(quality: quality(from: args), resolution: resolution(from: args),
+                                      output: outputFormat(from: args),
+                                      stripMetadata: args.contains("--strip-metadata"))
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -212,6 +214,8 @@ struct ForgeCLI {
         case .optimized: break
         }
         if let mime = r.outputType?.preferredMIMEType { o["mime"] = mime }
+        // Machine-readable strip claim — a host must not have to parse the recipe prose for it.
+        if r.recipe.strippedMetadata { o["stripped_metadata"] = true }
         return o
     }
 
@@ -248,9 +252,11 @@ struct ForgeCLI {
 
           forge analyze     <file> [--deep] [--json]
                 --deep adds decode-to-EOF integrity verification
-          forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--json]
+          forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--format F]
+                            [--strip-metadata] [--json]
                 native deliverables: HEIC stills · HEVC+AAC mp4 video
-          forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--json]
+          forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--format F]
+                            [--strip-metadata] [--json]
                 web deliverables: PNG/JPEG race stills · H.264+AAC mp4 video · GIF→mp4
           forge sweep       <file-or-dir>
                 re-baseline CSV: each image × {max, balanced, consumer, aggressive}, in memory
@@ -263,6 +269,11 @@ struct ForgeCLI {
                 per-frame SSIMULACRA2 of a video pair, p10-aggregated
 
           --quality Q       max | balanced | consumer | aggressive | <0–100>   (default balanced)
+          --format F        auto | heic | jpeg | png | hevc   (default auto = the verb's policy)
+                            still pins CONVERT: they deliver even when larger than the source;
+                            invalid pairings (e.g. png on video, heic on weboptimize) fail the item
+          --strip-metadata  metadata-clean deliverable (EXIF/GPS/IPTC/XMP; orientation is baked
+                            into pixels either way) — the default preserves stills metadata
           --json            NDJSON receipts on stdout (one per item + a summary object)
 
         exit codes: 0 success · 1 error or any per-item failure · 2 usage
@@ -276,6 +287,24 @@ struct ForgeCLI {
         guard let i = args.firstIndex(of: "--max-height"), i + 1 < args.count,
               let h = Int(args[i + 1]) else { return .source }
         return .maxHeight(h)
+    }
+
+    /// `--format` → `Options.output`. A TYPO'd value exits 2 rather than silently falling back to
+    /// `.auto` — an explicit format request that quietly becomes a different format is exactly the
+    /// silent no-op these flags exist to end.
+    static func outputFormat(from args: [String]) -> OutputFormat {
+        guard let i = args.firstIndex(of: "--format"), i + 1 < args.count else { return .auto }
+        switch args[i + 1].lowercased() {
+        case "auto": return .auto
+        case "heic": return .heic
+        case "jpeg", "jpg": return .jpeg
+        case "png": return .png
+        case "hevc": return .hevc
+        default:
+            FileHandle.standardError.write(Data(
+                "error: unknown --format '\(args[i + 1])' (auto | heic | jpeg | png | hevc)\n".utf8))
+            exit(2)
+        }
     }
 
     static func quality(from args: [String]) -> QualityTarget {

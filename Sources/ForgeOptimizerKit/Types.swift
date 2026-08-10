@@ -71,7 +71,17 @@ public enum QualityTarget: Sendable {
 
 public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors only `.off`
 public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
-public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }  // `.auto` = per media kind
+
+/// The deliverable format. `.auto` = the verb's opinionated default (optimize: HEIC stills /
+/// HEVC video; webOptimize: PNG↔JPEG race / H.264 video). An explicit still format
+/// (`.heic`/`.jpeg`/`.png`) pins the stills encode with **conversion semantics**: it delivers even
+/// when larger than the source, because the caller asked for the format, not for a size win
+/// (pinning the format the source already has keeps the honest-skip size gate). `.hevc` names the
+/// native video default and is video-only. Invalid pairings — a still format on video, `.hevc` on
+/// a still, `.heic` under `webOptimize`, a pin that contradicts a host-pinned `.fileURL`
+/// extension, `.jpeg` on an image with real transparency, any still pin on an animated GIF headed
+/// to web video — fail the item honestly rather than silently reinterpreting the request.
+public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }
 
 /// How hard `analyze` verifies file integrity. `.structural` (the default) runs millisecond byte
 /// walks — box chains, PNG CRCs, JPEG EOI, EBML sizes — safe on every ingest; `.deep` adds a full
@@ -97,6 +107,16 @@ public struct Options: Sendable {
     public var enhance: EnhancePolicy
     public var upscale: UpscaleFactor
     public var output: OutputFormat
+    /// Shed carried metadata (EXIF/GPS/IPTC/XMP…) from the deliverable. `false` (default)
+    /// preserves: a still carries the source's metadata over losslessly; the video remux
+    /// fast-path passes it through. (Video *re-encodes* don't carry source metadata yet — the
+    /// writer is metadata-clean by construction; preserving there is a media-bridge follow-up.)
+    /// `true` guarantees a metadata-clean deliverable on every path — including the remux, which
+    /// gets scrubbed — and forces delivery when the source carries metadata even if the re-encode
+    /// isn't smaller: an honest skip would keep the original, and the original's metadata is
+    /// exactly what the caller asked to shed. Two things are never treated as metadata: ICC color
+    /// profiles (the pixels' rendering contract) and orientation, which is baked into pixels at
+    /// decode so outputs render upright in both modes.
     public var stripMetadata: Bool
     /// `analyze`-only: integrity verification tier (see `IntegrityLevel`).
     public var integrity: IntegrityLevel
@@ -239,6 +259,10 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// honour the request — surfaced rather than silently normalised away.
     public var upscaleRequested: Int? = nil
     public var codec: String? = nil       // output format, e.g. "HEIC" / "HEVC"
+    /// The `Options.stripMetadata` guarantee held for this deliverable: it carries no source
+    /// metadata. On the receipt because a stripped file is indistinguishable from a clean-source
+    /// file by looking — the claim has to ride with the artifact.
+    public var strippedMetadata = false
     public var qualityFloor: Double? = nil
     /// The preset floor the class ratchet RAISED from, when it did (nil = no raise ran). The
     /// effective floor lives in `qualityFloor`; both appear on the receipt because a raised floor
@@ -292,6 +316,7 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
             }
         }
         if let c = codec { parts.append("→\(c)") }
+        if strippedMetadata { parts.append("strip-metadata") }
         if let q = qualityFloor {
             if let base = floorRaisedFrom, let cls = contentClass {
                 parts.append("@SSIMU2≥\(Int(q)) (raised from \(Int(base)) · \(cls))")
@@ -479,6 +504,10 @@ public enum ForgeError: Error, CustomStringConvertible {
     case decodeFailed(URL)
     case renderFailed(String)
     case notImplemented(String)
+    /// The request pairs options that contradict each other or the media kind (e.g. a stills
+    /// format on video, `.heic` under the web verb, a pin against a host-pinned destination).
+    /// Refused loudly: silently reinterpreting an explicit request is the no-op this replaces.
+    case invalidOptions(String)
     case busy                       // single-flight: a run is already in progress (host owns any queueing)
     /// The host named an output path equal to the input. Refused rather than honoured: `OptimizeRequest`
     /// guarantees the input stays byte-identical, and a host relying on that (a write-once canonical
@@ -494,6 +523,7 @@ public enum ForgeError: Error, CustomStringConvertible {
             return "output would overwrite the input (\(u.lastPathComponent)); the input is read-only"
         case .renderFailed(let s): return "render failed: \(s)"
         case .notImplemented(let s): return "not implemented: \(s)"
+        case .invalidOptions(let s): return "invalid options: \(s)"
         case .busy: return "optimizer busy — a run is already in progress"
         }
     }
