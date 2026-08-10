@@ -139,7 +139,7 @@ struct ForgeCLI {
         FileHandle.standardError.write(Data("""
         forge — ForgeOptimizer CLI (Phase A)
           forge analyze  <file> [--deep]     --deep adds decode-to-EOF integrity verification
-          forge optimize <file> <out-dir> [--quality max|balanced|aggressive|<0–100>]
+          forge optimize <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
           forge weboptimize <file> <out-dir> [--quality …]   web outputs: PNG · H.264+AAC mp4
           forge sweep    <file-or-dir>    re-baseline CSV: each image × all presets
           forge score    <ref> <distorted>   our SSIMULACRA2 (parity-diff vs canonical)
