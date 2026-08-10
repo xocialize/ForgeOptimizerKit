@@ -151,8 +151,10 @@ public struct ForgeOptimizer: Sendable {
     /// Stream a receipt per input. Per-item failures are isolated (yielded as `.failed`), so one bad
     /// file never aborts a bulk run. Throws only on up-front contract errors (e.g. unwritable folder).
     public func optimize(_ source: Source, to destination: Destination,
-                         _ options: Options = .init()) throws -> AsyncStream<OptimizeResult> {
-        try stream(source, to: destination, options, profile: .native)
+                         _ options: Options = .init(),
+                         progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        throws -> AsyncStream<OptimizeResult> {
+        try stream(source, to: destination, options, profile: .native, progress: progress)
     }
 
     /// `optimize` for web platforms: same planner, same receipts, web-universal outputs — stills →
@@ -166,21 +168,34 @@ public struct ForgeOptimizer: Sendable {
     /// the input is already web-native (PNG / H.264-mp4+AAC) and the re-encode isn't smaller —
     /// there the original itself is the web deliverable.
     public func webOptimize(_ source: Source, to destination: Destination,
-                            _ options: Options = .init()) throws -> AsyncStream<OptimizeResult> {
-        try stream(source, to: destination, options, profile: .web)
+                            _ options: Options = .init(),
+                            progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        throws -> AsyncStream<OptimizeResult> {
+        try stream(source, to: destination, options, profile: .web, progress: progress)
     }
 
     private func stream(_ source: Source, to destination: Destination, _ options: Options,
-                        profile: OutputProfile) throws -> AsyncStream<OptimizeResult> {
+                        profile: OutputProfile,
+                        progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+        throws -> AsyncStream<OptimizeResult> {
         try prepareDestination(destination)
         let urls = source.urls
         return AsyncStream { continuation in
             Task {
-                for url in urls {
+                for (i, url) in urls.enumerated() {
                     let start = Date()
+                    let emit: ProgressEmit? = progress.map { handler in
+                        { phase, fraction, detail in
+                            handler(OptimizeProgress(context: nil, input: url, phase: phase,
+                                                     fraction: fraction, detail: detail,
+                                                     itemIndex: i, itemCount: urls.count))
+                        }
+                    }
+                    emit?(.searching, 0, nil)
                     do {
                         continuation.yield(try await optimizeOne(url, to: destination, options,
-                                                                 start: start, profile: profile))
+                                                                 start: start, profile: profile,
+                                                                 emit: emit))
                     } catch {
                         let bytes = fileSize(url)
                         continuation.yield(OptimizeResult(
@@ -189,6 +204,7 @@ public struct ForgeOptimizer: Sendable {
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
                             status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start)))
                     }
+                    emit?(.finalizing, 1, nil)
                 }
                 continuation.finish()
             }
@@ -196,9 +212,10 @@ public struct ForgeOptimizer: Sendable {
     }
 
     /// Pipeline entry: each `OptimizeRequest` names its **exact output URL** and an optional `context`
-    /// token (echoed on the result). Per-item failures are isolated. `progress` is **stubbed** — only the
-    /// terminal `.searching`(0) → `.finalizing`(1) bookends fire today (per-iteration granularity is the
-    /// deferred implementation). Single-flight + busy-rejection live in `ForgeOptimizerService`, not here.
+    /// token (echoed on the result). Per-item failures are isolated. `progress` carries batch indices
+    /// plus coarse per-item stages today (see `OptimizeProgress` — per-pass fractions arrive with the
+    /// media-bridge 0.28.0 adoption). Single-flight + busy-rejection live in `ForgeOptimizerService`,
+    /// not here.
     public func optimize(_ requests: [OptimizeRequest],
                          progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
         -> AsyncStream<OptimizeResult> {
@@ -219,14 +236,20 @@ public struct ForgeOptimizer: Sendable {
         -> AsyncStream<OptimizeResult> {
         AsyncStream { continuation in
             Task {
-                for req in requests {
+                for (i, req) in requests.enumerated() {
                     let start = Date()
-                    progress?(OptimizeProgress(context: req.context, input: req.input,
-                                               phase: .searching, fraction: 0))
+                    let emit: ProgressEmit? = progress.map { handler in
+                        { phase, fraction, detail in
+                            handler(OptimizeProgress(context: req.context, input: req.input,
+                                                     phase: phase, fraction: fraction, detail: detail,
+                                                     itemIndex: i, itemCount: requests.count))
+                        }
+                    }
+                    emit?(.searching, 0, nil)
                     do {
                         try prepareDestination(.fileURL(req.output))
                         let r = try await optimizeOne(req.input, to: .fileURL(req.output), req.options,
-                                                      start: start, profile: profile)
+                                                      start: start, profile: profile, emit: emit)
                         continuation.yield(r.with(context: req.context))
                     } catch {
                         let bytes = fileSize(req.input)
@@ -237,21 +260,25 @@ public struct ForgeOptimizer: Sendable {
                             status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start),
                             context: req.context))
                     }
-                    progress?(OptimizeProgress(context: req.context, input: req.input,
-                                               phase: .finalizing, fraction: 1))
+                    emit?(.finalizing, 1, nil)
                 }
                 continuation.finish()
             }
         }
     }
 
+    /// Per-item progress emitter, already bound to the item's context/input/batch position by the
+    /// caller: (phase, fraction within this item, optional human detail line).
+    typealias ProgressEmit = @Sendable (OptimizeProgress.Phase, Double, String?) -> Void
+
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
-                             start: Date, profile: OutputProfile = .native) async throws -> OptimizeResult {
+                             start: Date, profile: OutputProfile = .native,
+                             emit: ProgressEmit? = nil) async throws -> OptimizeResult {
         switch mediaKind(of: url) {
         case .image: return try await optimizeImage(url, to: destination, options, start: start,
-                                                    profile: profile)
+                                                    profile: profile, emit: emit)
         case .video: return try await optimizeVideo(url, to: destination, options, start: start,
-                                                    profile: profile)
+                                                    profile: profile, emit: emit)
         case .unknown: throw ForgeError.unsupportedMedia(url)
         }
     }
@@ -259,11 +286,15 @@ public struct ForgeOptimizer: Sendable {
     /// Image path: optional engine enhance → target-quality HEIC via media-bridge's SSIMULACRA2
     /// search (`.native`), or lossless PNG with the measured round-trip score (`.web`).
     private func optimizeImage(_ url: URL, to destination: Destination, _ options: Options,
-                               start: Date, profile: OutputProfile) async throws -> OptimizeResult {
+                               start: Date, profile: OutputProfile,
+                               emit: ProgressEmit? = nil) async throws -> OptimizeResult {
         // An ANIMATED GIF is motion content wearing a still extension: on the web profile it
         // converts to an H.264 mp4 (typically ~10× smaller) through the same floor search as any
         // video. Single-frame GIFs fall through to the still race like every other image.
         if profile == .web, isGIF(url), GIFVideo.frameCount(url) > 1 {
+            emit?(.searching, 0.05,
+                  "Converting animated GIF — compositing frames, then searching for the smallest "
+                  + "H.264 that clears SSIMULACRA2 ≥ \(Int(options.quality.floor))")
             return try await optimizeAnimatedGIF(url, to: destination, options, start: start)
         }
         let inBytes = fileSize(url)
@@ -459,7 +490,8 @@ public struct ForgeOptimizer: Sendable {
     /// already web-native. Same resolution by default; `options.resolution = .maxHeight(_)` steps it
     /// down (4K→HD), quality measured at the target resolution.
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
-                               start: Date, profile: OutputProfile) async throws -> OptimizeResult {
+                               start: Date, profile: OutputProfile,
+                               emit: ProgressEmit? = nil) async throws -> OptimizeResult {
         // Upscale is a *quality* op (HD→4K), the opposite of compression — when requested and an enhancer is
         // present, run the temporally-consistent per-frame SR pipeline (V1: standalone HEVC deliverable).
         if options.upscale != .none, let enhancer {
@@ -467,6 +499,7 @@ public struct ForgeOptimizer: Sendable {
                                           start: start, profile: profile)
         }
 
+        emit?(.searching, 0.02, "Preparing source — probing container and streams")
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let sourceBytes = fileSize(url)
         let encodeProfile: VideoQualityTarget.EncodeProfile
@@ -520,6 +553,17 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
+        // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
+        // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
+        emit?(.searching, 0.05,
+              "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
+              + "\(Int(options.quality.floor)) — several encode+score passes"
+              + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
+        // DEEP PROGRESS SEAM (blocked on media-bridge 0.28.0 — 0.27.0 has no `onProgress`):
+        // pass `onProgress:` here, mapping `VideoQualityTarget.SearchProgress` into
+        // `emit(.searching / .scoring, 0.05 + 0.90 * p.fraction, <stage line>)` — the stages carry
+        // pass index/planned, the bitrate under test, and the best-so-far (bitrate + p10) for a
+        // live "pass 3/6 · trying 8.2 Mbps · best −62%" line. The UI already renders `detail`.
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: options.quality.floor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
@@ -559,6 +603,10 @@ public struct ForgeOptimizer: Sendable {
             let stash = outURL.deletingLastPathComponent()
                 .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
             try FileManager.default.moveItem(at: outURL, to: stash)
+            // The bar honestly re-opens: a second search is genuinely more work, not a regression.
+            emit?(.searching, 0.5,
+                  "Graphic content detected — re-running the search at the raised floor "
+                  + "(SSIMULACRA2 ≥ \(Int(raised)))")
             let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                             targetScore: raised,
                                                             maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
@@ -573,6 +621,7 @@ public struct ForgeOptimizer: Sendable {
                 try FileManager.default.moveItem(at: stash, to: outURL)
             }
         }
+        emit?(.finalizing, 0.95, nil)
 
         var recipe = AppliedRecipe()
         recipe.codec = encodeProfile.codecLabel

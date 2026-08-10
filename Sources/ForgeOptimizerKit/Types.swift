@@ -137,18 +137,33 @@ public struct OptimizeRequest: Sendable {
     }
 }
 
-/// Progress for one item. **Stubbed:** the type + handler are defined so a host can wire a progress
-/// surface now; today only the terminal `.searching`(0) → `.finalizing`(1) bookends fire per item.
-/// Per-iteration fractions (and mid-encode cancellation) are the deferred implementation.
+/// Progress for one item, emitted on both the destination-based and request-based paths.
+///
+/// Two dimensions travel together: `itemIndex`/`itemCount` locate the item in the submitted batch
+/// (the outer bar), and `phase` + `fraction` + `detail` narrate the item itself. Today the video
+/// path emits coarse stage transitions (preparing → searching → finalizing) with honest detail
+/// lines; per-pass fractions and best-so-far lines arrive when the Kit adopts media-bridge's
+/// `SearchProgress` callback (needs the 0.28.0 tag — the mapping seam is marked in
+/// `optimizeVideo`). Stills are near-instant and emit bookends only. The handler fires on the
+/// optimizer's task — hop to your actor/main thread before touching UI.
 public struct OptimizeProgress: Sendable {
     public enum Phase: Sendable { case searching, encoding, scoring, finalizing }
     public let context: String?
     public let input: URL
     public let phase: Phase
-    public let fraction: Double      // 0…1
+    public let fraction: Double      // 0…1 within this item
+    /// Human-readable stage line ("searching for the smallest H.264 that clears SSIMU2 ≥ 75…");
+    /// nil when the phase alone tells the story.
+    public let detail: String?
+    /// This item's position in the submitted batch (0-based) and the batch size — the outer
+    /// progress dimension a host combines with `fraction`.
+    public let itemIndex: Int
+    public let itemCount: Int
 
-    public init(context: String?, input: URL, phase: Phase, fraction: Double) {
+    public init(context: String?, input: URL, phase: Phase, fraction: Double,
+                detail: String? = nil, itemIndex: Int = 0, itemCount: Int = 1) {
         self.context = context; self.input = input; self.phase = phase; self.fraction = fraction
+        self.detail = detail; self.itemIndex = itemIndex; self.itemCount = itemCount
     }
 }
 
