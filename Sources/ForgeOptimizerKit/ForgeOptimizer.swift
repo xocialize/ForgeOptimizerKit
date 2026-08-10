@@ -489,6 +489,34 @@ public struct ForgeOptimizer: Sendable {
     /// H.264 + AAC (the mp4 every browser plays), delivered even when larger unless the source is
     /// already web-native. Same resolution by default; `options.resolution = .maxHeight(_)` steps it
     /// down (4K→HD), quality measured at the target resolution.
+    /// One human line per `SearchProgress` event — the "Pass 3/6 — encoding at 8.2 Mbps" /
+    /// "best so far 7.4 Mbps @ p10 81.4" narration hosts render from `OptimizeProgress.detail`.
+    /// nil for events whose fraction advance is the whole story.
+    private static func searchStageLine(_ p: VideoQualityTarget.SearchProgress) -> String? {
+        switch p.stage {
+        case .preparing, .finalizing:
+            return nil
+        case .mezzanine(let toneMapSDR, let downscale):
+            var parts: [String] = []
+            if downscale { parts.append("downscaling") }
+            if toneMapSDR { parts.append("tone-mapping HDR→SDR") }
+            let what = parts.isEmpty ? "denoising" : parts.joined(separator: " + ")
+            return "Rendering the reference mezzanine (\(what))"
+        case .pass(let label, let index, let planned, let bitrate):
+            return String(format: "Pass %d/%d (%@) — encoding at %.1f Mbps",
+                          index, planned, label, Double(bitrate) / 1e6)
+        case .scoring(_, let index, let planned):
+            return "Pass \(index)/\(planned) — scoring frames"
+        case .passResult(_, let p10, let cleared, let bestBitrate, let bestP10):
+            let verdict = cleared ? "cleared" : "below floor"
+            if let bestBitrate, let bestP10 {
+                return String(format: "p10 %.1f (%@) · best so far %.1f Mbps @ p10 %.1f",
+                              p10, verdict, Double(bestBitrate) / 1e6, bestP10)
+            }
+            return String(format: "p10 %.1f (%@)", p10, verdict)
+        }
+    }
+
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date, profile: OutputProfile,
                                emit: ProgressEmit? = nil) async throws -> OptimizeResult {
@@ -553,21 +581,51 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
-        // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
-        // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
+        // The camera-noise self-gate (consumer preset, macOS 26+): a cheap denoise probe asks
+        // whether a conservative temporal filter would actually change this clip. Clean content
+        // probes ≥ ~96 (the filter no-ops) and stays on the preset floor vs the raw source;
+        // demonstrably noisy content (probes ~65 on real handheld grain) gates at the camera
+        // floor against a DENOISED mezzanine instead — the research-grounded quality-saturation
+        // path. The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
+        var targetFloor = options.quality.floor
+        var denoiseStrength: Float? = nil
+        if case .consumer = options.quality {
+            emit?(.searching, 0.03, "Probing sensor noise (camera self-gate)")
+            if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput),
+               probe < ContentClassifier.Calibration.cameraNoiseGate {
+                targetFloor = ContentClassifier.Calibration.cameraDenoisedFloor
+                denoiseStrength = 0.1
+                emit?(.searching, 0.04,
+                      "Camera noise detected — scoring against a denoised reference at floor \(Int(targetFloor))")
+            }
+        }
+
+        // The search dominates the item's wall clock (~2 min on a 4K master, search-bound):
+        // narrate the entry, then map media-bridge's live SearchProgress into this item's
+        // progress — pass i/planned, the bitrate under test, best-so-far. The search owns
+        // 0.05…0.95 of the item's fraction; its own finalizing is dropped because the Kit
+        // emits finalizing after the ratchet decides.
         emit?(.searching, 0.05,
               "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
-              + "\(Int(options.quality.floor)) — several encode+score passes"
+              + "\(Int(targetFloor)) — several encode+score passes"
               + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
-        // DEEP PROGRESS SEAM (blocked on media-bridge 0.28.0 — 0.27.0 has no `onProgress`):
-        // pass `onProgress:` here, mapping `VideoQualityTarget.SearchProgress` into
-        // `emit(.searching / .scoring, 0.05 + 0.90 * p.fraction, <stage line>)` — the stages carry
-        // pass index/planned, the bitrate under test, and the best-so-far (bitrate + p10) for a
-        // live "pass 3/6 · trying 8.2 Mbps · best −62%" line. The UI already renders `detail`.
+        let onSearch: (@Sendable (VideoQualityTarget.SearchProgress) -> Void)? = emit.map { emit in
+            { p in
+                let phase: OptimizeProgress.Phase
+                switch p.stage {
+                case .scoring: phase = .scoring
+                case .finalizing: return
+                default: phase = .searching
+                }
+                emit(phase, 0.05 + 0.90 * p.fraction, Self.searchStageLine(p))
+            }
+        }
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                    targetScore: options.quality.floor,
+                                                    targetScore: targetFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                    profile: encodeProfile)
+                                                    profile: encodeProfile,
+                                                    denoiseStrength: denoiseStrength,
+                                                    onProgress: onSearch)
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
@@ -593,7 +651,7 @@ public struct ForgeOptimizer: Sendable {
         // a stricter attempt must never cost the result already in hand. Ratchet-up only; `.custom`
         // floors are exempt inside `raisedFloor`.
         var chosen = r
-        var effectiveFloor = options.quality.floor
+        var effectiveFloor = targetFloor
         var floorRaisedFrom: Double? = nil
         if chosen.delivered, chosen.metTarget,
            let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
@@ -631,6 +689,7 @@ public struct ForgeOptimizer: Sendable {
             recipe.floorRaisedFrom = floorRaisedFrom
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
         }
+        recipe.denoisedReference = denoiseStrength != nil
 
         // `before` describes the ORIGINAL source, not the normalize intermediate.
         let before = MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight)

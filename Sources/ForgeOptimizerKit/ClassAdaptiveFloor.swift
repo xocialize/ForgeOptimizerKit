@@ -79,5 +79,16 @@ enum ContentClassifier {
         static let graphicMaxFloor: Double = 94
         static let graphicBalancedFloor: Double = 90
         static let graphicAggressiveFloor: Double = 82
+
+        /// The camera-noise self-gate (consumer preset, macOS 26+): a conservative temporal
+        /// denoise probe scoring BELOW this means the clip demonstrably carries noise, and the
+        /// search gates against the DENOISED mezzanine at `cameraDenoisedFloor` — the
+        /// research-grounded quality-saturation approach (fidelity-to-noise is not what anyone
+        /// is buying). Calibration 2026-08-10: clean production footage probes 95.9–99.5 (the
+        /// filter no-ops), genuine handheld grain ~65 — a ~30-point chasm; 90 sits in it with
+        /// margin on both sides. Clean content NEVER takes this path: the weaker floor cannot
+        /// leak onto content that didn't earn it.
+        static let cameraNoiseGate: Double = 90
+        static let cameraDenoisedFloor: Double = 70
     }
 }
