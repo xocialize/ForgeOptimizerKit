@@ -232,6 +232,10 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// The mechanically-detected content class that justified the raise (e.g. "graphic"). Set only
     /// alongside `floorRaisedFrom` — a classification that changed nothing is not receipt material.
     public var contentClass: String? = nil
+    /// The quality floor was measured against a conservatively-DENOISED mezzanine, not the raw
+    /// source (the consumer camera path: the clip's own noise probe proved the content noisy, and
+    /// fidelity-to-noise is not the promise). The receipt must say which reference held the floor.
+    public var denoisedReference: Bool = false
 
     public init() {}
 
@@ -276,6 +280,8 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         if let q = qualityFloor {
             if let base = floorRaisedFrom, let cls = contentClass {
                 parts.append("@SSIMU2≥\(Int(q)) (raised from \(Int(base)) · \(cls))")
+            } else if denoisedReference {
+                parts.append("@SSIMU2≥\(Int(q)) (camera · denoised ref)")
             } else {
                 parts.append("@SSIMU2≥\(Int(q))")
             }

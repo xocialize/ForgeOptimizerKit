@@ -520,10 +520,27 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
+        // The camera-noise self-gate (consumer preset, macOS 26+): a cheap denoise probe asks
+        // whether a conservative temporal filter would actually change this clip. Clean content
+        // probes ≥ ~96 (the filter no-ops) and stays on the preset floor vs the raw source;
+        // demonstrably noisy content (probes ~65 on real handheld grain) gates at the camera
+        // floor against a DENOISED mezzanine instead — the research-grounded quality-saturation
+        // path. The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
+        var targetFloor = options.quality.floor
+        var denoiseStrength: Float? = nil
+        if case .consumer = options.quality {
+            if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput),
+               probe < ContentClassifier.Calibration.cameraNoiseGate {
+                targetFloor = ContentClassifier.Calibration.cameraDenoisedFloor
+                denoiseStrength = 0.1
+            }
+        }
+
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                    targetScore: options.quality.floor,
+                                                    targetScore: targetFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                    profile: encodeProfile)
+                                                    profile: encodeProfile,
+                                                    denoiseStrength: denoiseStrength)
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
@@ -549,7 +566,7 @@ public struct ForgeOptimizer: Sendable {
         // a stricter attempt must never cost the result already in hand. Ratchet-up only; `.custom`
         // floors are exempt inside `raisedFloor`.
         var chosen = r
-        var effectiveFloor = options.quality.floor
+        var effectiveFloor = targetFloor
         var floorRaisedFrom: Double? = nil
         if chosen.delivered, chosen.metTarget,
            let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
@@ -582,6 +599,7 @@ public struct ForgeOptimizer: Sendable {
             recipe.floorRaisedFrom = floorRaisedFrom
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
         }
+        recipe.denoisedReference = denoiseStrength != nil
 
         // `before` describes the ORIGINAL source, not the normalize intermediate.
         let before = MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight)
