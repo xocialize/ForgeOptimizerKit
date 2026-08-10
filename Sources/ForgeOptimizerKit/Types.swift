@@ -354,7 +354,14 @@ public struct Summary: Sendable {
         skipped = results.filter { if case .skipped = $0.status { return true }; return false }.count
         failed = results.filter { if case .failed = $0.status { return true }; return false }.count
         bytesIn = results.reduce(0) { $0 + $1.before.bytes }
-        bytesOut = results.reduce(0) { $0 + $1.after.bytes }
+        // Only a delivery changes what's on disk. Skipped/failed keep the original, so they count at
+        // `before.bytes` regardless of what their `after` carries — a trial encode's size (or a zero)
+        // must never read as savings in the aggregate. Structural: even if a future path regresses
+        // the receipt convention, the aggregate cannot claim savings from a non-delivery.
+        bytesOut = results.reduce(0) { sum, r in
+            if case .optimized = r.status { return sum + r.after.bytes }
+            return sum + r.before.bytes
+        }
     }
 }
 

@@ -587,13 +587,20 @@ public struct ForgeOptimizer: Sendable {
         let before = MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight)
         // Carry the reduction, not just the gating number: a bare score cannot say it is a percentile
         // over a sample, and this field being non-nil is what marks it as an aggregate (BRIDGE-061).
-        let after = MediaStats(bytes: chosen.outputBytes, width: chosen.width, height: chosen.height,
-                               qualityScore: chosen.score,
-                               qualityAggregation: .init(percentile: chosen.aggregation.percentile,
-                                                         minimum: chosen.aggregation.minimum,
-                                                         mean: chosen.aggregation.mean,
-                                                         framesScored: chosen.aggregation.framesScored,
-                                                         frameCount: chosen.aggregation.frameCount))
+        // A NON-delivery keeps the original, so `after` describes IT (source bytes/dims) — never the
+        // deleted trial encode, whose byte count would read as savings in any aggregate. The trial's
+        // score/aggregation still ride along: they are the evidence behind the skip reason.
+        // (Ported from the skip-aggregation worktree fix; its branch predates the parity rewrite.)
+        let aggregation = MediaStats.QualityAggregation(percentile: chosen.aggregation.percentile,
+                                                        minimum: chosen.aggregation.minimum,
+                                                        mean: chosen.aggregation.mean,
+                                                        framesScored: chosen.aggregation.framesScored,
+                                                        frameCount: chosen.aggregation.frameCount)
+        let after = chosen.delivered
+            ? MediaStats(bytes: chosen.outputBytes, width: chosen.width, height: chosen.height,
+                         qualityScore: chosen.score, qualityAggregation: aggregation)
+            : MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight,
+                         qualityScore: chosen.score, qualityAggregation: aggregation)
         // `output` is `.none` unless the encode delivered — it leaves NO file at `outURL` otherwise,
         // so the receipt must match (no `.file` pointing at a nonexistent path → no host orphan).
         // `delivered` is the encode profile's own rule; don't re-derive it here.
@@ -684,7 +691,7 @@ public struct ForgeOptimizer: Sendable {
             recipe.setUpscale(measuredFrom: src.w, to: 0, requested: options.upscale)
             return OptimizeResult(
                 input: url, kind: .video, output: .none, recipe: recipe, before: before,
-                after: MediaStats(bytes: 0, width: 0, height: 0),
+                after: before,   // nothing was produced — the kept original is the after-state
                 status: .skipped("upscale produced no output"),
                 elapsed: Date().timeIntervalSince(start))
         }
@@ -699,13 +706,18 @@ public struct ForgeOptimizer: Sendable {
             recipe.codec = "H.264"
             recipe.qualityFloor = options.quality.floor
             recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
-            let after = MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
-                                   qualityScore: r.score,
-                                   qualityAggregation: .init(percentile: r.aggregation.percentile,
-                                                             minimum: r.aggregation.minimum,
-                                                             mean: r.aggregation.mean,
-                                                             framesScored: r.aggregation.framesScored,
-                                                             frameCount: r.aggregation.frameCount))
+            let aggregation = MediaStats.QualityAggregation(percentile: r.aggregation.percentile,
+                                                            minimum: r.aggregation.minimum,
+                                                            mean: r.aggregation.mean,
+                                                            framesScored: r.aggregation.framesScored,
+                                                            frameCount: r.aggregation.frameCount)
+            // Non-delivery keeps the original → `after` = source bytes/dims; the floor evidence
+            // (score/aggregation) still rides along.
+            let after = r.delivered
+                ? MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
+                             qualityScore: r.score, qualityAggregation: aggregation)
+                : MediaStats(bytes: before.bytes, width: src.w, height: src.h,
+                             qualityScore: r.score, qualityAggregation: aggregation)
             return OptimizeResult(
                 input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
                 recipe: recipe, before: before, after: after,
