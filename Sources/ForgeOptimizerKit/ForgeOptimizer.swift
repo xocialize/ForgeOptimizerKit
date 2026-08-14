@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 import MediaBridge
 import ImageBridge
 import MediaMeasure
+import MediaMetrics
 
 /// The headless ForgeOptimizer core. Phase A runs entirely on media-bridge (pure-Swift, FFmpeg-free):
 /// structural `analyze`, target-quality `optimize`, and `.fast` `conform`. No MLX, no metallib —
@@ -184,6 +185,9 @@ public struct ForgeOptimizer: Sendable {
             Task {
                 for (i, url) in urls.enumerated() {
                     let start = Date()
+                    let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
+                                                    attrs: ["input": url.lastPathComponent,
+                                                            "index": "\(i)"])
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: nil, input: url, phase: phase,
@@ -205,6 +209,7 @@ public struct ForgeOptimizer: Sendable {
                             status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start)))
                     }
                     emit?(.finalizing, 1, nil)
+                    MediaMetrics.end(mmItem)
                 }
                 continuation.finish()
             }
@@ -238,6 +243,9 @@ public struct ForgeOptimizer: Sendable {
             Task {
                 for (i, req) in requests.enumerated() {
                     let start = Date()
+                    let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
+                                                    attrs: ["input": req.input.lastPathComponent,
+                                                            "index": "\(i)"])
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: req.context, input: req.input,
@@ -261,6 +269,7 @@ public struct ForgeOptimizer: Sendable {
                             context: req.context))
                     }
                     emit?(.finalizing, 1, nil)
+                    MediaMetrics.end(mmItem)
                 }
                 continuation.finish()
             }
@@ -270,6 +279,42 @@ public struct ForgeOptimizer: Sendable {
     /// Per-item progress emitter, already bound to the item's context/input/batch position by the
     /// caller: (phase, fraction within this item, optional human detail line).
     typealias ProgressEmit = @Sendable (OptimizeProgress.Phase, Double, String?) -> Void
+
+    /// The deep-progress seam: maps media-bridge's pass-granular `SearchProgress` into this item's
+    /// emitter. `base`/`span` place the search inside the item's own 0…1 (the first search spans
+    /// 0.05…0.95; the class-ratchet re-run re-opens at 0.50). Returns nil when the caller isn't
+    /// listening, so the search skips the callback entirely.
+    private static func searchProgressAdapter(emit: ProgressEmit?, base: Double, span: Double)
+        -> (@Sendable (VideoQualityTarget.SearchProgress) -> Void)? {
+        guard let emit else { return nil }
+        return { p in
+            let f = base + span * p.fraction
+            switch p.stage {
+            case .preparing:
+                emit(.searching, f, nil)
+            case .mezzanine(let toneMapSDR, let downscale):
+                var what: [String] = []
+                if downscale { what.append("downscale") }
+                if toneMapSDR { what.append("HDR→SDR tone-map") }
+                emit(.encoding, f, "Rendering near-lossless reference"
+                     + (what.isEmpty ? "" : " — " + what.joined(separator: " + ")))
+            case .pass(let label, let index, let planned, let bitrate):
+                emit(.encoding, f, String(format: "pass %d/%d (%@) · encoding at %.1f Mbps",
+                                          index, planned, label, Double(bitrate) / 1e6))
+            case .scoring(let label, let index, let planned):
+                emit(.scoring, f, "pass \(index)/\(planned) (\(label)) · scoring per-frame SSIMULACRA2")
+            case .passResult(let label, let p10, let cleared, let bestBitrate, let bestP10):
+                var line = String(format: "%@ · p10 %.1f · %@", label, p10,
+                                  cleared ? "clears the floor" : "below the floor")
+                if let bb = bestBitrate, let bp = bestP10 {
+                    line += String(format: " · best %.1f Mbps (p10 %.1f)", Double(bb) / 1e6, bp)
+                }
+                emit(.scoring, f, line)
+            case .finalizing:
+                emit(.finalizing, f, nil)
+            }
+        }
+    }
 
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date, profile: OutputProfile = .native,
@@ -298,7 +343,9 @@ public struct ForgeOptimizer: Sendable {
             return try await optimizeAnimatedGIF(url, to: destination, options, start: start)
         }
         let inBytes = fileSize(url)
-        guard var cg = loadCGImage(url) else { throw ForgeError.decodeFailed(url) }
+        let decoded = MediaMetrics.time("kit.decode", lane: "decode",
+                                        attrs: ["input": url.lastPathComponent]) { loadCGImage(url) }
+        guard var cg = decoded else { throw ForgeError.decodeFailed(url) }
 
         var recipe = AppliedRecipe()
         recipe.normalized = true
@@ -309,7 +356,10 @@ public struct ForgeOptimizer: Sendable {
         let enhanced = options.enhance != .off && enhancer != nil
         if enhanced, let enhancer {
             let widthBefore = cg.width
-            cg = try await enhancer.enhance(cg, options: options)
+            cg = try await MediaMetrics.time("kit.enhance", lane: "gpu",
+                                             attrs: ["w": "\(cg.width)", "h": "\(cg.height)"]) {
+                try await enhancer.enhance(cg, options: options)
+            }
             recipe.restored = true
             // Measured, not requested (BRIDGE-062). The enhance seam returns only a CGImage, so the
             // artifact is the only thing that can be trusted about what happened to it.
@@ -393,7 +443,9 @@ public struct ForgeOptimizer: Sendable {
                 elapsed: Date().timeIntervalSince(start))
         }
 
-        let output = try write(data, for: url, ext: profile == .web ? webExt : "heic", to: destination)
+        let output = try MediaMetrics.time("kit.write", lane: "io") {
+            try write(data, for: url, ext: profile == .web ? webExt : "heic", to: destination)
+        }
         return OptimizeResult(
             input: url, kind: .image, output: output, recipe: recipe, before: before,
             after: MediaStats(bytes: data.count, width: cg.width, height: cg.height,
@@ -511,7 +563,10 @@ public struct ForgeOptimizer: Sendable {
         case .native:
             encodeProfile = .hevc
         case .web:
-            let info = try? await MediaBridge.probe(url: url)
+            let info = await MediaMetrics.time("kit.probe", lane: "io",
+                                               attrs: ["input": url.lastPathComponent]) {
+                try? await MediaBridge.probe(url: url)
+            }
             webReady = Self.isWebReady(info)
             // Web-safe STREAMS in the wrong wrapper (an H.264+AAC .mov capture): the lossless
             // passthrough remux is the baseline deliverable — byte-identical quality at ~source
@@ -521,7 +576,10 @@ public struct ForgeOptimizer: Sendable {
             if !webReady, Self.hasWebSafeStreams(info) {
                 let temp = FileManager.default.temporaryDirectory
                     .appendingPathComponent("forge-webremux-\(UUID().uuidString).mp4")
-                if (try? await MediaBridge.remuxToMP4(input: url, output: temp)) != nil {
+                let remuxed = await MediaMetrics.time("kit.remux", lane: "encode") {
+                    (try? await MediaBridge.remuxToMP4(input: url, output: temp)) != nil
+                }
+                if remuxed {
                     remuxTemp = temp
                     intermediates.append(temp)
                     encodeInput = temp
@@ -545,7 +603,10 @@ public struct ForgeOptimizer: Sendable {
                 if let info, !info.container.isNativeApple {
                     let temp = FileManager.default.temporaryDirectory
                         .appendingPathComponent("forge-webnorm-\(UUID().uuidString).mp4")
-                    try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                    try await MediaMetrics.time("kit.normalize", lane: "encode",
+                                                attrs: ["container": info.container.rawValue]) {
+                        try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                    }
                     encodeInput = temp
                     intermediates.append(temp)
                 }
@@ -559,15 +620,16 @@ public struct ForgeOptimizer: Sendable {
               "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
               + "\(Int(options.quality.floor)) — several encode+score passes"
               + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
-        // DEEP PROGRESS SEAM (blocked on media-bridge 0.28.0 — 0.27.0 has no `onProgress`):
-        // pass `onProgress:` here, mapping `VideoQualityTarget.SearchProgress` into
-        // `emit(.searching / .scoring, 0.05 + 0.90 * p.fraction, <stage line>)` — the stages carry
-        // pass index/planned, the bitrate under test, and the best-so-far (bitrate + p10) for a
-        // live "pass 3/6 · trying 8.2 Mbps · best −62%" line. The UI already renders `detail`.
+        // DEEP PROGRESS SEAM (media-bridge 0.28.0): the search's own pass-granular
+        // `SearchProgress` maps into this item's emitter — pass index/planned, the bitrate under
+        // test, and the best-so-far, live. The UI already renders `detail`.
         let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: options.quality.floor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                    profile: encodeProfile)
+                                                    profile: encodeProfile,
+                                                    onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                           base: 0.05,
+                                                                                           span: 0.90))
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
@@ -595,10 +657,14 @@ public struct ForgeOptimizer: Sendable {
         var chosen = r
         var effectiveFloor = options.quality.floor
         var floorRaisedFrom: Double? = nil
-        if chosen.delivered, chosen.metTarget,
-           let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
-                                                        preset: options.quality,
-                                                        hevc: encodeProfile.codec == .hevc),
+        let raisedFloor: Double? = (chosen.delivered && chosen.metTarget)
+            ? try await MediaMetrics.time("kit.classify", lane: "orchestrate") {
+                try await Self.classRaisedFloor(for: chosen, input: encodeInput,
+                                                preset: options.quality,
+                                                hevc: encodeProfile.codec == .hevc)
+            }
+            : nil
+        if let raised = raisedFloor,
            raised > effectiveFloor {
             let stash = outURL.deletingLastPathComponent()
                 .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
@@ -607,10 +673,14 @@ public struct ForgeOptimizer: Sendable {
             emit?(.searching, 0.5,
                   "Graphic content detected — re-running the search at the raised floor "
                   + "(SSIMULACRA2 ≥ \(Int(raised)))")
+            MediaMetrics.event("kit.ratchet", attrs: ["raised": "\(raised)"])
             let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                             targetScore: raised,
                                                             maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                            profile: encodeProfile)
+                                                            profile: encodeProfile,
+                                                            onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                                   base: 0.50,
+                                                                                                   span: 0.45))
             if rerun.delivered, rerun.metTarget {
                 chosen = rerun
                 floorRaisedFrom = effectiveFloor

@@ -4,6 +4,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import ForgeOptimizerKit
 import MediaMeasure
+import MediaMetrics
 
 // `forge` — a thin CLI over ForgeOptimizerKit, dependency-free (no swift-argument-parser, to stay
 // minimal/net-clean). File-based verbs only; `conform` is in-memory inter-segment glue by design
@@ -25,6 +26,15 @@ struct ForgeCLI {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let verb = args.first else { usage(); exit(2) }
+        // FORGE_METRICS=<path-prefix> — env-gated like FORGE_PROFILE, no new flags: collect the
+        // structured span timeline and write `<prefix>.ndjson` + `<prefix>.trace.json` (Perfetto /
+        // chrome://tracing) at process end, with a stderr summary table. Detail level via
+        // MEDIA_METRICS_DETAIL (0 stage · 1 frame · 2 kernel; default 1).
+        if ProcessInfo.processInfo.environment["FORGE_METRICS"] != nil, !MediaMetrics.isEnabled {
+            let detail = ProcessInfo.processInfo.environment["MEDIA_METRICS_DETAIL"]
+                .flatMap(Int.init) ?? 1
+            MediaMetrics.enable(detail: detail)
+        }
         let forge = ForgeOptimizer()
         let json = args.contains("--json")
 
@@ -79,7 +89,7 @@ struct ForgeCLI {
                 }
                 // A run where something failed must not exit 0 — receipts are contracts, and a
                 // scripting host keys off the exit code before it ever parses one.
-                if s.failed > 0 { exit(1) }
+                if s.failed > 0 { dumpMetricsIfRequested(); exit(1) }
 
             case "sweep":
                 // Re-baseline harness: every image × the preset ladder → CSV. Measures in memory
@@ -151,8 +161,25 @@ struct ForgeCLI {
             }
         } catch {
             FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            dumpMetricsIfRequested()
             exit(1)
         }
+        dumpMetricsIfRequested()
+    }
+
+    /// Writes the collected span timeline when `FORGE_METRICS=<path-prefix>` is set: NDJSON for
+    /// scripts, a Chrome-trace for Perfetto, and the summary table to stderr (stdout stays
+    /// receipt-clean). No-op otherwise; the exit-code contract is untouched.
+    static func dumpMetricsIfRequested() {
+        guard let prefix = ProcessInfo.processInfo.environment["FORGE_METRICS"] else { return }
+        let report = MediaMetrics.report()
+        guard !report.spans.isEmpty else { return }
+        let nd = URL(fileURLWithPath: prefix + ".ndjson")
+        let tr = URL(fileURLWithPath: prefix + ".trace.json")
+        try? report.ndjson().write(to: nd)
+        try? report.chromeTrace().write(to: tr)
+        FileHandle.standardError.write(Data(("\n" + report.summaryTable() + "\n"
+            + "metrics → \(nd.path) · \(tr.path)\n").utf8))
     }
 
     // MARK: - Output

@@ -12,7 +12,9 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.18.0"),
+        // ≥ 0.28.0: MediaMetrics + `VideoQualityTarget.encode(onProgress:)` (tagged 2026-08-14;
+        // the VT suite validates that tag retroactively on the next macOS beta — AB-B-0002).
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.28.0"),
     ],
     targets: [
         .target(
@@ -21,6 +23,7 @@ let package = Package(
                 .product(name: "MediaBridge", package: "media-bridge"),
                 .product(name: "ImageBridge", package: "media-bridge"),
                 .product(name: "MediaMeasure", package: "media-bridge"),
+                .product(name: "MediaMetrics", package: "media-bridge"),   // stage spans (FORGE_METRICS)
             ],
             // CGImage / CVPixelBuffer aren't Sendable; lifecycle is serialized — v5 keeps it a warning.
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -31,6 +34,7 @@ let package = Package(
             dependencies: [
                 "ForgeOptimizerKit",
                 .product(name: "MediaMeasure", package: "media-bridge"),   // for `forge score` (SSIMULACRA2 parity)
+                .product(name: "MediaMetrics", package: "media-bridge"),   // FORGE_METRICS span dump
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
