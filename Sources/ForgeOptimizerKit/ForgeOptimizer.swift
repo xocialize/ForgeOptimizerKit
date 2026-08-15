@@ -27,10 +27,28 @@ public struct ForgeOptimizer: Sendable {
     private let hintProvider: (any ContentHintProvider)?
 
     public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil,
-                hintProvider: (any ContentHintProvider)? = nil) {
+                hintProvider: (any ContentHintProvider)? = nil,
+                bulkConcurrency: Int? = nil) {
         self.enhancer = enhancer
         self.flowProvider = flowProvider
         self.hintProvider = hintProvider
+        self.bulkConcurrency = bulkConcurrency
+    }
+
+    /// Bulk width for batches of STILLS (videos always run exclusively — one video item already
+    /// saturates the encoder and scorer lanes). `nil` → `FORGE_BULK_CONCURRENCY` → 1.
+    private let bulkConcurrency: Int?
+
+    /// Effective width, clamped 1…8. Defaults to 1 (the proven serial behavior) until the
+    /// quiet-window A/B measures the concurrent default; an injected enhancer forces 1 — engine
+    /// memory admission is the host's budget, revisit after measuring. Stills are ~27% GPU-busy
+    /// internally (PERFORMANCE-BASELINE §4.2), which is the headroom this width exists to use.
+    var effectiveBulkWidth: Int {   // internal for the enhancer-forces-serial test
+        guard enhancer == nil else { return 1 }
+        let raw = bulkConcurrency
+            ?? ProcessInfo.processInfo.environment["FORGE_BULK_CONCURRENCY"].flatMap(Int.init)
+            ?? 1
+        return min(max(raw, 1), 8)
     }
 
     // MARK: - analyze (read-only)
@@ -190,33 +208,48 @@ public struct ForgeOptimizer: Sendable {
         let urls = source.urls
         return AsyncStream { continuation in
             Task {
-                for (i, url) in urls.enumerated() {
+                let itemCount = urls.count
+                // One body for both schedules: emits, span, and failure isolation are per-item
+                // and identical either way. (Vs the historical serial loop, the finalizing emit
+                // now precedes the yield — receipts are unchanged and progress consumers treat
+                // finalizing as item-done.)
+                @Sendable func processItem(_ i: Int, _ url: URL) async -> OptimizeResult {
                     let start = Date()
                     let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
                                                     attrs: ["input": url.lastPathComponent,
                                                             "index": "\(i)"])
+                    defer { MediaMetrics.end(mmItem) }
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: nil, input: url, phase: phase,
                                                      fraction: fraction, detail: detail,
-                                                     itemIndex: i, itemCount: urls.count))
+                                                     itemIndex: i, itemCount: itemCount))
                         }
                     }
                     emit?(.searching, 0, nil)
+                    defer { emit?(.finalizing, 1, nil) }
                     do {
-                        continuation.yield(try await optimizeOne(url, to: destination, options,
-                                                                 start: start, profile: profile,
-                                                                 emit: emit))
+                        return try await optimizeOne(url, to: destination, options,
+                                                     start: start, profile: profile, emit: emit)
                     } catch {
                         let bytes = fileSize(url)
-                        continuation.yield(OptimizeResult(
+                        return OptimizeResult(
                             input: url, kind: mediaKind(of: url), output: .none, recipe: AppliedRecipe(),
                             before: MediaStats(bytes: bytes, width: 0, height: 0),
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
-                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start)))
+                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start))
                     }
-                    emit?(.finalizing, 1, nil)
-                    MediaMetrics.end(mmItem)
+                }
+                let width = effectiveBulkWidth
+                if width > 1 {
+                    await runBulk(urls, width: width,
+                                  isStill: { mediaKind(of: $0) == .image },
+                                  process: processItem,
+                                  yield: { continuation.yield($0) })
+                } else {
+                    for (i, url) in urls.enumerated() {
+                        continuation.yield(await processItem(i, url))
+                    }
                 }
                 continuation.finish()
             }
@@ -248,35 +281,47 @@ public struct ForgeOptimizer: Sendable {
         -> AsyncStream<OptimizeResult> {
         AsyncStream { continuation in
             Task {
-                for (i, req) in requests.enumerated() {
+                let itemCount = requests.count
+                @Sendable func processItem(_ i: Int, _ req: OptimizeRequest) async -> OptimizeResult {
                     let start = Date()
                     let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
                                                     attrs: ["input": req.input.lastPathComponent,
                                                             "index": "\(i)"])
+                    defer { MediaMetrics.end(mmItem) }
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: req.context, input: req.input,
                                                      phase: phase, fraction: fraction, detail: detail,
-                                                     itemIndex: i, itemCount: requests.count))
+                                                     itemIndex: i, itemCount: itemCount))
                         }
                     }
                     emit?(.searching, 0, nil)
+                    defer { emit?(.finalizing, 1, nil) }
                     do {
                         try prepareDestination(.fileURL(req.output))
                         let r = try await optimizeOne(req.input, to: .fileURL(req.output), req.options,
                                                       start: start, profile: profile, emit: emit)
-                        continuation.yield(r.with(context: req.context))
+                        return r.with(context: req.context)
                     } catch {
                         let bytes = fileSize(req.input)
-                        continuation.yield(OptimizeResult(
+                        return OptimizeResult(
                             input: req.input, kind: mediaKind(of: req.input), output: .none,
                             recipe: AppliedRecipe(), before: MediaStats(bytes: bytes, width: 0, height: 0),
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
                             status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start),
-                            context: req.context))
+                            context: req.context)
                     }
-                    emit?(.finalizing, 1, nil)
-                    MediaMetrics.end(mmItem)
+                }
+                let width = effectiveBulkWidth
+                if width > 1 {
+                    await runBulk(requests, width: width,
+                                  isStill: { mediaKind(of: $0.input) == .image },
+                                  process: processItem,
+                                  yield: { continuation.yield($0) })
+                } else {
+                    for (i, req) in requests.enumerated() {
+                        continuation.yield(await processItem(i, req))
+                    }
                 }
                 continuation.finish()
             }
@@ -286,6 +331,55 @@ public struct ForgeOptimizer: Sendable {
     /// Per-item progress emitter, already bound to the item's context/input/batch position by the
     /// caller: (phase, fraction within this item, optional human detail line).
     typealias ProgressEmit = @Sendable (OptimizeProgress.Phase, Double, String?) -> Void
+
+    /// Ordered, width-bounded bulk executor (opt-in via `effectiveBulkWidth`). Consecutive STILLS
+    /// process concurrently up to `width`; any non-still runs exclusively (one video item already
+    /// saturates the encoder + scorer lanes; unknowns take the safe path and fail in isolation).
+    /// Results yield strictly in **submission order** — completions buffer until their turn — and
+    /// the buffer/next-yield state lives on the calling task only, so the drain is race-free by
+    /// construction. Failure isolation is `process`'s own (identical to the serial loop's body).
+    private func runBulk<Item: Sendable>(
+        _ items: [Item], width: Int,
+        isStill: (Item) -> Bool,
+        process: @escaping @Sendable (Int, Item) async -> OptimizeResult,
+        yield: (OptimizeResult) -> Void) async {
+        var i = 0
+        while i < items.count {
+            guard isStill(items[i]) else {
+                yield(await process(i, items[i]))
+                i += 1
+                continue
+            }
+            var run: [(index: Int, item: Item)] = []
+            while i < items.count, isStill(items[i]) {
+                run.append((i, items[i]))
+                i += 1
+            }
+            var buffer: [Int: OptimizeResult] = [:]
+            var nextYield = run[0].index
+            await withTaskGroup(of: (Int, OptimizeResult).self) { group in
+                var submitted = 0
+                for (index, item) in run {
+                    if submitted >= width, let (di, r) = await group.next() {
+                        buffer[di] = r
+                        while let ready = buffer.removeValue(forKey: nextYield) {
+                            yield(ready)
+                            nextYield += 1
+                        }
+                    }
+                    group.addTask { (index, await process(index, item)) }
+                    submitted += 1
+                }
+                for await (di, r) in group {
+                    buffer[di] = r
+                    while let ready = buffer.removeValue(forKey: nextYield) {
+                        yield(ready)
+                        nextYield += 1
+                    }
+                }
+            }
+        }
+    }
 
     /// The deep-progress seam: maps media-bridge's pass-granular `SearchProgress` into this item's
     /// emitter. `base`/`span` place the search inside the item's own 0…1 (the first search spans
