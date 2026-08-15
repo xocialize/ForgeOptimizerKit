@@ -102,6 +102,10 @@ final class BulkConcurrencyTests: XCTestCase {
                        "engine-backed enhance keeps bulk serial until admission is measured")
         XCTAssertEqual(ForgeOptimizer(bulkConcurrency: 4).effectiveBulkWidth, 4)
         XCTAssertEqual(ForgeOptimizer(bulkConcurrency: 99).effectiveBulkWidth, 8, "clamped")
+        if ProcessInfo.processInfo.environment["FORGE_BULK_CONCURRENCY"] == nil {
+            XCTAssertEqual(ForgeOptimizer().effectiveBulkWidth, 3,
+                           "measured default (bulkbench 2026-08-15: 2.31× at width 3)")
+        }
     }
 
     // MARK: - Fixtures (WebOptimizeTests conventions, self-contained)

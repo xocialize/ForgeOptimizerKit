@@ -36,18 +36,22 @@ public struct ForgeOptimizer: Sendable {
     }
 
     /// Bulk width for batches of STILLS (videos always run exclusively — one video item already
-    /// saturates the encoder and scorer lanes). `nil` → `FORGE_BULK_CONCURRENCY` → 1.
+    /// saturates the encoder and scorer lanes). `nil` → `FORGE_BULK_CONCURRENCY` → 3.
     private let bulkConcurrency: Int?
 
-    /// Effective width, clamped 1…8. Defaults to 1 (the proven serial behavior) until the
-    /// quiet-window A/B measures the concurrent default; an injected enhancer forces 1 — engine
-    /// memory admission is the host's budget, revisit after measuring. Stills are ~27% GPU-busy
-    /// internally (PERFORMANCE-BASELINE §4.2), which is the headroom this width exists to use.
+    /// Effective width, clamped 1…8; an injected enhancer forces 1 (engine memory admission is
+    /// the host's budget — revisit after measuring). Default **3**, from the quiet-machine
+    /// interleaved A/B (bulkbench, 10× derived-1080 stills, fresh process per arm, spreads <2%):
+    /// width 1 = 2.29 s · 2 = 1.37 s (1.68×) · 3 = 1.00 s (2.31×) · 4 = 0.85 s · 6 = 0.65 s
+    /// (3.5×). The curve keeps climbing past 3, but each concurrent scorer beyond the cached set
+    /// allocates a transient resident-scorer working set (~0.18 GB at 1080p, ~0.75 GB at 4K
+    /// stills) — 3 is the conservative library default on unknown machines; hosts that know
+    /// their hardware raise the knob (measured 3.5× at 6 on an M5 Max).
     var effectiveBulkWidth: Int {   // internal for the enhancer-forces-serial test
         guard enhancer == nil else { return 1 }
         let raw = bulkConcurrency
             ?? ProcessInfo.processInfo.environment["FORGE_BULK_CONCURRENCY"].flatMap(Int.init)
-            ?? 1
+            ?? 3
         return min(max(raw, 1), 8)
     }
 
