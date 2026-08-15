@@ -247,6 +247,15 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// The mechanically-detected content class that justified the raise (e.g. "graphic"). Set only
     /// alongside `floorRaisedFrom` — a classification that changed nothing is not receipt material.
     public var contentClass: String? = nil
+    /// Planner-hint receipt trio (§6.3) — set ONLY when an injected `ContentHintProvider`'s hint
+    /// CHANGED planner behavior: it raised the starting floor (`raised-*` outcomes) or it
+    /// over-reached and the preset-floor search restored the contract (`overreached`). A hint that
+    /// changed nothing is not receipt material — the same rule as `contentClass`. A hint-raised
+    /// result also sets `floorRaisedFrom`/`contentClass`, so hinted and behavioral raises stay
+    /// comparable in aggregates; `contentHintOutcome` is what tells them apart.
+    public var contentHintClass: String? = nil
+    public var contentHintConfidence: Double? = nil
+    public var contentHintOutcome: String? = nil
 
     public init() {}
 
@@ -290,9 +299,19 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         if let c = codec { parts.append("→\(c)") }
         if let q = qualityFloor {
             if let base = floorRaisedFrom, let cls = contentClass {
-                parts.append("@SSIMU2≥\(Int(q)) (raised from \(Int(base)) · \(cls))")
+                var raise = "raised from \(Int(base)) · \(cls)"
+                switch contentHintOutcome {   // non-nil ⇒ the raise came from a pre-search hint
+                case HintOutcome.confirmed.rawValue?:   raise += " · hinted"
+                case HintOutcome.unconfirmed.rawValue?: raise += " · hinted, behavior disagreed"
+                case HintOutcome.unverified.rawValue?:  raise += " · hinted, unverified"
+                default: break
+                }
+                parts.append("@SSIMU2≥\(Int(q)) (\(raise))")
             } else {
                 parts.append("@SSIMU2≥\(Int(q))")
+                if contentHintOutcome == HintOutcome.overreached.rawValue {
+                    parts.append("(hint overreached — preset floor kept)")
+                }
             }
         }
         return parts.isEmpty ? "passthrough" : parts.joined(separator: " ")

@@ -18,8 +18,9 @@ public actor ForgeOptimizerService {
 
     private let optimizer: ForgeOptimizer
 
-    public init(enhancer: (any ImageEnhancer)? = nil) {
-        self.optimizer = ForgeOptimizer(enhancer: enhancer)
+    public init(enhancer: (any ImageEnhancer)? = nil,
+                hintProvider: (any ContentHintProvider)? = nil) {
+        self.optimizer = ForgeOptimizer(enhancer: enhancer, hintProvider: hintProvider)
     }
 
     /// Run a batch of pipeline requests. Throws `ForgeError.busy` if a run is already in progress.

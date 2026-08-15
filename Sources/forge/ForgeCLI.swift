@@ -35,7 +35,7 @@ struct ForgeCLI {
                 .flatMap(Int.init) ?? 1
             MediaMetrics.enable(detail: detail)
         }
-        let forge = ForgeOptimizer()
+        let forge = ForgeOptimizer(hintProvider: hintStub())
         let json = args.contains("--json")
 
         do {
@@ -229,6 +229,17 @@ struct ForgeCLI {
             "saved_fraction": round4(r.savedFraction),
             "elapsed_s": round2(r.elapsed),
         ]
+        // Floor/class/hint receipts, structured (the recipe string above carries them for
+        // humans). These rows are the §6.5 training-set flywheel — and the §6.3 disagreement
+        // receipt lands here as `hint_outcome`.
+        if let q = r.recipe.qualityFloor { o["quality_floor"] = q }
+        if let base = r.recipe.floorRaisedFrom { o["floor_raised_from"] = base }
+        if let cls = r.recipe.contentClass { o["content_class"] = cls }
+        if let hintClass = r.recipe.contentHintClass {
+            o["hint_class"] = hintClass
+            if let c = r.recipe.contentHintConfidence { o["hint_confidence"] = round2(c) }
+            if let outcome = r.recipe.contentHintOutcome { o["hint_outcome"] = outcome }
+        }
         switch r.output {
         case .file(let u):  o["output"] = u.path
         case .data(let d):  o["output_inline_bytes"] = d.count
@@ -323,6 +334,25 @@ struct ForgeCLI {
         case "webshrink": return .webH264Shrink
         default: return .hevc   // "native"
         }
+    }
+
+    /// `FORGE_HINT_STUB=graphic[:conf]` (or `general[:conf]`) — a bench/dev-only stand-in for the
+    /// app-injected VJEPA2 `ContentHintProvider` (the metallib boundary keeps real MLX out of this
+    /// CLI). Lets forgebench measure the §6.3 single-search shape headlessly with the SAME binary
+    /// in both arms: the env var is the only delta. Deliberately NOT a CLI flag — AB-D-0016 froze
+    /// the verb surface — and its influence is visible on every receipt (`hint_*` fields).
+    struct EnvHintStub: ContentHintProvider {
+        let hint: ContentHint
+        func classify(_ url: URL) async -> ContentHint? { hint }
+    }
+
+    static func hintStub() -> (any ContentHintProvider)? {
+        guard let raw = ProcessInfo.processInfo.environment["FORGE_HINT_STUB"] else { return nil }
+        let parts = raw.split(separator: ":")
+        guard let clsRaw = parts.first,
+              let cls = ContentHint.ContentClass(rawValue: String(clsRaw)) else { return nil }
+        let confidence = parts.count > 1 ? (Double(parts[1]) ?? 1) : 1
+        return EnvHintStub(hint: ContentHint(contentClass: cls, confidence: confidence, label: "stub"))
     }
 
     static func bytes(_ n: Int) -> String {

@@ -21,9 +21,16 @@ public struct ForgeOptimizer: Sendable {
     /// upscale path runs per-frame SR without flicker stabilization (zero flow).
     private let flowProvider: (any VideoFlowProvider)?
 
-    public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil) {
+    /// The §6.3 planner-hint seam (VJEPA2 pre-classify) — supplied by the app/ForgeCore layer, like
+    /// `enhancer`. `nil` → classical planning only: the class ratchet discovers graphic content from
+    /// the first search's own behavior (and pays a second search for it).
+    private let hintProvider: (any ContentHintProvider)?
+
+    public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil,
+                hintProvider: (any ContentHintProvider)? = nil) {
         self.enhancer = enhancer
         self.flowProvider = flowProvider
+        self.hintProvider = hintProvider
     }
 
     // MARK: - analyze (read-only)
@@ -614,22 +621,71 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
+        // PLANNER HINT (§6.3): an injected pre-classifier may set the class floor BEFORE the
+        // first search, collapsing the ratchet's classify-then-re-search into a single search on
+        // graphic content. Structurally safe: high confidence only, the same `raisedFloor` table
+        // (ratchet-up only, `.custom` exempt), a behavioral post-hoc audit below, and an
+        // over-reach falls back to the preset search — a wrong hint can cost an attempt, never
+        // the deliverable.
+        var hint: ContentHint? = nil
+        var hintedFloor: Double? = nil
+        if let hintProvider {
+            hint = await MediaMetrics.time("kit.hint", lane: "orchestrate",
+                                           attrs: ["input": encodeInput.lastPathComponent]) {
+                await hintProvider.classify(encodeInput)
+            }
+            hintedFloor = HintedStartPolicy.startingFloor(hint: hint, preset: options.quality)
+            if let hint {
+                MediaMetrics.event("kit.hint.classified",
+                                   attrs: ["class": hint.contentClass.rawValue,
+                                           "confidence": String(format: "%.2f", hint.confidence),
+                                           "applied": hintedFloor != nil ? "1" : "0"])
+            }
+        }
+        let startFloor = hintedFloor ?? options.quality.floor
+
         // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
         // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
         emit?(.searching, 0.05,
               "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
-              + "\(Int(options.quality.floor)) — several encode+score passes"
+              + "\(Int(startFloor))"
+              + (hintedFloor != nil ? " (content hint: graphic — starting at the class floor)" : "")
+              + " — several encode+score passes"
               + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
         // DEEP PROGRESS SEAM (media-bridge 0.28.0): the search's own pass-granular
         // `SearchProgress` maps into this item's emitter — pass index/planned, the bitrate under
         // test, and the best-so-far, live. The UI already renders `detail`.
-        let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                    targetScore: options.quality.floor,
+        var r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                    targetScore: startFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
                                                     onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                            base: 0.05,
                                                                                            span: 0.90))
+
+        // The hinted floor could not deliver → the preset-floor search the hint skipped restores
+        // the contract. This is the ratchet's stash-and-restore promise, mirrored: the stricter
+        // attempt ran FIRST here, so recovery means re-running at the preset floor and discarding
+        // the failed attempt. Receipted, never silent — the over-reach row is exactly what the
+        // hint head's calibration needs. The behavioral ratchet stays disarmed after this: the
+        // raised floor already failed once on this item, and re-trying it would convert a receipt
+        // into wasted searches.
+        var hintOverreached = false
+        if let hinted = hintedFloor, !(r.delivered && r.metTarget) {
+            hintOverreached = true
+            MediaMetrics.event("kit.hint.overreach", attrs: ["hinted": "\(Int(hinted))"])
+            emit?(.searching, 0.5,
+                  "The hinted floor (SSIMULACRA2 ≥ \(Int(hinted))) can't deliver — re-running at "
+                  + "the preset floor (≥ \(Int(options.quality.floor)))")
+            try? FileManager.default.removeItem(at: outURL)   // a best-effort partial never leaks into the re-run
+            r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                    targetScore: options.quality.floor,
+                                                    maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
+                                                    profile: encodeProfile,
+                                                    onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                           base: 0.50,
+                                                                                           span: 0.45))
+        }
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
@@ -648,47 +704,75 @@ public struct ForgeOptimizer: Sendable {
                 outputType: .mpeg4Movie)
         }
 
-        // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static content
-        // clears the preset floor with huge overshoot at tiny bitrates AND is the class where
-        // artifacts glare on signage, so a delivered preset-floor result gets one re-run at the
-        // class floor. The first deliverable is stashed and restored if the re-run cannot deliver —
-        // a stricter attempt must never cost the result already in hand. Ratchet-up only; `.custom`
-        // floors are exempt inside `raisedFloor`.
         var chosen = r
         var effectiveFloor = options.quality.floor
         var floorRaisedFrom: Double? = nil
-        let raisedFloor: Double? = (chosen.delivered && chosen.metTarget)
-            ? try await MediaMetrics.time("kit.classify", lane: "orchestrate") {
-                try await Self.classRaisedFloor(for: chosen, input: encodeInput,
-                                                preset: options.quality,
-                                                hevc: encodeProfile.codec == .hevc)
+        var hintOutcome: HintOutcome? = hintOverreached ? .overreached : nil
+
+        if let hinted = hintedFloor, !hintOverreached {
+            // The hinted start delivered at the class floor — the ratchet's second search never
+            // runs (§6.3: one classify replaced an entire search). The behavioral signals still
+            // audit the landing (LESSONS: behavior outranks the label): disagreement files a
+            // receipt INSTEAD of a re-run — either way the deliverable cleared a floor at least
+            // as strong as the preset promised. NOTE the audit thresholds were calibrated on
+            // preset-floor landings; at a raised floor they are provisional — which is exactly
+            // why disagreement is a receipt and not an action.
+            effectiveFloor = hinted
+            floorRaisedFrom = options.quality.floor
+            let posthoc: ContentClassifier.ContentClass? =
+                (try? await MediaMetrics.time("kit.classify", lane: "orchestrate") {
+                    try await Self.behavioralClass(of: chosen, input: encodeInput,
+                                                   askedFloor: hinted,
+                                                   hevc: encodeProfile.codec == .hevc)
+                }) ?? nil
+            switch posthoc {
+            case .graphic: hintOutcome = .confirmed
+            case .general: hintOutcome = .unconfirmed
+            case nil:      hintOutcome = .unverified
             }
-            : nil
-        if let raised = raisedFloor,
-           raised > effectiveFloor {
-            let stash = outURL.deletingLastPathComponent()
-                .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
-            try FileManager.default.moveItem(at: outURL, to: stash)
-            // The bar honestly re-opens: a second search is genuinely more work, not a regression.
-            emit?(.searching, 0.5,
-                  "Graphic content detected — re-running the search at the raised floor "
-                  + "(SSIMULACRA2 ≥ \(Int(raised)))")
-            MediaMetrics.event("kit.ratchet", attrs: ["raised": "\(raised)"])
-            let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                            targetScore: raised,
-                                                            maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                            profile: encodeProfile,
-                                                            onProgress: Self.searchProgressAdapter(emit: emit,
-                                                                                                   base: 0.50,
-                                                                                                   span: 0.45))
-            if rerun.delivered, rerun.metTarget {
-                chosen = rerun
-                floorRaisedFrom = effectiveFloor
-                effectiveFloor = raised
-                try? FileManager.default.removeItem(at: stash)
-            } else {
-                try? FileManager.default.removeItem(at: outURL)
-                try FileManager.default.moveItem(at: stash, to: outURL)
+            MediaMetrics.event("kit.hint.posthoc", attrs: ["outcome": hintOutcome!.rawValue])
+        } else if !hintOverreached {
+            // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static
+            // content clears the preset floor with huge overshoot at tiny bitrates AND is the
+            // class where artifacts glare on signage, so a delivered preset-floor result gets one
+            // re-run at the class floor. The first deliverable is stashed and restored if the
+            // re-run cannot deliver — a stricter attempt must never cost the result already in
+            // hand. Ratchet-up only; `.custom` floors are exempt inside `raisedFloor`. This is
+            // the CLASSICAL path the §6.3 hint seam collapses when a provider is injected — and
+            // the fallback that keeps headless/CLI runs whole (metallib boundary: no MLX here).
+            let raisedFloor: Double? = (chosen.delivered && chosen.metTarget)
+                ? try await MediaMetrics.time("kit.classify", lane: "orchestrate") {
+                    try await Self.classRaisedFloor(for: chosen, input: encodeInput,
+                                                    preset: options.quality,
+                                                    hevc: encodeProfile.codec == .hevc)
+                }
+                : nil
+            if let raised = raisedFloor,
+               raised > effectiveFloor {
+                let stash = outURL.deletingLastPathComponent()
+                    .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
+                try FileManager.default.moveItem(at: outURL, to: stash)
+                // The bar honestly re-opens: a second search is genuinely more work, not a regression.
+                emit?(.searching, 0.5,
+                      "Graphic content detected — re-running the search at the raised floor "
+                      + "(SSIMULACRA2 ≥ \(Int(raised)))")
+                MediaMetrics.event("kit.ratchet", attrs: ["raised": "\(raised)"])
+                let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                                targetScore: raised,
+                                                                maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
+                                                                profile: encodeProfile,
+                                                                onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                                       base: 0.50,
+                                                                                                       span: 0.45))
+                if rerun.delivered, rerun.metTarget {
+                    chosen = rerun
+                    floorRaisedFrom = effectiveFloor
+                    effectiveFloor = raised
+                    try? FileManager.default.removeItem(at: stash)
+                } else {
+                    try? FileManager.default.removeItem(at: outURL)
+                    try FileManager.default.moveItem(at: stash, to: outURL)
+                }
             }
         }
         emit?(.finalizing, 0.95, nil)
@@ -700,6 +784,14 @@ public struct ForgeOptimizer: Sendable {
         if let floorRaisedFrom {
             recipe.floorRaisedFrom = floorRaisedFrom
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
+        }
+        if let hint, let hintOutcome {
+            // The hint changed behavior (raised the start, or over-reached and fell back) —
+            // receipt it. An ignored hint (low confidence / general / no raise applicable) is
+            // metrics-only: a classification that changed nothing is not receipt material.
+            recipe.contentHintClass = hint.contentClass.rawValue
+            recipe.contentHintConfidence = hint.confidence
+            recipe.contentHintOutcome = hintOutcome.rawValue
         }
 
         // `before` describes the ORIGINAL source, not the normalize intermediate.
@@ -741,6 +833,19 @@ public struct ForgeOptimizer: Sendable {
     private static func classRaisedFloor(for r: VideoQualityTarget.Result, input: URL,
                                          preset: QualityTarget,
                                          hevc: Bool) async throws -> Double? {
+        guard let cls = try await behavioralClass(of: r, input: input, askedFloor: preset.floor,
+                                                  hevc: hevc) else { return nil }
+        return ContentClassifier.raisedFloor(preset: preset, class: cls)
+    }
+
+    /// The behavioral content class of a delivered search result — the same mechanical signals
+    /// the ratchet classifies on (floor overshoot + emitted bits-per-pixel). `askedFloor` is the
+    /// floor THIS search targeted: overshoot is only meaningful relative to what was asked — the
+    /// preset floor on the ratchet path, the hinted floor on the §6.3 post-hoc audit. nil = the
+    /// input's metadata could not anchor the signals (no duration / no video track).
+    private static func behavioralClass(of r: VideoQualityTarget.Result, input: URL,
+                                        askedFloor: Double,
+                                        hevc: Bool) async throws -> ContentClassifier.ContentClass? {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard duration > 0, r.width > 0, r.height > 0,
@@ -748,9 +853,8 @@ public struct ForgeOptimizer: Sendable {
         let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
         let fps = fpsRaw > 0 ? fpsRaw : 30
         let bpp = Double(r.outputBytes) * 8 / (Double(r.width * r.height) * fps * duration)
-        let cls = ContentClassifier.classify(overshoot: r.score - preset.floor, bitsPerPixel: bpp,
-                                             hevc: hevc)
-        return ContentClassifier.raisedFloor(preset: preset, class: cls)
+        return ContentClassifier.classify(overshoot: r.score - askedFloor, bitsPerPixel: bpp,
+                                          hevc: hevc)
     }
 
     /// The file browsers already play as-is: mp4 container, one H.264 video stream, AAC (or no) audio.
