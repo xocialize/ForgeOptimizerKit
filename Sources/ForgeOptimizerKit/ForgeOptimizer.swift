@@ -847,29 +847,30 @@ public struct ForgeOptimizer: Sendable {
                 : nil
             if let raised = raisedFloor,
                raised > effectiveFloor {
-                let stash = outURL.deletingLastPathComponent()
-                    .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
-                try FileManager.default.moveItem(at: outURL, to: stash)
                 // The bar honestly re-opens: a second search is genuinely more work, not a regression.
                 emit?(.searching, 0.5,
                       "Graphic content detected — re-running the search at the raised floor "
                       + "(SSIMULACRA2 ≥ \(Int(raised)))")
                 MediaMetrics.event("kit.ratchet", attrs: ["raised": "\(raised)"])
-                let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                                targetScore: raised,
-                                                                maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                                profile: encodeProfile,
-                                                                onProgress: Self.searchProgressAdapter(emit: emit,
-                                                                                                       base: 0.50,
-                                                                                                       span: 0.45))
-                if rerun.delivered, rerun.metTarget {
+                // `RatchetStash` owns the stash-and-restore protocol: whatever the re-run does —
+                // deliver, decline, throw, get cancelled — `outURL` is left holding a deliverable
+                // and no `.forge-ratchet-*.tmp` survives. `nil` means the original was kept.
+                let rerun = try await RatchetStash.attemptReplacing(
+                    outURL,
+                    accept: { $0.delivered && $0.metTarget }
+                ) {
+                    try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                        targetScore: raised,
+                                                        maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
+                                                        profile: encodeProfile,
+                                                        onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                               base: 0.50,
+                                                                                               span: 0.45))
+                }
+                if let rerun {
                     chosen = rerun
                     floorRaisedFrom = effectiveFloor
                     effectiveFloor = raised
-                    try? FileManager.default.removeItem(at: stash)
-                } else {
-                    try? FileManager.default.removeItem(at: outURL)
-                    try FileManager.default.moveItem(at: stash, to: outURL)
                 }
             }
         }
