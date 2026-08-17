@@ -60,7 +60,8 @@ struct ForgeCLI {
                 guard args.count >= 3 else { usage(); exit(2) }
                 let url = URL(fileURLWithPath: args[1])
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
-                let options = Options(quality: quality(from: args), resolution: resolution(from: args))
+                let options = Options(quality: quality(from: args), resolution: resolution(from: args),
+                                      contentClass: contentClass(from: args))
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -286,8 +287,10 @@ struct ForgeCLI {
 
           forge analyze     <file> [--deep] [--json]
                 --deep adds decode-to-EOF integrity verification
-          forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--json]
+          forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--content-class C] [--json]
                 native deliverables: HEIC stills · HEVC+AAC mp4 video
+                --content-class graphic|general — state the content class instead of detecting it
+                (auto-detection is gated off); graphic starts at the class floor, general keeps the preset
           forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--json]
                 web deliverables: PNG/JPEG race stills · H.264+AAC mp4 video · GIF→mp4
           forge sweep       <file-or-dir>
@@ -325,6 +328,24 @@ struct ForgeCLI {
         case "aggressive": return .aggressive
         default: return Double(args[i + 1]).map { .custom($0) } ?? .balanced
         }
+    }
+
+    /// `--content-class graphic|general` — the caller stating what the content IS, in lieu of
+    /// auto-detection (which is gated off; see `ContentClassifier.autoDetectEnabled`). `graphic`
+    /// starts the first search at the class floor; `general` explicitly keeps the preset and
+    /// suppresses any hint. Absent = no opinion.
+    static func contentClass(from args: [String]) -> ContentClassifier.ContentClass? {
+        guard let i = args.firstIndex(of: "--content-class") else { return nil }
+        // A typo must NOT degrade to "no opinion": the whole point of this flag is that the caller
+        // is asserting something, and silently ignoring the assertion would ship the preset floor
+        // while the operator believes they raised it.
+        guard i + 1 < args.count, let cls = ContentClassifier.ContentClass(rawValue: args[i + 1]) else {
+            let got = i + 1 < args.count ? "'\(args[i + 1])'" : "(missing)"
+            FileHandle.standardError.write(Data(
+                "forge: --content-class expects graphic|general, got \(got)\n".utf8))
+            exit(2)
+        }
+        return cls
     }
 
     static func encodeProfile(from args: [String]) -> VideoQualityTarget.EncodeProfile {

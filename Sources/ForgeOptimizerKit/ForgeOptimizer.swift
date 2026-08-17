@@ -727,7 +727,11 @@ public struct ForgeOptimizer: Sendable {
         // the deliverable.
         var hint: ContentHint? = nil
         var hintedFloor: Double? = nil
-        if let hintProvider {
+        // A caller-supplied class suppresses hinting outright — including `.general`, which
+        // resolves to no raise. Otherwise "explicit beats estimate" would hold for `.graphic` and
+        // quietly invert for `.general`, where a hint could still raise a floor the caller just
+        // declined. Not classifying is also cheaper: no provider call, no model load.
+        if let hintProvider, options.contentClass == nil {
             hint = await MediaMetrics.time("kit.hint", lane: "orchestrate",
                                            attrs: ["input": encodeInput.lastPathComponent]) {
                 await hintProvider.classify(encodeInput)
@@ -740,7 +744,14 @@ public struct ForgeOptimizer: Sendable {
                                            "applied": hintedFloor != nil ? "1" : "0"])
             }
         }
-        let startFloor = hintedFloor ?? options.quality.floor
+        // Precedence: an explicit class beats a probabilistic hint beats the preset. `raisedFloor`
+        // is ratchet-UP only and `.custom`-exempt, so `.general` (or any already-higher floor)
+        // resolves to nil here and the preset stands — a stated class can strengthen the promise,
+        // never weaken it.
+        let declaredFloor: Double? = options.contentClass.flatMap {
+            ContentClassifier.raisedFloor(preset: options.quality, class: $0)
+        }
+        let startFloor = declaredFloor ?? hintedFloor ?? options.quality.floor
 
         // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
         // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
@@ -807,7 +818,14 @@ public struct ForgeOptimizer: Sendable {
         var floorRaisedFrom: Double? = nil
         var hintOutcome: HintOutcome? = hintOverreached ? .overreached : nil
 
-        if let hinted = hintedFloor, !hintOverreached {
+        if let declared = declaredFloor {
+            // An explicit class started the FIRST search at the class floor — one search, no second
+            // pass. Deliberately NO post-hoc audit: the behavioral signals that audit are the same
+            // ones measured unreliable (`ContentClassifier.autoDetectEnabled`), so auditing a
+            // caller's stated class against them would file disagreement receipts that mean nothing.
+            effectiveFloor = declared
+            floorRaisedFrom = options.quality.floor
+        } else if let hinted = hintedFloor, !hintOverreached {
             // The hinted start delivered at the class floor — the ratchet's second search never
             // runs (§6.3: one classify replaced an entire search). The behavioral signals still
             // audit the landing (LESSONS: behavior outranks the label): disagreement files a
@@ -932,6 +950,14 @@ public struct ForgeOptimizer: Sendable {
     private static func classRaisedFloor(for r: VideoQualityTarget.Result, input: URL,
                                          preset: QualityTarget,
                                          hevc: Bool) async throws -> Double? {
+        // 🚨 The mechanical ratchet is GATED OFF (2026-08-16). Measured on a purpose-built signage
+        // corpus it fired twice in 37 clips, both on blank synthetic test cards, and never on real
+        // signage — its load-bearing signal is anti-correlated with artifact visibility. Full
+        // evidence + why no threshold fixes it: `ContentClassifier.autoDetectEnabled`.
+        //
+        // Returning nil here means no second search: the preset floor (or an explicitly supplied
+        // class floor) is what ships. Callers who want a class floor pass `Options.contentClass`.
+        guard ContentClassifier.autoDetectEnabled else { return nil }
         guard let cls = try await behavioralClass(of: r, input: input, askedFloor: preset.floor,
                                                   hevc: hevc) else { return nil }
         return ContentClassifier.raisedFloor(preset: preset, class: cls)

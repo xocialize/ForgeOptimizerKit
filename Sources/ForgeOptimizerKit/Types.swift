@@ -101,10 +101,26 @@ public struct Options: Sendable {
     /// `analyze`-only: integrity verification tier (see `IntegrityLevel`).
     public var integrity: IntegrityLevel
 
+    /// **Caller-supplied content class, in lieu of auto-detection.**
+    ///
+    /// When set, it resolves through the same `ContentClassifier.raisedFloor` table the ratchet used
+    /// — so `.graphic` starts the FIRST search at the class floor (balanced 80 → 90) and `.general`
+    /// keeps the preset. One search either way; there is no second pass and no confidence gate,
+    /// because an explicit class is a statement, not an estimate.
+    ///
+    /// `nil` (the default) means "no opinion": the preset floor applies. Auto-detection is gated off
+    /// (`ContentClassifier.autoDetectEnabled`), so nothing infers a class on your behalf.
+    ///
+    /// ⚠️ `.custom` quality targets are exempt — an explicit floor already is an explicit choice,
+    /// and a class must never move a number the caller stated outright.
+    public var contentClass: ContentClassifier.ContentClass?
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
-                integrity: IntegrityLevel = .structural) {
+                integrity: IntegrityLevel = .structural,
+                contentClass: ContentClassifier.ContentClass? = nil) {
+        self.contentClass = contentClass
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance

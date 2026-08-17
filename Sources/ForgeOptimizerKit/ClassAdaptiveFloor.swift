@@ -16,9 +16,35 @@ import Foundation
 ///
 /// The classifier is mechanical — no model, no probe pass: the signals fall out of the search
 /// that already ran (the first, preset-floor encode).
-enum ContentClassifier {
+public enum ContentClassifier {
 
-    enum ContentClass: String {
+    /// Whether the MECHANICAL classifier may raise a floor on its own.
+    ///
+    /// 🚨 **OFF since 2026-08-16 — gated, not tuned.** Measured across 70 receipts from three
+    /// corpora with frames inspected for ground truth (`Tools/hintcal/FINDINGS.md`, AB-L-0053,
+    /// AB-L-0054):
+    ///
+    /// - On a 37-clip purpose-built signage corpus it fired **twice, both on blank synthetic test
+    ///   cards** (solid field + a frame counter). Zero raises on real signage.
+    /// - `overshoot` — the documented load-bearing signal — ranks blank test cards ABOVE flat-vector
+    ///   signage ABOVE dense-text signage, i.e. the **inverse** of artifact visibility. It only
+    ///   appears when the search hits its descent limit, so it measures search behaviour, not
+    ///   content, and goes quiet exactly where a raise is most warranted.
+    /// - `bpp` cannot stand in: graphic content spans **0.0053–0.0866** (16×) across labelled
+    ///   receipts; the 0.009 guard catches 7 of 27 graphic clips.
+    /// - The AND rule's founding counter-example is mislabelled — `AISC_Sevilla_players_V02` is
+    ///   described below as "photographic people content", but eight frames across its full 69 s are
+    ///   flat vector illustration. Its low bpp was correct, and the rule was built to exclude it.
+    ///
+    /// ⚠️ Re-enabling is a visible edit to this file, and it needs a signal that separates the
+    /// classes — not a new constant. The calibration constants below are LEFT AS MEASURED so the
+    /// 2026-08-09 provenance stays readable; they are simply no longer consulted automatically.
+    ///
+    /// Callers wanting a class floor today pass one explicitly (`Options.contentClass`), which is
+    /// authoritative and skips detection entirely.
+    public static let autoDetectEnabled = false
+
+    public enum ContentClass: String, Sendable, CaseIterable {
         /// Flat text / vector / motion-graphics — clears floors with huge overshoot at tiny
         /// bitrates, and the class where artifacts are most visible. Gets the raised floor.
         case graphic
@@ -35,6 +61,10 @@ enum ContentClassifier {
     /// Thresholds calibrated on the 9-clip IBM_Pairs balanced-floor sweep (2026-08-09) — see
     /// `classcal.csv` provenance in the session notes; both signals must agree (AND, not OR) so
     /// a tight-landing low-bpp photographic clip is never misclassified.
+    ///
+    /// 🚨 **NOT CONSULTED while `autoDetectEnabled == false`.** Both premises above were measured
+    /// false on 2026-08-16 — see `autoDetectEnabled`. Retained unchanged so the original provenance
+    /// stays legible next to the evidence that overturned it.
     static func classify(overshoot: Double, bitsPerPixel: Double,
                          hevc: Bool = false) -> ContentClass {
         let bppGuard = hevc ? Calibration.maxGraphicBPPHEVC : Calibration.maxGraphicBPP
@@ -44,6 +74,10 @@ enum ContentClassifier {
 
     /// The raised floor for a fragile class under a named preset. Returns nil when no raise
     /// applies (general class, already-high floors, or a custom target).
+    ///
+    /// Deliberately NOT gated by `autoDetectEnabled`: the gate disables *detection*, not the
+    /// preset→floor table. An explicitly supplied class (`Options.contentClass`) and the §6.3 hint
+    /// seam both still resolve through here, which is what keeps them on one floor policy.
     static func raisedFloor(preset: QualityTarget, class cls: ContentClass) -> Double? {
         guard cls == .graphic else { return nil }
         switch preset {
