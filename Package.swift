@@ -12,11 +12,9 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        // ASSEMBLY BRANCH PIN: the v2 surface (TNF + denoiseStrength + SearchProgress) is on
-        // media-bridge main, unreleased — the v0.28.0 tag is blocked on the HEVC-quarantined
-        // suite (FB114259303). Flip to `from: "0.28.0"` when it tags; main keeps `from:`.
-        .package(url: "https://github.com/xocialize/media-bridge.git",
-                 revision: "8ab516b0af2bbedf20065fe690981b1fbce395c0"),
+        // Flipped off the assembly branch's pinned revision 2026-08-24: v0.28.0 tagged, and the HEVC quarantine
+        // that parked this branch (AB-B-0002 / FB114259303) is retired on macOS 26A5421a.
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.34.0"),
     ],
     targets: [
         .target(
