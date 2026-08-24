@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 import MediaBridge
 import ImageBridge
 import MediaMeasure
+import MediaMetrics
 
 /// The headless ForgeOptimizer core. Phase A runs entirely on media-bridge (pure-Swift, FFmpeg-free):
 /// structural `analyze`, target-quality `optimize`, and `.fast` `conform`. No MLX, no metallib —
@@ -20,9 +21,38 @@ public struct ForgeOptimizer: Sendable {
     /// upscale path runs per-frame SR without flicker stabilization (zero flow).
     private let flowProvider: (any VideoFlowProvider)?
 
-    public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil) {
+    /// The §6.3 planner-hint seam (VJEPA2 pre-classify) — supplied by the app/ForgeCore layer, like
+    /// `enhancer`. `nil` → classical planning only: the class ratchet discovers graphic content from
+    /// the first search's own behavior (and pays a second search for it).
+    private let hintProvider: (any ContentHintProvider)?
+
+    public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil,
+                hintProvider: (any ContentHintProvider)? = nil,
+                bulkConcurrency: Int? = nil) {
         self.enhancer = enhancer
         self.flowProvider = flowProvider
+        self.hintProvider = hintProvider
+        self.bulkConcurrency = bulkConcurrency
+    }
+
+    /// Bulk width for batches of STILLS (videos always run exclusively — one video item already
+    /// saturates the encoder and scorer lanes). `nil` → `FORGE_BULK_CONCURRENCY` → 3.
+    private let bulkConcurrency: Int?
+
+    /// Effective width, clamped 1…8; an injected enhancer forces 1 (engine memory admission is
+    /// the host's budget — revisit after measuring). Default **3**, from the quiet-machine
+    /// interleaved A/B (bulkbench, 10× derived-1080 stills, fresh process per arm, spreads <2%):
+    /// width 1 = 2.29 s · 2 = 1.37 s (1.68×) · 3 = 1.00 s (2.31×) · 4 = 0.85 s · 6 = 0.65 s
+    /// (3.5×). The curve keeps climbing past 3, but each concurrent scorer beyond the cached set
+    /// allocates a transient resident-scorer working set (~0.18 GB at 1080p, ~0.75 GB at 4K
+    /// stills) — 3 is the conservative library default on unknown machines; hosts that know
+    /// their hardware raise the knob (measured 3.5× at 6 on an M5 Max).
+    var effectiveBulkWidth: Int {   // internal for the enhancer-forces-serial test
+        guard enhancer == nil else { return 1 }
+        let raw = bulkConcurrency
+            ?? ProcessInfo.processInfo.environment["FORGE_BULK_CONCURRENCY"].flatMap(Int.init)
+            ?? 3
+        return min(max(raw, 1), 8)
     }
 
     // MARK: - analyze (read-only)
@@ -197,29 +227,48 @@ public struct ForgeOptimizer: Sendable {
         let urls = source.urls
         return AsyncStream { continuation in
             Task {
-                for (i, url) in urls.enumerated() {
+                let itemCount = urls.count
+                // One body for both schedules: emits, span, and failure isolation are per-item
+                // and identical either way. (Vs the historical serial loop, the finalizing emit
+                // now precedes the yield — receipts are unchanged and progress consumers treat
+                // finalizing as item-done.)
+                @Sendable func processItem(_ i: Int, _ url: URL) async -> OptimizeResult {
                     let start = Date()
+                    let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
+                                                    attrs: ["input": url.lastPathComponent,
+                                                            "index": "\(i)"])
+                    defer { MediaMetrics.end(mmItem) }
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: nil, input: url, phase: phase,
                                                      fraction: fraction, detail: detail,
-                                                     itemIndex: i, itemCount: urls.count))
+                                                     itemIndex: i, itemCount: itemCount))
                         }
                     }
                     emit?(.searching, 0, nil)
+                    defer { emit?(.finalizing, 1, nil) }
                     do {
-                        continuation.yield(try await optimizeOne(url, to: destination, options,
-                                                                 start: start, profile: profile,
-                                                                 emit: emit))
+                        return try await optimizeOne(url, to: destination, options,
+                                                     start: start, profile: profile, emit: emit)
                     } catch {
                         let bytes = fileSize(url)
-                        continuation.yield(OptimizeResult(
+                        return OptimizeResult(
                             input: url, kind: mediaKind(of: url), output: .none, recipe: AppliedRecipe(),
                             before: MediaStats(bytes: bytes, width: 0, height: 0),
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
-                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start)))
+                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start))
                     }
-                    emit?(.finalizing, 1, nil)
+                }
+                let width = effectiveBulkWidth
+                if width > 1 {
+                    await runBulk(urls, width: width,
+                                  isStill: { mediaKind(of: $0) == .image },
+                                  process: processItem,
+                                  yield: { continuation.yield($0) })
+                } else {
+                    for (i, url) in urls.enumerated() {
+                        continuation.yield(await processItem(i, url))
+                    }
                 }
                 continuation.finish()
             }
@@ -251,31 +300,47 @@ public struct ForgeOptimizer: Sendable {
         -> AsyncStream<OptimizeResult> {
         AsyncStream { continuation in
             Task {
-                for (i, req) in requests.enumerated() {
+                let itemCount = requests.count
+                @Sendable func processItem(_ i: Int, _ req: OptimizeRequest) async -> OptimizeResult {
                     let start = Date()
+                    let mmItem = MediaMetrics.begin("kit.item", lane: "kit",
+                                                    attrs: ["input": req.input.lastPathComponent,
+                                                            "index": "\(i)"])
+                    defer { MediaMetrics.end(mmItem) }
                     let emit: ProgressEmit? = progress.map { handler in
                         { phase, fraction, detail in
                             handler(OptimizeProgress(context: req.context, input: req.input,
                                                      phase: phase, fraction: fraction, detail: detail,
-                                                     itemIndex: i, itemCount: requests.count))
+                                                     itemIndex: i, itemCount: itemCount))
                         }
                     }
                     emit?(.searching, 0, nil)
+                    defer { emit?(.finalizing, 1, nil) }
                     do {
                         try prepareDestination(.fileURL(req.output))
                         let r = try await optimizeOne(req.input, to: .fileURL(req.output), req.options,
                                                       start: start, profile: profile, emit: emit)
-                        continuation.yield(r.with(context: req.context))
+                        return r.with(context: req.context)
                     } catch {
                         let bytes = fileSize(req.input)
-                        continuation.yield(OptimizeResult(
+                        return OptimizeResult(
                             input: req.input, kind: mediaKind(of: req.input), output: .none,
                             recipe: AppliedRecipe(), before: MediaStats(bytes: bytes, width: 0, height: 0),
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
                             status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start),
-                            context: req.context))
+                            context: req.context)
                     }
-                    emit?(.finalizing, 1, nil)
+                }
+                let width = effectiveBulkWidth
+                if width > 1 {
+                    await runBulk(requests, width: width,
+                                  isStill: { mediaKind(of: $0.input) == .image },
+                                  process: processItem,
+                                  yield: { continuation.yield($0) })
+                } else {
+                    for (i, req) in requests.enumerated() {
+                        continuation.yield(await processItem(i, req))
+                    }
                 }
                 continuation.finish()
             }
@@ -285,6 +350,91 @@ public struct ForgeOptimizer: Sendable {
     /// Per-item progress emitter, already bound to the item's context/input/batch position by the
     /// caller: (phase, fraction within this item, optional human detail line).
     typealias ProgressEmit = @Sendable (OptimizeProgress.Phase, Double, String?) -> Void
+
+    /// Ordered, width-bounded bulk executor (opt-in via `effectiveBulkWidth`). Consecutive STILLS
+    /// process concurrently up to `width`; any non-still runs exclusively (one video item already
+    /// saturates the encoder + scorer lanes; unknowns take the safe path and fail in isolation).
+    /// Results yield strictly in **submission order** — completions buffer until their turn — and
+    /// the buffer/next-yield state lives on the calling task only, so the drain is race-free by
+    /// construction. Failure isolation is `process`'s own (identical to the serial loop's body).
+    private func runBulk<Item: Sendable>(
+        _ items: [Item], width: Int,
+        isStill: (Item) -> Bool,
+        process: @escaping @Sendable (Int, Item) async -> OptimizeResult,
+        yield: (OptimizeResult) -> Void) async {
+        var i = 0
+        while i < items.count {
+            guard isStill(items[i]) else {
+                yield(await process(i, items[i]))
+                i += 1
+                continue
+            }
+            var run: [(index: Int, item: Item)] = []
+            while i < items.count, isStill(items[i]) {
+                run.append((i, items[i]))
+                i += 1
+            }
+            var buffer: [Int: OptimizeResult] = [:]
+            var nextYield = run[0].index
+            await withTaskGroup(of: (Int, OptimizeResult).self) { group in
+                var submitted = 0
+                for (index, item) in run {
+                    if submitted >= width, let (di, r) = await group.next() {
+                        buffer[di] = r
+                        while let ready = buffer.removeValue(forKey: nextYield) {
+                            yield(ready)
+                            nextYield += 1
+                        }
+                    }
+                    group.addTask { (index, await process(index, item)) }
+                    submitted += 1
+                }
+                for await (di, r) in group {
+                    buffer[di] = r
+                    while let ready = buffer.removeValue(forKey: nextYield) {
+                        yield(ready)
+                        nextYield += 1
+                    }
+                }
+            }
+        }
+    }
+
+    /// The deep-progress seam: maps media-bridge's pass-granular `SearchProgress` into this item's
+    /// emitter. `base`/`span` place the search inside the item's own 0…1 (the first search spans
+    /// 0.05…0.95; the class-ratchet re-run re-opens at 0.50). Returns nil when the caller isn't
+    /// listening, so the search skips the callback entirely.
+    private static func searchProgressAdapter(emit: ProgressEmit?, base: Double, span: Double)
+        -> (@Sendable (VideoQualityTarget.SearchProgress) -> Void)? {
+        guard let emit else { return nil }
+        return { p in
+            let f = base + span * p.fraction
+            switch p.stage {
+            case .preparing:
+                emit(.searching, f, nil)
+            case .mezzanine(let toneMapSDR, let downscale):
+                var what: [String] = []
+                if downscale { what.append("downscale") }
+                if toneMapSDR { what.append("HDR→SDR tone-map") }
+                emit(.encoding, f, "Rendering near-lossless reference"
+                     + (what.isEmpty ? "" : " — " + what.joined(separator: " + ")))
+            case .pass(let label, let index, let planned, let bitrate):
+                emit(.encoding, f, String(format: "pass %d/%d (%@) · encoding at %.1f Mbps",
+                                          index, planned, label, Double(bitrate) / 1e6))
+            case .scoring(let label, let index, let planned):
+                emit(.scoring, f, "pass \(index)/\(planned) (\(label)) · scoring per-frame SSIMULACRA2")
+            case .passResult(let label, let p10, let cleared, let bestBitrate, let bestP10):
+                var line = String(format: "%@ · p10 %.1f · %@", label, p10,
+                                  cleared ? "clears the floor" : "below the floor")
+                if let bb = bestBitrate, let bp = bestP10 {
+                    line += String(format: " · best %.1f Mbps (p10 %.1f)", Double(bb) / 1e6, bp)
+                }
+                emit(.scoring, f, line)
+            case .finalizing:
+                emit(.finalizing, f, nil)
+            }
+        }
+    }
 
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date, profile: OutputProfile = .native,
@@ -349,7 +499,11 @@ public struct ForgeOptimizer: Sendable {
             return try await optimizeAnimatedGIF(url, to: destination, options, start: start)
         }
         let inBytes = fileSize(url)
-        guard let still = Self.loadOrientedStill(url) else { throw ForgeError.decodeFailed(url) }
+        // Orientation is baked at decode (branch) INSIDE the decode span (main): a rotated source
+        // must not ship sideways, and the stage still has to show up in the timeline.
+        let still = MediaMetrics.time("kit.decode", lane: "decode",
+                                      attrs: ["input": url.lastPathComponent]) { Self.loadOrientedStill(url) }
+        guard let still else { throw ForgeError.decodeFailed(url) }
         var cg = still.image
 
         var recipe = AppliedRecipe()
@@ -361,7 +515,10 @@ public struct ForgeOptimizer: Sendable {
         let enhanced = options.enhance != .off && enhancer != nil
         if enhanced, let enhancer {
             let widthBefore = cg.width
-            cg = try await enhancer.enhance(cg, options: options)
+            cg = try await MediaMetrics.time("kit.enhance", lane: "gpu",
+                                             attrs: ["w": "\(cg.width)", "h": "\(cg.height)"]) {
+                try await enhancer.enhance(cg, options: options)
+            }
             recipe.restored = true
             // Measured, not requested (BRIDGE-062). The enhance seam returns only a CGImage, so the
             // artifact is the only thing that can be trusted about what happened to it.
@@ -508,7 +665,9 @@ public struct ForgeOptimizer: Sendable {
         // `stripMetadata` can only happen on a metadata-free source; `stripDelivers` forces
         // delivery otherwise.)
         recipe.strippedMetadata = options.stripMetadata
-        let output = try write(data, for: url, ext: outExt, to: destination)
+        let output = try MediaMetrics.time("kit.write", lane: "io") {
+            try write(data, for: url, ext: outExt, to: destination)
+        }
         return OptimizeResult(
             input: url, kind: .image, output: output, recipe: recipe, before: before,
             after: MediaStats(bytes: data.count, width: cg.width, height: cg.height,
@@ -668,7 +827,10 @@ public struct ForgeOptimizer: Sendable {
         case .native:
             encodeProfile = .hevc
         case .web:
-            let info = try? await MediaBridge.probe(url: url)
+            let info = await MediaMetrics.time("kit.probe", lane: "io",
+                                               attrs: ["input": url.lastPathComponent]) {
+                try? await MediaBridge.probe(url: url)
+            }
             webReady = Self.isWebReady(info)
             // Web-safe STREAMS in the wrong wrapper (an H.264+AAC .mov capture): the lossless
             // passthrough remux is the baseline deliverable — byte-identical quality at ~source
@@ -678,7 +840,10 @@ public struct ForgeOptimizer: Sendable {
             if !webReady, Self.hasWebSafeStreams(info) {
                 let temp = FileManager.default.temporaryDirectory
                     .appendingPathComponent("forge-webremux-\(UUID().uuidString).mp4")
-                if (try? await MediaBridge.remuxToMP4(input: url, output: temp)) != nil {
+                let remuxed = await MediaMetrics.time("kit.remux", lane: "encode") {
+                    (try? await MediaBridge.remuxToMP4(input: url, output: temp)) != nil
+                }
+                if remuxed {
                     remuxTemp = temp
                     intermediates.append(temp)
                     encodeInput = temp
@@ -702,7 +867,10 @@ public struct ForgeOptimizer: Sendable {
                 if let info, !info.container.isNativeApple {
                     let temp = FileManager.default.temporaryDirectory
                         .appendingPathComponent("forge-webnorm-\(UUID().uuidString).mp4")
-                    try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                    try await MediaMetrics.time("kit.normalize", lane: "encode",
+                                                attrs: ["container": info.container.rawValue]) {
+                        try await MediaBridge.normalizeVideoToHEVC(input: url, output: temp)
+                    }
                     encodeInput = temp
                     intermediates.append(temp)
                 }
@@ -710,51 +878,114 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
-        // The camera-noise self-gate (consumer preset, macOS 26+): a cheap denoise probe asks
-        // whether a conservative temporal filter would actually change this clip. Clean content
-        // probes ≥ ~96 (the filter no-ops) and stays on the preset floor vs the raw source;
-        // demonstrably noisy content (probes ~65 on real handheld grain) gates at the camera
-        // floor against a DENOISED mezzanine instead — the research-grounded quality-saturation
-        // path. The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
-        var targetFloor = options.quality.floor
+        // ── Camera-noise self-gate (consumer preset, macOS 26+) ────────────────────────────
+        // A cheap denoise probe asks whether a conservative temporal filter would actually change
+        // this clip. Clean content probes ≥ ~96 (the filter no-ops) and stays on the preset floor
+        // vs the raw source; demonstrably noisy content (~65 on real handheld grain) is scored
+        // against a DENOISED mezzanine at the camera floor instead — the quality-saturation path.
+        // The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
         var denoiseStrength: Float? = nil
+        var cameraFloor: Double? = nil
         if case .consumer = options.quality {
             emit?(.searching, 0.03, "Probing sensor noise (camera self-gate)")
             if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput),
                probe < ContentClassifier.Calibration.cameraNoiseGate {
-                targetFloor = ContentClassifier.Calibration.cameraDenoisedFloor
+                let floor = ContentClassifier.Calibration.cameraDenoisedFloor
+                cameraFloor = floor
                 denoiseStrength = 0.1
                 emit?(.searching, 0.04,
-                      "Camera noise detected — scoring against a denoised reference at floor \(Int(targetFloor))")
+                      "Camera noise detected — scoring against a denoised reference at floor \(Int(floor))")
             }
         }
 
-        // The search dominates the item's wall clock (~2 min on a 4K master, search-bound):
-        // narrate the entry, then map media-bridge's live SearchProgress into this item's
-        // progress — pass i/planned, the bitrate under test, best-so-far. The search owns
-        // 0.05…0.95 of the item's fraction; its own finalizing is dropped because the Kit
-        // emits finalizing after the ratchet decides.
-        emit?(.searching, 0.05,
-              "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
-              + "\(Int(targetFloor)) — several encode+score passes"
-              + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
-        let onSearch: (@Sendable (VideoQualityTarget.SearchProgress) -> Void)? = emit.map { emit in
-            { p in
-                let phase: OptimizeProgress.Phase
-                switch p.stage {
-                case .scoring: phase = .scoring
-                case .finalizing: return
-                default: phase = .searching
-                }
-                emit(phase, 0.05 + 0.90 * p.fraction, Self.searchStageLine(p))
+        // PLANNER HINT (§6.3): an injected pre-classifier may set the class floor BEFORE the
+        // first search, collapsing the ratchet's classify-then-re-search into a single search on
+        // graphic content. Structurally safe: high confidence only, the same `raisedFloor` table
+        // (ratchet-up only, `.custom` exempt), a behavioral post-hoc audit below, and an
+        // over-reach falls back to the preset search — a wrong hint can cost an attempt, never
+        // the deliverable.
+        var hint: ContentHint? = nil
+        var hintedFloor: Double? = nil
+        // A caller-supplied class suppresses hinting outright — including `.general`, which
+        // resolves to no raise. Otherwise "explicit beats estimate" would hold for `.graphic` and
+        // quietly invert for `.general`, where a hint could still raise a floor the caller just
+        // declined. Not classifying is also cheaper: no provider call, no model load.
+        // The gate's denoised-reference regime and a hint's raise are different currencies, and
+        // the gate changes what the score is measured AGAINST — so a fired gate suppresses
+        // hinting outright rather than composing with it. In practice they are near-exclusive
+        // (handheld sensor noise is not graphic content); this makes that explicit rather than
+        // leaving the interaction to precedence order.
+        if cameraFloor == nil, let hintProvider, options.contentClass == nil {
+            hint = await MediaMetrics.time("kit.hint", lane: "orchestrate",
+                                           attrs: ["input": encodeInput.lastPathComponent]) {
+                await hintProvider.classify(encodeInput)
+            }
+            hintedFloor = HintedStartPolicy.startingFloor(hint: hint, preset: options.quality)
+            if let hint {
+                MediaMetrics.event("kit.hint.classified",
+                                   attrs: ["class": hint.contentClass.rawValue,
+                                           "confidence": String(format: "%.2f", hint.confidence),
+                                           "applied": hintedFloor != nil ? "1" : "0"])
             }
         }
-        let r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                    targetScore: targetFloor,
+        // Precedence: an explicit class beats a probabilistic hint beats the preset. `raisedFloor`
+        // is ratchet-UP only and `.custom`-exempt, so `.general` (or any already-higher floor)
+        // resolves to nil here and the preset stands — a stated class can strengthen the promise,
+        // never weaken it.
+        let declaredFloor: Double? = options.contentClass.flatMap {
+            ContentClassifier.raisedFloor(preset: options.quality, class: $0)
+        }
+        // Precedence: a fired camera gate > an explicit class > a probabilistic hint > the preset.
+        // `baselineFloor` is what a fallback re-runs at — the gate's floor when it fired, since
+        // reverting to the preset floor would score denoised frames against the wrong bar.
+        let baselineFloor = cameraFloor ?? options.quality.floor
+        let startFloor = cameraFloor ?? declaredFloor ?? hintedFloor ?? options.quality.floor
+
+        // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
+        // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
+        emit?(.searching, 0.05,
+              "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
+              + "\(Int(startFloor))"
+              + (cameraFloor != nil ? " (camera self-gate: denoised reference)" : "")
+              + (hintedFloor != nil ? " (content hint: graphic — starting at the class floor)" : "")
+              + " — several encode+score passes"
+              + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
+        // DEEP PROGRESS SEAM (media-bridge 0.28.0): the search's own pass-granular
+        // `SearchProgress` maps into this item's emitter — pass index/planned, the bitrate under
+        // test, and the best-so-far, live. The UI already renders `detail`.
+        var r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                    targetScore: startFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
                                                     denoiseStrength: denoiseStrength,
-                                                    onProgress: onSearch)
+                                                    onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                           base: 0.05,
+                                                                                           span: 0.90))
+
+        // The hinted floor could not deliver → the preset-floor search the hint skipped restores
+        // the contract. This is the ratchet's stash-and-restore promise, mirrored: the stricter
+        // attempt ran FIRST here, so recovery means re-running at the preset floor and discarding
+        // the failed attempt. Receipted, never silent — the over-reach row is exactly what the
+        // hint head's calibration needs. The behavioral ratchet stays disarmed after this: the
+        // raised floor already failed once on this item, and re-trying it would convert a receipt
+        // into wasted searches.
+        var hintOverreached = false
+        if let hinted = hintedFloor, !(r.delivered && r.metTarget) {
+            hintOverreached = true
+            MediaMetrics.event("kit.hint.overreach", attrs: ["hinted": "\(Int(hinted))"])
+            emit?(.searching, 0.5,
+                  "The hinted floor (SSIMULACRA2 ≥ \(Int(hinted))) can't deliver — re-running at "
+                  + "the preset floor (≥ \(Int(baselineFloor)))")
+            try? FileManager.default.removeItem(at: outURL)   // a best-effort partial never leaks into the re-run
+            r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                    targetScore: baselineFloor,
+                                                    maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
+                                                    profile: encodeProfile,
+                                                    denoiseStrength: denoiseStrength,
+                                                    onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                           base: 0.50,
+                                                                                           span: 0.45))
+        }
 
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
@@ -782,39 +1013,86 @@ public struct ForgeOptimizer: Sendable {
                 outputType: .mpeg4Movie)
         }
 
-        // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static content
-        // clears the preset floor with huge overshoot at tiny bitrates AND is the class where
-        // artifacts glare on signage, so a delivered preset-floor result gets one re-run at the
-        // class floor. The first deliverable is stashed and restored if the re-run cannot deliver —
-        // a stricter attempt must never cost the result already in hand. Ratchet-up only; `.custom`
-        // floors are exempt inside `raisedFloor`.
         var chosen = r
-        var effectiveFloor = targetFloor
+        // The floor the DELIVERING run actually held: an over-reach fell back to the baseline
+        // (the camera floor when the gate fired, else the preset), so the receipt must not claim
+        // the hinted floor the attempt abandoned.
+        var effectiveFloor = hintOverreached ? baselineFloor : startFloor
         var floorRaisedFrom: Double? = nil
-        if chosen.delivered, chosen.metTarget,
-           let raised = try await Self.classRaisedFloor(for: chosen, input: encodeInput,
-                                                        preset: options.quality,
-                                                        hevc: encodeProfile.codec == .hevc),
-           raised > effectiveFloor {
-            let stash = outURL.deletingLastPathComponent()
-                .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
-            try FileManager.default.moveItem(at: outURL, to: stash)
-            // The bar honestly re-opens: a second search is genuinely more work, not a regression.
-            emit?(.searching, 0.5,
-                  "Graphic content detected — re-running the search at the raised floor "
-                  + "(SSIMULACRA2 ≥ \(Int(raised)))")
-            let rerun = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                            targetScore: raised,
-                                                            maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
-                                                            profile: encodeProfile)
-            if rerun.delivered, rerun.metTarget {
-                chosen = rerun
-                floorRaisedFrom = effectiveFloor
-                effectiveFloor = raised
-                try? FileManager.default.removeItem(at: stash)
-            } else {
-                try? FileManager.default.removeItem(at: outURL)
-                try FileManager.default.moveItem(at: stash, to: outURL)
+        var hintOutcome: HintOutcome? = hintOverreached ? .overreached : nil
+
+        if let declared = declaredFloor {
+            // An explicit class started the FIRST search at the class floor — one search, no second
+            // pass. Deliberately NO post-hoc audit: the behavioral signals that audit are the same
+            // ones measured unreliable (`ContentClassifier.autoDetectEnabled`), so auditing a
+            // caller's stated class against them would file disagreement receipts that mean nothing.
+            effectiveFloor = declared
+            floorRaisedFrom = options.quality.floor
+        } else if let hinted = hintedFloor, !hintOverreached {
+            // The hinted start delivered at the class floor — the ratchet's second search never
+            // runs (§6.3: one classify replaced an entire search). The behavioral signals still
+            // audit the landing (LESSONS: behavior outranks the label): disagreement files a
+            // receipt INSTEAD of a re-run — either way the deliverable cleared a floor at least
+            // as strong as the preset promised. NOTE the audit thresholds were calibrated on
+            // preset-floor landings; at a raised floor they are provisional — which is exactly
+            // why disagreement is a receipt and not an action.
+            effectiveFloor = hinted
+            floorRaisedFrom = options.quality.floor
+            let posthoc: ContentClassifier.ContentClass? =
+                (try? await MediaMetrics.time("kit.classify", lane: "orchestrate") {
+                    try await Self.behavioralClass(of: chosen, input: encodeInput,
+                                                   askedFloor: hinted,
+                                                   hevc: encodeProfile.codec == .hevc)
+                }) ?? nil
+            switch posthoc {
+            case .graphic: hintOutcome = .confirmed
+            case .general: hintOutcome = .unconfirmed
+            case nil:      hintOutcome = .unverified
+            }
+            MediaMetrics.event("kit.hint.posthoc", attrs: ["outcome": hintOutcome!.rawValue])
+        } else if !hintOverreached {
+            // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static
+            // content clears the preset floor with huge overshoot at tiny bitrates AND is the
+            // class where artifacts glare on signage, so a delivered preset-floor result gets one
+            // re-run at the class floor. The first deliverable is stashed and restored if the
+            // re-run cannot deliver — a stricter attempt must never cost the result already in
+            // hand. Ratchet-up only; `.custom` floors are exempt inside `raisedFloor`. This is
+            // the CLASSICAL path the §6.3 hint seam collapses when a provider is injected — and
+            // the fallback that keeps headless/CLI runs whole (metallib boundary: no MLX here).
+            let raisedFloor: Double? = (chosen.delivered && chosen.metTarget)
+                ? try await MediaMetrics.time("kit.classify", lane: "orchestrate") {
+                    try await Self.classRaisedFloor(for: chosen, input: encodeInput,
+                                                    preset: options.quality,
+                                                    hevc: encodeProfile.codec == .hevc)
+                }
+                : nil
+            if let raised = raisedFloor,
+               raised > effectiveFloor {
+                // The bar honestly re-opens: a second search is genuinely more work, not a regression.
+                emit?(.searching, 0.5,
+                      "Graphic content detected — re-running the search at the raised floor "
+                      + "(SSIMULACRA2 ≥ \(Int(raised)))")
+                MediaMetrics.event("kit.ratchet", attrs: ["raised": "\(raised)"])
+                // `RatchetStash` owns the stash-and-restore protocol: whatever the re-run does —
+                // deliver, decline, throw, get cancelled — `outURL` is left holding a deliverable
+                // and no `.forge-ratchet-*.tmp` survives. `nil` means the original was kept.
+                let rerun = try await RatchetStash.attemptReplacing(
+                    outURL,
+                    accept: { $0.delivered && $0.metTarget }
+                ) {
+                    try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
+                                                        targetScore: raised,
+                                                        maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
+                                                        profile: encodeProfile,
+                                                        onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                               base: 0.50,
+                                                                                               span: 0.45))
+                }
+                if let rerun {
+                    chosen = rerun
+                    floorRaisedFrom = effectiveFloor
+                    effectiveFloor = raised
+                }
             }
         }
         emit?(.finalizing, 0.95, nil)
@@ -831,6 +1109,14 @@ public struct ForgeOptimizer: Sendable {
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
         }
         recipe.denoisedReference = denoiseStrength != nil
+        if let hint, let hintOutcome {
+            // The hint changed behavior (raised the start, or over-reached and fell back) —
+            // receipt it. An ignored hint (low confidence / general / no raise applicable) is
+            // metrics-only: a classification that changed nothing is not receipt material.
+            recipe.contentHintClass = hint.contentClass.rawValue
+            recipe.contentHintConfidence = hint.confidence
+            recipe.contentHintOutcome = hintOutcome.rawValue
+        }
 
         // `before` describes the ORIGINAL source, not the normalize intermediate.
         let before = MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight)
@@ -871,6 +1157,27 @@ public struct ForgeOptimizer: Sendable {
     private static func classRaisedFloor(for r: VideoQualityTarget.Result, input: URL,
                                          preset: QualityTarget,
                                          hevc: Bool) async throws -> Double? {
+        // 🚨 The mechanical ratchet is GATED OFF (2026-08-16). Measured on a purpose-built signage
+        // corpus it fired twice in 37 clips, both on blank synthetic test cards, and never on real
+        // signage — its load-bearing signal is anti-correlated with artifact visibility. Full
+        // evidence + why no threshold fixes it: `ContentClassifier.autoDetectEnabled`.
+        //
+        // Returning nil here means no second search: the preset floor (or an explicitly supplied
+        // class floor) is what ships. Callers who want a class floor pass `Options.contentClass`.
+        guard ContentClassifier.autoDetectEnabled else { return nil }
+        guard let cls = try await behavioralClass(of: r, input: input, askedFloor: preset.floor,
+                                                  hevc: hevc) else { return nil }
+        return ContentClassifier.raisedFloor(preset: preset, class: cls)
+    }
+
+    /// The behavioral content class of a delivered search result — the same mechanical signals
+    /// the ratchet classifies on (floor overshoot + emitted bits-per-pixel). `askedFloor` is the
+    /// floor THIS search targeted: overshoot is only meaningful relative to what was asked — the
+    /// preset floor on the ratchet path, the hinted floor on the §6.3 post-hoc audit. nil = the
+    /// input's metadata could not anchor the signals (no duration / no video track).
+    private static func behavioralClass(of r: VideoQualityTarget.Result, input: URL,
+                                        askedFloor: Double,
+                                        hevc: Bool) async throws -> ContentClassifier.ContentClass? {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard duration > 0, r.width > 0, r.height > 0,
@@ -878,9 +1185,8 @@ public struct ForgeOptimizer: Sendable {
         let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
         let fps = fpsRaw > 0 ? fpsRaw : 30
         let bpp = Double(r.outputBytes) * 8 / (Double(r.width * r.height) * fps * duration)
-        let cls = ContentClassifier.classify(overshoot: r.score - preset.floor, bitsPerPixel: bpp,
-                                             hevc: hevc)
-        return ContentClassifier.raisedFloor(preset: preset, class: cls)
+        return ContentClassifier.classify(overshoot: r.score - askedFloor, bitsPerPixel: bpp,
+                                          hevc: hevc)
     }
 
     /// The file browsers already play as-is: mp4 container, one H.264 video stream, AAC (or no) audio.

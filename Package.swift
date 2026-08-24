@@ -12,8 +12,9 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        // Flipped off the assembly branch's pinned revision 2026-08-24: v0.28.0 tagged, and the HEVC quarantine
-        // that parked this branch (AB-B-0002 / FB114259303) is retired on macOS 26A5421a.
+        // ≥ 0.34.0: MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe` (the V2
+        // camera path this branch assembles). The retroactive VT validation that AB-B-0002 asked
+        // for RAN on macOS 26A5421a — suite green, quarantine retired (AB-R-0143).
         .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.34.0"),
     ],
     targets: [
@@ -23,6 +24,7 @@ let package = Package(
                 .product(name: "MediaBridge", package: "media-bridge"),
                 .product(name: "ImageBridge", package: "media-bridge"),
                 .product(name: "MediaMeasure", package: "media-bridge"),
+                .product(name: "MediaMetrics", package: "media-bridge"),   // stage spans (FORGE_METRICS)
             ],
             // CGImage / CVPixelBuffer aren't Sendable; lifecycle is serialized — v5 keeps it a warning.
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -33,6 +35,7 @@ let package = Package(
             dependencies: [
                 "ForgeOptimizerKit",
                 .product(name: "MediaMeasure", package: "media-bridge"),   // for `forge score` (SSIMULACRA2 parity)
+                .product(name: "MediaMetrics", package: "media-bridge"),   // FORGE_METRICS span dump
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -4,6 +4,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import ForgeOptimizerKit
 import MediaMeasure
+import MediaMetrics
 
 // `forge` — a thin CLI over ForgeOptimizerKit, dependency-free (no swift-argument-parser, to stay
 // minimal/net-clean). File-based verbs only; `conform` is in-memory inter-segment glue by design
@@ -25,7 +26,16 @@ struct ForgeCLI {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let verb = args.first else { usage(); exit(2) }
-        let forge = ForgeOptimizer()
+        // FORGE_METRICS=<path-prefix> — env-gated like FORGE_PROFILE, no new flags: collect the
+        // structured span timeline and write `<prefix>.ndjson` + `<prefix>.trace.json` (Perfetto /
+        // chrome://tracing) at process end, with a stderr summary table. Detail level via
+        // MEDIA_METRICS_DETAIL (0 stage · 1 frame · 2 kernel; default 1).
+        if ProcessInfo.processInfo.environment["FORGE_METRICS"] != nil, !MediaMetrics.isEnabled {
+            let detail = ProcessInfo.processInfo.environment["MEDIA_METRICS_DETAIL"]
+                .flatMap(Int.init) ?? 1
+            MediaMetrics.enable(detail: detail)
+        }
+        let forge = ForgeOptimizer(hintProvider: hintStub())
         let json = args.contains("--json")
 
         do {
@@ -52,7 +62,8 @@ struct ForgeCLI {
                 let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
                 let options = Options(quality: quality(from: args), resolution: resolution(from: args),
                                       output: outputFormat(from: args),
-                                      stripMetadata: args.contains("--strip-metadata"))
+                                      stripMetadata: args.contains("--strip-metadata"),
+                                      contentClass: contentClass(from: args))
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -81,7 +92,7 @@ struct ForgeCLI {
                 }
                 // A run where something failed must not exit 0 — receipts are contracts, and a
                 // scripting host keys off the exit code before it ever parses one.
-                if s.failed > 0 { exit(1) }
+                if s.failed > 0 { dumpMetricsIfRequested(); exit(1) }
 
             case "sweep":
                 // Re-baseline harness: every image × the preset ladder → CSV. Measures in memory
@@ -153,8 +164,25 @@ struct ForgeCLI {
             }
         } catch {
             FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            dumpMetricsIfRequested()
             exit(1)
         }
+        dumpMetricsIfRequested()
+    }
+
+    /// Writes the collected span timeline when `FORGE_METRICS=<path-prefix>` is set: NDJSON for
+    /// scripts, a Chrome-trace for Perfetto, and the summary table to stderr (stdout stays
+    /// receipt-clean). No-op otherwise; the exit-code contract is untouched.
+    static func dumpMetricsIfRequested() {
+        guard let prefix = ProcessInfo.processInfo.environment["FORGE_METRICS"] else { return }
+        let report = MediaMetrics.report()
+        guard !report.spans.isEmpty else { return }
+        let nd = URL(fileURLWithPath: prefix + ".ndjson")
+        let tr = URL(fileURLWithPath: prefix + ".trace.json")
+        try? report.ndjson().write(to: nd)
+        try? report.chromeTrace().write(to: tr)
+        FileHandle.standardError.write(Data(("\n" + report.summaryTable() + "\n"
+            + "metrics → \(nd.path) · \(tr.path)\n").utf8))
     }
 
     // MARK: - Output
@@ -204,6 +232,17 @@ struct ForgeCLI {
             "saved_fraction": round4(r.savedFraction),
             "elapsed_s": round2(r.elapsed),
         ]
+        // Floor/class/hint receipts, structured (the recipe string above carries them for
+        // humans). These rows are the §6.5 training-set flywheel — and the §6.3 disagreement
+        // receipt lands here as `hint_outcome`.
+        if let q = r.recipe.qualityFloor { o["quality_floor"] = q }
+        if let base = r.recipe.floorRaisedFrom { o["floor_raised_from"] = base }
+        if let cls = r.recipe.contentClass { o["content_class"] = cls }
+        if let hintClass = r.recipe.contentHintClass {
+            o["hint_class"] = hintClass
+            if let c = r.recipe.contentHintConfidence { o["hint_confidence"] = round2(c) }
+            if let outcome = r.recipe.contentHintOutcome { o["hint_outcome"] = outcome }
+        }
         switch r.output {
         case .file(let u):  o["output"] = u.path
         case .data(let d):  o["output_inline_bytes"] = d.count
@@ -253,10 +292,12 @@ struct ForgeCLI {
           forge analyze     <file> [--deep] [--json]
                 --deep adds decode-to-EOF integrity verification
           forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--json]
+                            [--strip-metadata] [--content-class C] [--json]
                 native deliverables: HEIC stills · HEVC+AAC mp4 video
+                --content-class graphic|general — state the content class instead of detecting it
+                (auto-detection is gated off); graphic starts at the class floor, general keeps the preset
           forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--json]
+                            [--strip-metadata] [--content-class C] [--json]
                 web deliverables: PNG/JPEG race stills · H.264+AAC mp4 video · GIF→mp4
           forge sweep       <file-or-dir>
                 re-baseline CSV: each image × {max, balanced, consumer, aggressive}, in memory
@@ -318,6 +359,24 @@ struct ForgeCLI {
         }
     }
 
+    /// `--content-class graphic|general` — the caller stating what the content IS, in lieu of
+    /// auto-detection (which is gated off; see `ContentClassifier.autoDetectEnabled`). `graphic`
+    /// starts the first search at the class floor; `general` explicitly keeps the preset and
+    /// suppresses any hint. Absent = no opinion.
+    static func contentClass(from args: [String]) -> ContentClassifier.ContentClass? {
+        guard let i = args.firstIndex(of: "--content-class") else { return nil }
+        // A typo must NOT degrade to "no opinion": the whole point of this flag is that the caller
+        // is asserting something, and silently ignoring the assertion would ship the preset floor
+        // while the operator believes they raised it.
+        guard i + 1 < args.count, let cls = ContentClassifier.ContentClass(rawValue: args[i + 1]) else {
+            let got = i + 1 < args.count ? "'\(args[i + 1])'" : "(missing)"
+            FileHandle.standardError.write(Data(
+                "forge: --content-class expects graphic|general, got \(got)\n".utf8))
+            exit(2)
+        }
+        return cls
+    }
+
     static func encodeProfile(from args: [String]) -> VideoQualityTarget.EncodeProfile {
         guard let i = args.firstIndex(of: "--profile"), i + 1 < args.count else { return .hevc }
         switch args[i + 1] {
@@ -325,6 +384,25 @@ struct ForgeCLI {
         case "webshrink": return .webH264Shrink
         default: return .hevc   // "native"
         }
+    }
+
+    /// `FORGE_HINT_STUB=graphic[:conf]` (or `general[:conf]`) — a bench/dev-only stand-in for the
+    /// app-injected VJEPA2 `ContentHintProvider` (the metallib boundary keeps real MLX out of this
+    /// CLI). Lets forgebench measure the §6.3 single-search shape headlessly with the SAME binary
+    /// in both arms: the env var is the only delta. Deliberately NOT a CLI flag — AB-D-0016 froze
+    /// the verb surface — and its influence is visible on every receipt (`hint_*` fields).
+    struct EnvHintStub: ContentHintProvider {
+        let hint: ContentHint
+        func classify(_ url: URL) async -> ContentHint? { hint }
+    }
+
+    static func hintStub() -> (any ContentHintProvider)? {
+        guard let raw = ProcessInfo.processInfo.environment["FORGE_HINT_STUB"] else { return nil }
+        let parts = raw.split(separator: ":")
+        guard let clsRaw = parts.first,
+              let cls = ContentHint.ContentClass(rawValue: String(clsRaw)) else { return nil }
+        let confidence = parts.count > 1 ? (Double(parts[1]) ?? 1) : 1
+        return EnvHintStub(hint: ContentHint(contentClass: cls, confidence: confidence, label: "stub"))
     }
 
     static func bytes(_ n: Int) -> String {

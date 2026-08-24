@@ -121,10 +121,26 @@ public struct Options: Sendable {
     /// `analyze`-only: integrity verification tier (see `IntegrityLevel`).
     public var integrity: IntegrityLevel
 
+    /// **Caller-supplied content class, in lieu of auto-detection.**
+    ///
+    /// When set, it resolves through the same `ContentClassifier.raisedFloor` table the ratchet used
+    /// — so `.graphic` starts the FIRST search at the class floor (balanced 80 → 90) and `.general`
+    /// keeps the preset. One search either way; there is no second pass and no confidence gate,
+    /// because an explicit class is a statement, not an estimate.
+    ///
+    /// `nil` (the default) means "no opinion": the preset floor applies. Auto-detection is gated off
+    /// (`ContentClassifier.autoDetectEnabled`), so nothing infers a class on your behalf.
+    ///
+    /// ⚠️ `.custom` quality targets are exempt — an explicit floor already is an explicit choice,
+    /// and a class must never move a number the caller stated outright.
+    public var contentClass: ContentClassifier.ContentClass?
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
-                integrity: IntegrityLevel = .structural) {
+                integrity: IntegrityLevel = .structural,
+                contentClass: ContentClassifier.ContentClass? = nil) {
+        self.contentClass = contentClass
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance
@@ -276,6 +292,16 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// fidelity-to-noise is not the promise). The receipt must say which reference held the floor.
     public var denoisedReference: Bool = false
 
+    /// Planner-hint receipt trio (§6.3) — set ONLY when an injected `ContentHintProvider`'s hint
+    /// CHANGED planner behavior: it raised the starting floor (`raised-*` outcomes) or it
+    /// over-reached and the preset-floor search restored the contract (`overreached`). A hint that
+    /// changed nothing is not receipt material — the same rule as `contentClass`. A hint-raised
+    /// result also sets `floorRaisedFrom`/`contentClass`, so hinted and behavioral raises stay
+    /// comparable in aggregates; `contentHintOutcome` is what tells them apart.
+    public var contentHintClass: String? = nil
+    public var contentHintConfidence: Double? = nil
+    public var contentHintOutcome: String? = nil
+
     public init() {}
 
     /// Set `upscaled` from the pixels that actually came back, and record the request when it differs.
@@ -319,11 +345,24 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         if strippedMetadata { parts.append("strip-metadata") }
         if let q = qualityFloor {
             if let base = floorRaisedFrom, let cls = contentClass {
-                parts.append("@SSIMU2≥\(Int(q)) (raised from \(Int(base)) · \(cls))")
+                var raise = "raised from \(Int(base)) · \(cls)"
+                switch contentHintOutcome {   // non-nil ⇒ the raise came from a pre-search hint
+                case HintOutcome.confirmed.rawValue?:   raise += " · hinted"
+                case HintOutcome.unconfirmed.rawValue?: raise += " · hinted, behavior disagreed"
+                case HintOutcome.unverified.rawValue?:  raise += " · hinted, unverified"
+                default: break
+                }
+                parts.append("@SSIMU2≥\(Int(q)) (\(raise))")
             } else if denoisedReference {
+                // The camera path holds its floor against a DENOISED mezzanine rather than the raw
+                // source — a different reference, so the receipt names it rather than implying
+                // fidelity to the original grain.
                 parts.append("@SSIMU2≥\(Int(q)) (camera · denoised ref)")
             } else {
                 parts.append("@SSIMU2≥\(Int(q))")
+                if contentHintOutcome == HintOutcome.overreached.rawValue {
+                    parts.append("(hint overreached — preset floor kept)")
+                }
             }
         }
         return parts.isEmpty ? "passthrough" : parts.joined(separator: " ")
