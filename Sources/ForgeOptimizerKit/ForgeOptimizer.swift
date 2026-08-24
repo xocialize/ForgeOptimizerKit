@@ -98,12 +98,27 @@ public struct ForgeOptimizer: Sendable {
                     verdict.escalate(to: .suspect)
                 }
                 var recipe = AppliedRecipe()
-                recipe.codec = "HEIC"
-                recipe.qualityFloor = options.quality.floor
-                recipe.normalized = meta.format != .heic
+                // The recommendation reflects an explicit still pin; `.auto` (and the video-only
+                // `.hevc`) keep the native default. analyze is read-only, so invalid pairings
+                // aren't policed here — optimize is where they fail.
+                switch Self.stillPin(options.output) ?? .heic {
+                case .heic:
+                    recipe.codec = "HEIC"
+                    recipe.qualityFloor = options.quality.floor
+                    recipe.normalized = meta.format != .heic
+                case .jpeg:
+                    recipe.codec = "JPEG"
+                    recipe.qualityFloor = options.quality.floor
+                    recipe.normalized = meta.format != .jpeg
+                case .png:
+                    recipe.codec = "PNG"                        // lossless: no floor to carry
+                    recipe.normalized = meta.format != .png
+                }
                 let estimate = SavingsEstimate(
                     estimatedFraction: nil,
-                    note: "run optimize for actual savings (target SSIMULACRA2 ≥ \(Int(options.quality.floor)))")
+                    note: recipe.qualityFloor.map {
+                        "run optimize for actual savings (target SSIMULACRA2 ≥ \(Int($0)))"
+                    } ?? "run optimize for actual savings (lossless PNG, measured round-trip)")
                 return Analysis(input: url, kind: .image, width: meta.width, height: meta.height,
                                 bytes: bytes, codecID: meta.format.rawValue, qualityScore: nil,
                                 recommendation: recipe, estimate: estimate,
@@ -424,7 +439,9 @@ public struct ForgeOptimizer: Sendable {
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date, profile: OutputProfile = .native,
                              emit: ProgressEmit? = nil) async throws -> OptimizeResult {
-        switch mediaKind(of: url) {
+        let kind = mediaKind(of: url)
+        try Self.validate(options.output, for: kind, profile: profile)
+        switch kind {
         case .image: return try await optimizeImage(url, to: destination, options, start: start,
                                                     profile: profile, emit: emit)
         case .video: return try await optimizeVideo(url, to: destination, options, start: start,
@@ -433,24 +450,61 @@ public struct ForgeOptimizer: Sendable {
         }
     }
 
+    /// `Options.output` × media kind × verb, checked before any decode runs. Invalid pairings fail
+    /// the item (isolated in a bulk run like any per-item failure) — never silently reinterpreted.
+    private static func validate(_ output: OutputFormat, for kind: MediaKind,
+                                 profile: OutputProfile) throws {
+        switch (kind, output) {
+        case (_, .auto), (.unknown, _):
+            return                              // unknown kind throws unsupportedMedia right after
+        case (.image, .hevc):
+            throw ForgeError.invalidOptions("HEVC is the video codec — stills take .heic, .jpeg, or .png")
+        case (.image, .heic) where profile == .web:
+            throw ForgeError.invalidOptions(
+                "HEIC is not web-universal — webOptimize stills race PNG/JPEG (use optimize for HEIC)")
+        case (.image, _):
+            return
+        case (.video, .hevc):
+            guard profile == .native else {
+                throw ForgeError.invalidOptions(
+                    "webOptimize video is H.264+AAC by contract — use optimize for HEVC")
+            }
+            return
+        case (.video, _):
+            throw ForgeError.invalidOptions(
+                "\(output) is a stills format — video writes HEVC (optimize) / H.264 (webOptimize)")
+        }
+    }
+
     /// Image path: optional engine enhance → target-quality HEIC via media-bridge's SSIMULACRA2
-    /// search (`.native`), or lossless PNG with the measured round-trip score (`.web`).
+    /// search (`.native`), or lossless PNG with the measured round-trip score (`.web`). An explicit
+    /// `Options.output` still pin reroutes the encode (conversion semantics — see `OutputFormat`).
     private func optimizeImage(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date, profile: OutputProfile,
                                emit: ProgressEmit? = nil) async throws -> OptimizeResult {
+        let requested = Self.stillPin(options.output)
         // An ANIMATED GIF is motion content wearing a still extension: on the web profile it
         // converts to an H.264 mp4 (typically ~10× smaller) through the same floor search as any
         // video. Single-frame GIFs fall through to the still race like every other image.
         if profile == .web, isGIF(url), GIFVideo.frameCount(url) > 1 {
+            // Motion content can't honour a stills pin, and pinning the first frame would silently
+            // drop the animation — refused, not reinterpreted.
+            guard requested == nil else {
+                throw ForgeError.invalidOptions(
+                    "an animated GIF converts to web video (mp4) — a stills format pin does not apply")
+            }
             emit?(.searching, 0.05,
                   "Converting animated GIF — compositing frames, then searching for the smallest "
                   + "H.264 that clears SSIMULACRA2 ≥ \(Int(options.quality.floor))")
             return try await optimizeAnimatedGIF(url, to: destination, options, start: start)
         }
         let inBytes = fileSize(url)
-        let decoded = MediaMetrics.time("kit.decode", lane: "decode",
-                                        attrs: ["input": url.lastPathComponent]) { loadCGImage(url) }
-        guard var cg = decoded else { throw ForgeError.decodeFailed(url) }
+        // Orientation is baked at decode (branch) INSIDE the decode span (main): a rotated source
+        // must not ship sideways, and the stage still has to show up in the timeline.
+        let still = MediaMetrics.time("kit.decode", lane: "decode",
+                                      attrs: ["input": url.lastPathComponent]) { Self.loadOrientedStill(url) }
+        guard let still else { throw ForgeError.decodeFailed(url) }
+        var cg = still.image
 
         var recipe = AppliedRecipe()
         recipe.normalized = true
@@ -482,25 +536,65 @@ public struct ForgeOptimizer: Sendable {
             return nil
         }()
 
+        // Options pin vs host pin: both are explicit; a contradiction is refused, not arbitrated.
+        if let requested, let pinnedExt {
+            let matches = (requested == .png && pinnedExt == "png")
+                || (requested == .jpeg && (pinnedExt == "jpg" || pinnedExt == "jpeg"))
+            guard matches else {
+                throw ForgeError.invalidOptions(
+                    "output format \(requested.rawValue) conflicts with the host-pinned '.\(pinnedExt)' destination")
+            }
+        }
+        // JPEG has no alpha. The race's transparency gate quietly routes implicit paths to PNG;
+        // an EXPLICIT .jpeg on a transparent image gets a refusal instead — shipping PNG against
+        // the pin and compositing the alpha away are both silent reinterpretations.
+        if requested == .jpeg, Self.hasRealTransparency(cg) {
+            throw ForgeError.invalidOptions(
+                "JPEG cannot represent transparency and this image has transparent pixels — use .png or .heic")
+        }
+
         // GPU-accelerate the SSIMULACRA2 — full-GPU per-channel path (CPU fallback when no Metal device).
         let scalars = SSIMULACRA2Metal.shared?.channelScalarsFunction
-        let data: Data
+        var data: Data
         let score: Double
-        var webExt = "png"
-        var webType: UTType = .png
+        let outExt: String
+        let outType: UTType
         switch profile {
         case .native:
-            let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
-                                                                  channelScalars: scalars)
-            data = encoded.data; score = encoded.score
-            recipe.codec = "HEIC"
-            recipe.qualityFloor = options.quality.floor
+            // Native deliverable: HEIC by default; an explicit pin reroutes the same machinery
+            // (floor search for the lossy formats, measured round-trip for lossless PNG).
+            switch requested ?? .heic {
+            case .heic:
+                let encoded = try await ImageQualityTarget.encodeHEIC(cg, targetScore: options.quality.floor,
+                                                                      channelScalars: scalars)
+                data = encoded.data; score = encoded.score
+                recipe.codec = "HEIC"
+                recipe.qualityFloor = options.quality.floor
+                outExt = "heic"; outType = .heic
+            case .jpeg:
+                let encoded = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
+                                                                      channelScalars: scalars)
+                data = encoded.data; score = encoded.score
+                recipe.codec = "JPEG"
+                recipe.qualityFloor = options.quality.floor
+                outExt = "jpg"; outType = .jpeg
+            case .png:
+                let encoded = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
+                data = encoded.data; score = encoded.score
+                recipe.codec = "PNG"
+                recipe.qualityFloor = nil                       // PNG has no floor: lossless
+                outExt = "png"; outType = .png
+            }
         case .web:
             // The web still is a RACE, not a classification: the lossless PNG always runs; a JPEG
             // floor search runs alongside unless the image carries alpha (JPEG has none). Ship the
             // smaller deliverable that keeps its guarantee — photos land 5–10× under PNG via JPEG,
             // flat graphics ring + inflate under JPEG and PNG wins on size, transparency is PNG by
             // construction. No content classifier to mis-tune; the outcome decides.
+            // An explicit `Options.output` pin folds in exactly like a host-pinned URL: it benches
+            // the other lane rather than changing the mechanics.
+            let pin: StillFormat? = requested
+                ?? (pinnedExt == "png" ? .png : pinnedExt != nil ? .jpeg : nil)
             let png = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
             // Gate on TRUE transparency, not channel presence: opaque-RGBA is everywhere in
             // consumer content (screenshots, decoded video frames, editor exports), and treating
@@ -508,34 +602,52 @@ public struct ForgeOptimizer: Sendable {
             // race on exactly the photos it exists for (a real 6 MP frame shipped 2.3 MB PNG
             // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
             var jpeg: ImageQualityTarget.Result?
-            if pinnedExt != "png", !Self.hasRealTransparency(cg) {
+            if pin != .png, !Self.hasRealTransparency(cg) {
                 jpeg = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
                                                                channelScalars: scalars)
             }
-            let jpegPinned = pinnedExt == "jpg" || pinnedExt == "jpeg"
-            if let jpeg, jpegPinned || (jpeg.metTarget && jpeg.data.count < png.data.count) {
+            if let jpeg, pin == .jpeg || (jpeg.metTarget && jpeg.data.count < png.data.count) {
                 data = jpeg.data; score = jpeg.score
                 recipe.codec = "JPEG"
                 recipe.qualityFloor = options.quality.floor
-                webExt = "jpg"; webType = .jpeg
+                outExt = "jpg"; outType = .jpeg
             } else {
                 data = png.data; score = png.score
                 recipe.codec = "PNG"
                 recipe.qualityFloor = nil                       // PNG has no floor: lossless
+                outExt = "png"; outType = .png
             }
+        }
+
+        // `stripMetadata` honored — both modes are real now. `true` ships exactly the fresh encode,
+        // metadata-clean by construction; `false` (the declared default) carries the source's
+        // metadata into the deliverable losslessly (the compressed payload is untouched).
+        // Orientation is excluded either way: it was baked into pixels at decode, and a carried
+        // tag would rotate the output a second time.
+        if !options.stripMetadata, let metadata = still.metadata {
+            data = Self.injectingMetadata(metadata, into: data, type: outType) ?? data
         }
 
         // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
         // Native: skip whenever the re-encode isn't smaller. Web: skip only when the input is
         // already web-native (PNG or JPEG) — the original itself is a valid web deliverable and a
-        // bigger re-encode would be a strict loss — EXCEPT when a host-pinned URL requests a
-        // DIFFERENT format: that is a format conversion, and a conversion delivers even when
-        // larger (the same semantics the video path gives non-web-native sources).
-        let webNativeFormat = profile == .web ? webNativeStillFormat(url) : nil
+        // bigger re-encode would be a strict loss — EXCEPT when a host-pinned URL or an explicit
+        // `Options.output` requests a DIFFERENT format than the source's: that is a format
+        // conversion, and a conversion delivers even when larger (the same semantics the video
+        // path gives non-web-native sources). A strip on a source that carries metadata also
+        // delivers regardless of size: the skip would keep the original, and the original's
+        // metadata is exactly what the caller asked to shed.
+        let sourceFormat = probedStillFormat(url)
+        let webNativeFormat: String? = profile == .web
+            ? (sourceFormat == .png || sourceFormat == .jpeg ? sourceFormat?.rawValue : nil)
+            : nil
         let pinnedMatchesSource = pinnedExt == nil
             || (pinnedExt == "png" && webNativeFormat == "PNG")
             || ((pinnedExt == "jpg" || pinnedExt == "jpeg") && webNativeFormat == "JPEG")
-        let sizeGated = profile == .native || (webNativeFormat != nil && pinnedMatchesSource)
+        let optionsConversion = requested != nil && requested != sourceFormat
+        let stripDelivers = options.stripMetadata && still.metadata != nil
+        let sizeGated = !optionsConversion && !stripDelivers
+            && (profile == .native || (webNativeFormat != nil && pinnedMatchesSource))
         guard enhanced || !sizeGated || data.count < inBytes else {
             let why = profile == .web
                 ? "already web-ready (\(webNativeFormat ?? "web still")); re-encode (\(data.count) B) ≥ source (\(inBytes) B)"
@@ -548,15 +660,20 @@ public struct ForgeOptimizer: Sendable {
                 elapsed: Date().timeIntervalSince(start))
         }
 
+        // The strip claim rides only on a DELIVERY — a skip keeps the original, and a receipt
+        // claiming a strip that shipped nothing would be the receipt lying. (A skip under
+        // `stripMetadata` can only happen on a metadata-free source; `stripDelivers` forces
+        // delivery otherwise.)
+        recipe.strippedMetadata = options.stripMetadata
         let output = try MediaMetrics.time("kit.write", lane: "io") {
-            try write(data, for: url, ext: profile == .web ? webExt : "heic", to: destination)
+            try write(data, for: url, ext: outExt, to: destination)
         }
         return OptimizeResult(
             input: url, kind: .image, output: output, recipe: recipe, before: before,
             after: MediaStats(bytes: data.count, width: cg.width, height: cg.height,
                               qualityScore: score),
             status: .optimized, elapsed: Date().timeIntervalSince(start),
-            outputType: profile == .web ? webType : .heic)
+            outputType: outType)
     }
 
     /// The input's *actual* still format is PNG (probed, not extension-guessed). Unprobeable inputs
@@ -582,6 +699,8 @@ public struct ForgeOptimizer: Sendable {
         var recipe = AppliedRecipe()
         recipe.codec = "H.264"
         recipe.normalized = true
+        // Writer-clean encode: the strip guarantee holds — claimed on deliveries only.
+        recipe.strippedMetadata = options.stripMetadata && r.delivered
         recipe.qualityFloor = options.quality.floor
         let before = MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight)
         let after = MediaStats(bytes: r.delivered ? r.outputBytes : sourceBytes,
@@ -627,18 +746,30 @@ public struct ForgeOptimizer: Sendable {
         return false
     }
 
-    /// "PNG"/"JPEG" when the source is already a web-native still (the honest-skip gate names the
-    /// actual format), nil otherwise.
-    private func webNativeStillFormat(_ url: URL) -> String? {
-        switch (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format {
-        case .png: return "PNG"
-        case .jpeg: return "JPEG"
-        default: return nil
+    /// The still-format routing vocabulary an `Options.output` pin (or a probed source) resolves to.
+    enum StillFormat: String { case heic = "HEIC", jpeg = "JPEG", png = "PNG" }
+
+    /// The still format an explicit `Options.output` names — nil for `.auto` (and `.hevc`, which
+    /// validation keeps off the image path).
+    private static func stillPin(_ output: OutputFormat) -> StillFormat? {
+        switch output {
+        case .auto, .hevc: return nil
+        case .heic: return .heic
+        case .jpeg: return .jpeg
+        case .png: return .png
         }
     }
 
-    private func isPNGSource(_ url: URL) -> Bool {
-        (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format == .png
+    /// The source's ACTUAL still format (probed, not extension-guessed) — nil when it isn't one of
+    /// the three routing formats or can't be probed. Feeds the conversion-vs-optimization decision
+    /// and the web honest-skip gate.
+    private func probedStillFormat(_ url: URL) -> StillFormat? {
+        switch (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format {
+        case .png: return .png
+        case .jpeg: return .jpeg
+        case .heic: return .heic
+        default: return nil
+        }
     }
 
     /// Video path: **target-quality** — smallest encode whose per-frame p10 SSIMULACRA2 clears the
@@ -646,6 +777,34 @@ public struct ForgeOptimizer: Sendable {
     /// H.264 + AAC (the mp4 every browser plays), delivered even when larger unless the source is
     /// already web-native. Same resolution by default; `options.resolution = .maxHeight(_)` steps it
     /// down (4K→HD), quality measured at the target resolution.
+    /// One human line per `SearchProgress` event — the "Pass 3/6 — encoding at 8.2 Mbps" /
+    /// "best so far 7.4 Mbps @ p10 81.4" narration hosts render from `OptimizeProgress.detail`.
+    /// nil for events whose fraction advance is the whole story.
+    private static func searchStageLine(_ p: VideoQualityTarget.SearchProgress) -> String? {
+        switch p.stage {
+        case .preparing, .finalizing:
+            return nil
+        case .mezzanine(let toneMapSDR, let downscale):
+            var parts: [String] = []
+            if downscale { parts.append("downscaling") }
+            if toneMapSDR { parts.append("tone-mapping HDR→SDR") }
+            let what = parts.isEmpty ? "denoising" : parts.joined(separator: " + ")
+            return "Rendering the reference mezzanine (\(what))"
+        case .pass(let label, let index, let planned, let bitrate):
+            return String(format: "Pass %d/%d (%@) — encoding at %.1f Mbps",
+                          index, planned, label, Double(bitrate) / 1e6)
+        case .scoring(_, let index, let planned):
+            return "Pass \(index)/\(planned) — scoring frames"
+        case .passResult(_, let p10, let cleared, let bestBitrate, let bestP10):
+            let verdict = cleared ? "cleared" : "below floor"
+            if let bestBitrate, let bestP10 {
+                return String(format: "p10 %.1f (%@) · best so far %.1f Mbps @ p10 %.1f",
+                              p10, verdict, Double(bestBitrate) / 1e6, bestP10)
+            }
+            return String(format: "p10 %.1f (%@)", p10, verdict)
+        }
+    }
+
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date, profile: OutputProfile,
                                emit: ProgressEmit? = nil) async throws -> OptimizeResult {
@@ -719,6 +878,26 @@ public struct ForgeOptimizer: Sendable {
         }
         defer { for temp in intermediates { try? FileManager.default.removeItem(at: temp) } }
 
+        // ── Camera-noise self-gate (consumer preset, macOS 26+) ────────────────────────────
+        // A cheap denoise probe asks whether a conservative temporal filter would actually change
+        // this clip. Clean content probes ≥ ~96 (the filter no-ops) and stays on the preset floor
+        // vs the raw source; demonstrably noisy content (~65 on real handheld grain) is scored
+        // against a DENOISED mezzanine at the camera floor instead — the quality-saturation path.
+        // The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
+        var denoiseStrength: Float? = nil
+        var cameraFloor: Double? = nil
+        if case .consumer = options.quality {
+            emit?(.searching, 0.03, "Probing sensor noise (camera self-gate)")
+            if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput),
+               probe < ContentClassifier.Calibration.cameraNoiseGate {
+                let floor = ContentClassifier.Calibration.cameraDenoisedFloor
+                cameraFloor = floor
+                denoiseStrength = 0.1
+                emit?(.searching, 0.04,
+                      "Camera noise detected — scoring against a denoised reference at floor \(Int(floor))")
+            }
+        }
+
         // PLANNER HINT (§6.3): an injected pre-classifier may set the class floor BEFORE the
         // first search, collapsing the ratchet's classify-then-re-search into a single search on
         // graphic content. Structurally safe: high confidence only, the same `raisedFloor` table
@@ -731,7 +910,12 @@ public struct ForgeOptimizer: Sendable {
         // resolves to no raise. Otherwise "explicit beats estimate" would hold for `.graphic` and
         // quietly invert for `.general`, where a hint could still raise a floor the caller just
         // declined. Not classifying is also cheaper: no provider call, no model load.
-        if let hintProvider, options.contentClass == nil {
+        // The gate's denoised-reference regime and a hint's raise are different currencies, and
+        // the gate changes what the score is measured AGAINST — so a fired gate suppresses
+        // hinting outright rather than composing with it. In practice they are near-exclusive
+        // (handheld sensor noise is not graphic content); this makes that explicit rather than
+        // leaving the interaction to precedence order.
+        if cameraFloor == nil, let hintProvider, options.contentClass == nil {
             hint = await MediaMetrics.time("kit.hint", lane: "orchestrate",
                                            attrs: ["input": encodeInput.lastPathComponent]) {
                 await hintProvider.classify(encodeInput)
@@ -751,13 +935,18 @@ public struct ForgeOptimizer: Sendable {
         let declaredFloor: Double? = options.contentClass.flatMap {
             ContentClassifier.raisedFloor(preset: options.quality, class: $0)
         }
-        let startFloor = declaredFloor ?? hintedFloor ?? options.quality.floor
+        // Precedence: a fired camera gate > an explicit class > a probabilistic hint > the preset.
+        // `baselineFloor` is what a fallback re-runs at — the gate's floor when it fired, since
+        // reverting to the preset floor would score denoised frames against the wrong bar.
+        let baselineFloor = cameraFloor ?? options.quality.floor
+        let startFloor = cameraFloor ?? declaredFloor ?? hintedFloor ?? options.quality.floor
 
         // The search dominates the item's wall clock (~2 min on a 4K master, search-bound), so
         // narrate it honestly before entering: the codec, the floor, and that multiple passes run.
         emit?(.searching, 0.05,
               "Searching for the smallest \(encodeProfile.codecLabel) that clears SSIMULACRA2 ≥ "
               + "\(Int(startFloor))"
+              + (cameraFloor != nil ? " (camera self-gate: denoised reference)" : "")
               + (hintedFloor != nil ? " (content hint: graphic — starting at the class floor)" : "")
               + " — several encode+score passes"
               + (fileSize(encodeInput) > 200_000_000 ? " (a large master can take a couple of minutes)" : ""))
@@ -768,6 +957,7 @@ public struct ForgeOptimizer: Sendable {
                                                     targetScore: startFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
+                                                    denoiseStrength: denoiseStrength,
                                                     onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                            base: 0.05,
                                                                                            span: 0.90))
@@ -785,12 +975,13 @@ public struct ForgeOptimizer: Sendable {
             MediaMetrics.event("kit.hint.overreach", attrs: ["hinted": "\(Int(hinted))"])
             emit?(.searching, 0.5,
                   "The hinted floor (SSIMULACRA2 ≥ \(Int(hinted))) can't deliver — re-running at "
-                  + "the preset floor (≥ \(Int(options.quality.floor)))")
+                  + "the preset floor (≥ \(Int(baselineFloor)))")
             try? FileManager.default.removeItem(at: outURL)   // a best-effort partial never leaks into the re-run
             r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
-                                                    targetScore: options.quality.floor,
+                                                    targetScore: baselineFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
+                                                    denoiseStrength: denoiseStrength,
                                                     onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                            base: 0.50,
                                                                                            span: 0.45))
@@ -799,12 +990,21 @@ public struct ForgeOptimizer: Sendable {
         // The re-encode search couldn't beat the lossless remux (smaller AND floor-met) — ship the
         // remux: byte-identical streams, ~source size, no floor claim because nothing lossy ran.
         if !r.delivered, let remuxTemp {
-            let remuxBytes = fileSize(remuxTemp)
             try? FileManager.default.removeItem(at: outURL)
-            try FileManager.default.moveItem(at: remuxTemp, to: outURL)
+            if options.stripMetadata {
+                // The passthrough remux is the ONE video path that CARRIES source metadata (the
+                // container copies over losslessly, creation date / GPS included) — an honored
+                // strip must scrub it. Same passthrough, empty metadata list, still no re-encode.
+                // The encode paths need nothing: the writer is metadata-clean by construction.
+                try await Self.scrubbingMovieMetadata(from: remuxTemp, to: outURL)
+            } else {
+                try FileManager.default.moveItem(at: remuxTemp, to: outURL)
+            }
+            let remuxBytes = fileSize(outURL)
             var recipe = AppliedRecipe()
             recipe.codec = "H.264"
             recipe.remuxed = true
+            recipe.strippedMetadata = options.stripMetadata
             return OptimizeResult(
                 input: url, kind: .video, output: .file(outURL), recipe: recipe,
                 before: MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight),
@@ -814,7 +1014,10 @@ public struct ForgeOptimizer: Sendable {
         }
 
         var chosen = r
-        var effectiveFloor = options.quality.floor
+        // The floor the DELIVERING run actually held: an over-reach fell back to the baseline
+        // (the camera floor when the gate fired, else the preset), so the receipt must not claim
+        // the hinted floor the attempt abandoned.
+        var effectiveFloor = hintOverreached ? baselineFloor : startFloor
         var floorRaisedFrom: Double? = nil
         var hintOutcome: HintOutcome? = hintOverreached ? .overreached : nil
 
@@ -897,11 +1100,15 @@ public struct ForgeOptimizer: Sendable {
         var recipe = AppliedRecipe()
         recipe.codec = encodeProfile.codecLabel
         recipe.normalized = true
+        // The writer carries no source metadata, so the strip guarantee holds on every encode —
+        // claimed on deliveries only (a skip keeps the original, metadata and all).
+        recipe.strippedMetadata = options.stripMetadata && chosen.delivered
         recipe.qualityFloor = effectiveFloor
         if let floorRaisedFrom {
             recipe.floorRaisedFrom = floorRaisedFrom
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
         }
+        recipe.denoisedReference = denoiseStrength != nil
         if let hint, let hintOutcome {
             // The hint changed behavior (raised the start, or over-reached and fell back) —
             // receipt it. An ignored hint (low confidence / general / no raise applicable) is
@@ -1053,6 +1260,7 @@ public struct ForgeOptimizer: Sendable {
             let dst = r.delivered ? await Self.videoDimensions(outURL) : (w: 0, h: 0)
             recipe.codec = "H.264"
             recipe.qualityFloor = options.quality.floor
+            recipe.strippedMetadata = options.stripMetadata && r.delivered   // writer-clean
             recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
             let aggregation = MediaStats.QualityAggregation(percentile: r.aggregation.percentile,
                                                             minimum: r.aggregation.minimum,
@@ -1078,6 +1286,7 @@ public struct ForgeOptimizer: Sendable {
         let outBytes = fileSize(outURL)
         let dst = await Self.videoDimensions(outURL)
         recipe.codec = "HEVC"
+        recipe.strippedMetadata = options.stripMetadata   // writer-clean delivery
         recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
         let after = MediaStats(bytes: outBytes, width: dst.w, height: dst.h)
         return OptimizeResult(
@@ -1086,6 +1295,35 @@ public struct ForgeOptimizer: Sendable {
             status: .optimized,
             elapsed: Date().timeIntervalSince(start),
             outputType: .mpeg4Movie)
+    }
+
+    /// Rewrap an mp4 with its asset-level metadata REPLACED by none — a passthrough export, no
+    /// re-encode. The strip guarantee's video half: encode paths write metadata-clean by
+    /// construction; the remux fast-path copies the container and needs this. Throws on failure —
+    /// under `stripMetadata` a delivery that silently kept its metadata would be worse than a
+    /// failed item.
+    static func scrubbingMovieMetadata(from input: URL, to output: URL) async throws {
+        let asset = AVURLAsset(url: input)
+        guard let export = AVAssetExportSession(asset: asset,
+                                                presetName: AVAssetExportPresetPassthrough) else {
+            throw ForgeError.renderFailed("no passthrough session for the metadata scrub")
+        }
+        try? FileManager.default.removeItem(at: output)
+        export.outputURL = output
+        export.outputFileType = .mp4
+        export.metadata = []                     // replace carried metadata with none
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            export.exportAsynchronously {
+                switch export.status {
+                case .completed: cont.resume()
+                default: cont.resume(throwing: ForgeError.renderFailed(
+                    "metadata scrub failed: \(export.error?.localizedDescription ?? "status \(export.status.rawValue)")"))
+                }
+            }
+        }
+        guard ((try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 else {
+            throw ForgeError.renderFailed("metadata scrub produced no bytes")
+        }
     }
 
     /// Pixel dimensions of a video's first video track (0×0 if unreadable).
@@ -1101,9 +1339,68 @@ public struct ForgeOptimizer: Sendable {
         (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
     }
 
-    func loadCGImage(_ url: URL) -> CGImage? {
+    /// A decoded still with EXIF orientation BAKED into the pixels, plus the source's carried
+    /// metadata (nil when it has none).
+    struct OrientedStill {
+        let image: CGImage
+        let metadata: CGImageMetadata?
+    }
+
+    /// Decode a still upright. `CGImageSourceCreateImageAtIndex` returns pixels as stored — a
+    /// rotated source (EXIF orientation ≠ 1, i.e. most phone shots) decoded that way and written
+    /// into a fresh container with no orientation tag ships SIDEWAYS. Baking the transform at
+    /// decode makes every downstream consumer correct at once: the encode, the SSIMULACRA2
+    /// reference, the enhance seam, and the receipt's dimensions all describe the upright image.
+    /// The full-size transform decode is the thumbnail API at `maxPixelSize == max(w, h)` — no
+    /// resample, orientation applied.
+    static func loadOrientedStill(_ url: URL) -> OrientedStill? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any]
+        let orientation = (props?[kCGImagePropertyOrientation as String] as? UInt32) ?? 1
+        let w = (props?[kCGImagePropertyPixelWidth as String] as? Int) ?? 0
+        let h = (props?[kCGImagePropertyPixelHeight as String] as? Int) ?? 0
+        var image: CGImage?
+        if orientation > 1, max(w, h) > 0 {
+            image = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(w, h),
+            ] as CFDictionary)
+        }
+        image = image ?? CGImageSourceCreateImageAtIndex(src, 0, nil)
+        guard let image else { return nil }
+        // Metadata only when the source actually carries tags — a nil here is what lets the strip
+        // path skip the forced delivery and the preserve path skip the rewrap.
+        let metadata = CGImageSourceCopyMetadataAtIndex(src, 0, nil).flatMap { meta in
+            (CGImageMetadataCopyTags(meta) as? [Any])?.isEmpty == false ? meta : nil
+        }
+        return OrientedStill(image: image, metadata: metadata)
+    }
+
+    /// Losslessly rewrap encoded still bytes with `metadata` carried in — the compressed payload
+    /// is untouched (`CGImageDestinationCopyImageSource`), so the floor search's chosen bytes stay
+    /// exactly what was scored. Orientation tags are dropped: pixels were baked upright at decode,
+    /// and a carried tag would rotate them a second time. Returns nil on failure; callers ship the
+    /// clean encode rather than failing a delivery over metadata carriage.
+    static func injectingMetadata(_ metadata: CGImageMetadata, into data: Data,
+                                  type: UTType) -> Data? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, type.identifier as CFString, 1, nil)
+        else { return nil }
+        var carried = metadata
+        if let mutable = CGImageMetadataCreateMutableCopy(metadata) {
+            // The one orientation mechanism: ImageIO REFUSES kCGImageDestinationOrientation
+            // alongside kCGImageDestinationMetadata (OSStatus 4), so the stale tag must come out
+            // of the metadata itself. Returns false when the source never carried one — fine.
+            CGImageMetadataRemoveTagWithPath(mutable, nil, "tiff:Orientation" as CFString)
+            carried = mutable
+        }
+        let options: [CFString: Any] = [kCGImageDestinationMetadata: carried]
+        guard CGImageDestinationCopyImageSource(dest, src, options as CFDictionary, nil) else {
+            return nil
+        }
+        return out as Data
     }
 
     func mediaKind(of url: URL) -> MediaKind {

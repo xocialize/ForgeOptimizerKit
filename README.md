@@ -122,14 +122,28 @@ Bulk runs return an `AsyncStream` of receipts: a per-item failure is isolated (`
 aborts the run; `Summary(results)` aggregates. The host-dictated-URL pipeline form
 (`webOptimize(_ requests:)`) writes to exact paths and honors a format the path names.
 
+`Options.output` pins the deliverable format (`.heic`/`.jpeg`/`.png` for stills — conversion
+semantics, so a pin delivers even when larger; `.auto` keeps each verb's policy). Invalid pairings
+(a still format on video, `.heic` under the web verb, `.jpeg` on real transparency) fail the item
+honestly. `Options.stripMetadata: true` guarantees a metadata-clean deliverable (EXIF/GPS/IPTC/XMP
+shed; the receipt carries `strippedMetadata`); the default preserves a still's source metadata.
+Orientation is baked into pixels either way, so rotated phone shots ship upright.
+
 ## CLI
 
 ```
+<<<<<<< HEAD
 forge analyze     <file> [--deep] [--json]     # --deep = decode-to-EOF verification
 forge optimize    <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
                   [--max-height N] [--json]
 forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--json]
 forge sweep | score | vscore | voptimize …     # run `forge` bare for the full surface
+=======
+forge analyze  <file> [--deep]                 # --deep = decode-to-EOF verification
+forge optimize <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
+                                [--format auto|heic|jpeg|png|hevc] [--strip-metadata]
+forge weboptimize <file> <out-dir> [--quality …] [--format …] [--strip-metadata]
+>>>>>>> claude/reverent-raman-9263d5
 ```
 
 `--json` streams NDJSON receipts on stdout (one object per item + a summary; exit 1 on any

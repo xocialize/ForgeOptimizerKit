@@ -12,9 +12,10 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        // ≥ 0.28.0: MediaMetrics + `VideoQualityTarget.encode(onProgress:)` (tagged 2026-08-14;
-        // the VT suite validates that tag retroactively on the next macOS beta — AB-B-0002).
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.28.0"),
+        // ≥ 0.34.0: MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe` (the V2
+        // camera path this branch assembles). The retroactive VT validation that AB-B-0002 asked
+        // for RAN on macOS 26A5421a — suite green, quarantine retired (AB-R-0143).
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.34.0"),
     ],
     targets: [
         .target(
