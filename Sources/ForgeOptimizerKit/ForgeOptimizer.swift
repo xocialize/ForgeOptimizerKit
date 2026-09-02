@@ -888,12 +888,13 @@ public struct ForgeOptimizer: Sendable {
         let sourceBytes = fileSize(url)
         // ONE probe, before any routing. `.web` needs the container/codec answer for its remux
         // decision, and EVERY path — including upscale — needs the alpha answer immediately below.
-        // Under `.native` the probe is gated on AVFoundation readability: `MediaBridge.probe`'s
-        // Matroska fallback reads the WHOLE file into memory to parse headers (a plain
-        // `Data(contentsOf:)`, not a bounded read), and the native path cannot consume a Matroska
-        // container anyway — it fails at the encoder exactly as it did before the probe was
-        // hoisted, without a multi-GB read first. For AVFoundation containers the probe IS
-        // metadata-only, no decode.
+        // Under `.native` the probe is gated on AVFoundation readability: the native path cannot
+        // consume a Matroska container (no normalize step), so probing one is work whose only
+        // outcome is the same `noVideoTrack` failure the encoder raises — the gate keeps that
+        // failure exactly where it was before the probe was hoisted. (media-bridge ≥ 0.37.1 opens
+        // Matroska memory-mapped, so even the web path's probe now touches header pages only;
+        // below that, the fallback read the WHOLE file into RAM.) For AVFoundation containers the
+        // probe is metadata-only, no decode.
         let avReadable = !((try? await AVURLAsset(url: url).loadTracks(withMediaType: .video)) ?? []).isEmpty
         let info: MediaInfo? = (profile == .web || avReadable)
             ? await MediaMetrics.time("kit.probe", lane: "io",
