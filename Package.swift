@@ -12,10 +12,13 @@ let package = Package(
         .executable(name: "forge", targets: ["forge"]),
     ],
     dependencies: [
-        // ≥ 0.34.0: MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe` (the V2
-        // camera path this branch assembles). The retroactive VT validation that AB-B-0002 asked
-        // for RAN on macOS 26A5421a — suite green, quarantine retired (AB-R-0143).
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.34.0"),
+        // ≥ 0.37.0 is REQUIRED, not merely preferred (AB-A-0055):
+        //  · the denoise mezzanine's audio pump is registered before video pumps inline — below
+        //    this, `optimize(.consumer)` on any clip WITH audio deadlocks forever once the
+        //    camera self-gate fires, and the item never returns to the host;
+        //  · `VideoStreamInfo.hasAlpha` is what the alpha refusal in `optimizeVideo` reads.
+        // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.0"),
     ],
     targets: [
         .target(
@@ -39,6 +42,10 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        .testTarget(name: "ForgeOptimizerKitTests", dependencies: ["ForgeOptimizerKit"]),
+        .testTarget(name: "ForgeOptimizerKitTests",
+                    dependencies: ["ForgeOptimizerKit",
+                                   // `AlphaVideoWriter` — synthesizes the ProRes 4444 /
+                                   // HEVC-with-alpha fixtures the alpha-refusal tests need.
+                                   .product(name: "MediaMeasure", package: "media-bridge")]),
     ]
 )

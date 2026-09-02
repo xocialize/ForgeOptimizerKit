@@ -58,6 +58,14 @@ provenance, measured-not-requested transforms, and honest skips with sizes
   like any video. Single-frame GIFs are stills.
 - **Audio rides along honestly** — AAC passes through byte-identical; above-web-rate AAC normalizes
   to ~96 kbps/channel on the web profiles; non-AAC transcodes to AAC-LC.
+- **Alpha video is refused, not flattened** — every video deliverable here is HEVC- or
+  H.264-in-mp4, and no mp4 configuration carries an alpha channel. A ProRes 4444 or
+  HEVC-with-alpha source is therefore `.skipped("alpha content …")` with the original kept. It has
+  to be a refusal rather than a caveat because nothing downstream could catch it: the flattened
+  output is a complete, plausible video, the byte "win" is large (a measured −99%, most of it the
+  discarded alpha), and SSIMULACRA2 composites both sides over an opaque ground before scoring, so
+  a flattened candidate clears its floor against a flattened reference. **Stills are the opposite
+  case: HEIC carries alpha and `optimize` keeps it**, so transparent stills optimize normally.
 - **VFR-safe** — frame timing is preserved 1:1 through every encode.
 
 Real, reproducible example (CC-licensed Wikimedia GIFs through `weboptimize --quality consumer`):
@@ -129,21 +137,34 @@ honestly. `Options.stripMetadata: true` guarantees a metadata-clean deliverable 
 shed; the receipt carries `strippedMetadata`); the default preserves a still's source metadata.
 Orientation is baked into pixels either way, so rotated phone shots ship upright.
 
+`Options.cameraGate: .off` skips the `.consumer` preset's camera-noise probe. That probe is the
+planner's one floor-LOWERING device — content that measures as noisy is scored against a *denoised*
+reference at a weaker floor, which is right for handheld footage and wrong for anything rendered,
+where the denoise softens exactly the text edges the content exists to show. Rendered material does
+not always read as clean to the probe (a 1080p presentation slide measured 86.3 against a gate of
+90), so on a host whose content is rendered by construction — signage, slides, motion graphics —
+turn it off rather than hope. Declaring `Options.contentClass = .graphic` turns it off too and says
+more: rendered content is definitionally not camera capture, and the class also raises the floor.
+(`.general` deliberately does not suppress it — that value *includes* the camera footage the gate
+exists for.)
+
+⚠️ **A `.fileURL` destination whose extension names a still format PINS that format**, exactly as an
+explicit `Options.output` would — Forge will not write bytes of one codec into a path that names
+another. That is deliberate, but a host that mirrors the source extension onto its temp path
+silently benches `webOptimize`'s PNG↔JPEG race for every PNG source, and the receipt looks like an
+ordinary PNG win because it *is* one; it just never had a competitor. Pass an **extension-less**
+path when you want the race to decide, and read the container back from `OptimizeResult.outputType`.
+
 ## CLI
 
 ```
-<<<<<<< HEAD
 forge analyze     <file> [--deep] [--json]     # --deep = decode-to-EOF verification
 forge optimize    <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
-                  [--max-height N] [--json]
-forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--json]
+                  [--max-height N] [--format auto|heic|jpeg|png|hevc] [--strip-metadata]
+                  [--content-class graphic|general] [--no-camera-gate] [--json]
+forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format …]
+                  [--strip-metadata] [--content-class …] [--no-camera-gate] [--json]
 forge sweep | score | vscore | voptimize …     # run `forge` bare for the full surface
-=======
-forge analyze  <file> [--deep]                 # --deep = decode-to-EOF verification
-forge optimize <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
-                                [--format auto|heic|jpeg|png|hevc] [--strip-metadata]
-forge weboptimize <file> <out-dir> [--quality …] [--format …] [--strip-metadata]
->>>>>>> claude/reverent-raman-9263d5
 ```
 
 `--json` streams NDJSON receipts on stdout (one object per item + a summary; exit 1 on any

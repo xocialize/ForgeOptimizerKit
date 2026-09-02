@@ -11,8 +11,8 @@ import MediaMetrics
 // (PRD §3) and deliberately has no CLI form.
 //
 //   forge analyze     <file> [--deep] [--json]
-//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--json]
-//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--json]
+//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--no-camera-gate] [--json]
+//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--no-camera-gate] [--json]
 //   forge sweep       <file-or-dir>
 //   forge score       <ref> <distorted> [--metal]
 //   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink]
@@ -63,7 +63,8 @@ struct ForgeCLI {
                 let options = Options(quality: quality(from: args), resolution: resolution(from: args),
                                       output: outputFormat(from: args),
                                       stripMetadata: args.contains("--strip-metadata"),
-                                      contentClass: contentClass(from: args))
+                                      contentClass: contentClass(from: args),
+                                      cameraGate: args.contains("--no-camera-gate") ? .off : .auto)
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -292,12 +293,12 @@ struct ForgeCLI {
           forge analyze     <file> [--deep] [--json]
                 --deep adds decode-to-EOF integrity verification
           forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--content-class C] [--json]
+                            [--strip-metadata] [--content-class C] [--no-camera-gate] [--json]
                 native deliverables: HEIC stills · HEVC+AAC mp4 video
                 --content-class graphic|general — state the content class instead of detecting it
                 (auto-detection is gated off); graphic starts at the class floor, general keeps the preset
           forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--content-class C] [--json]
+                            [--strip-metadata] [--content-class C] [--no-camera-gate] [--json]
                 web deliverables: PNG/JPEG race stills · H.264+AAC mp4 video · GIF→mp4
           forge sweep       <file-or-dir>
                 re-baseline CSV: each image × {max, balanced, consumer, aggressive}, in memory
@@ -315,6 +316,10 @@ struct ForgeCLI {
                             invalid pairings (e.g. png on video, heic on weboptimize) fail the item
           --strip-metadata  metadata-clean deliverable (EXIF/GPS/IPTC/XMP; orientation is baked
                             into pixels either way) — the default preserves stills metadata
+          --no-camera-gate  skip the consumer preset's camera-noise probe, keeping the preset floor
+                            and the source as the scoring reference. For content you know is
+                            RENDERED (signage, slides, motion graphics) — the gate's denoised
+                            reference softens text edges. --content-class graphic implies it.
           --json            NDJSON receipts on stdout (one per item + a summary object)
 
         exit codes: 0 success · 1 error or any per-item failure · 2 usage

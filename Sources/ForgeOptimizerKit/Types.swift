@@ -22,7 +22,17 @@ public enum Source: Sendable {
 public enum Destination: Sendable {
     case directory(URL)             // write `<stem>.<ext>` into this folder (created if missing)
     case alongside(suffix: String)  // write next to the input, filename + suffix
-    case fileURL(URL)               // write EXACTLY here (host-dictated; parent created) — the pipeline path
+    /// Write EXACTLY here (host-dictated; parent created) — the pipeline path.
+    ///
+    /// ⚠️ **A `.png`/`.jpg`/`.jpeg` extension on this URL PINS the still format**, exactly as an
+    /// explicit `Options.output` would: Forge will not write bytes of one codec into a path that
+    /// names another. That is deliberate, but it has a trap — a host that mirrors the source
+    /// extension onto its temp path silently benches `webOptimize`'s PNG↔JPEG race for every PNG
+    /// source, and the receipt looks like an ordinary PNG win because it IS one; it just never
+    /// had a competitor. Pass an **extension-less** path when you want the race to decide, and
+    /// read the chosen container back from `OptimizeResult.outputType`.
+    /// (Video is unaffected: the optimize container is `.mp4` regardless.)
+    case fileURL(URL)
     case inMemory                   // return bytes in the receipt, write nothing
 }
 
@@ -68,6 +78,20 @@ public enum QualityTarget: Sendable {
         return nil
     }
 }
+
+/// Whether the CONSUMER preset's camera-noise self-gate may run.
+///
+/// `.auto` (the default) is the shipped behaviour: under `.consumer`, a cheap temporal-denoise
+/// probe decides whether the clip carries real sensor noise, and demonstrably noisy content is
+/// then scored against a DENOISED reference at the camera floor instead of the preset floor.
+/// `.off` skips the probe outright and keeps the preset's own floor and reference.
+///
+/// Reach for `.off` when you already know the content is **rendered, never captured** — signage,
+/// slides, motion graphics, screen recordings. The gate is the planner's one floor-LOWERING
+/// device, and on rendered content a denoised reference softens exactly the text edges the
+/// content exists to show. Declaring `Options.contentClass = .graphic` suppresses it too, and
+/// says more; this knob is for hosts that want the policy without making a claim about content.
+public enum CameraGate: Sendable { case auto, off }
 
 public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors only `.off`
 public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
@@ -135,12 +159,18 @@ public struct Options: Sendable {
     /// and a class must never move a number the caller stated outright.
     public var contentClass: ContentClassifier.ContentClass?
 
+    /// Whether the `.consumer` preset's camera-noise self-gate may run (see `CameraGate`).
+    /// `.auto` by default; no effect under any other preset, which never run the probe.
+    public var cameraGate: CameraGate
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
                 integrity: IntegrityLevel = .structural,
-                contentClass: ContentClassifier.ContentClass? = nil) {
+                contentClass: ContentClassifier.ContentClass? = nil,
+                cameraGate: CameraGate = .auto) {
         self.contentClass = contentClass
+        self.cameraGate = cameraGate
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance
