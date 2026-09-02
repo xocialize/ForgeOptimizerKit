@@ -11,8 +11,10 @@ import MediaMetrics
 // (PRD §3) and deliberately has no CLI form.
 //
 //   forge analyze     <file> [--deep] [--json]
-//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--no-camera-gate] [--json]
-//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata] [--no-camera-gate] [--json]
+//   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata]
+//                     [--content-class C] [--no-camera-gate] [--json]
+//   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata]
+//                     [--content-class C] [--no-camera-gate] [--json]
 //   forge sweep       <file-or-dir>
 //   forge score       <ref> <distorted> [--metal]
 //   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink]
@@ -239,6 +241,10 @@ struct ForgeCLI {
         if let q = r.recipe.qualityFloor { o["quality_floor"] = q }
         if let base = r.recipe.floorRaisedFrom { o["floor_raised_from"] = base }
         if let cls = r.recipe.contentClass { o["content_class"] = cls }
+        // The gate's disposition rides on the receipt so calibration rows can separate
+        // "probed clean" from "never probed" (--no-camera-gate / --content-class graphic).
+        if let gate = r.recipe.cameraGate { o["camera_gate"] = gate }
+        if r.recipe.flattenedAlpha { o["flattened_alpha"] = true }
         if let hintClass = r.recipe.contentHintClass {
             o["hint_class"] = hintClass
             if let c = r.recipe.contentHintConfidence { o["hint_confidence"] = round2(c) }

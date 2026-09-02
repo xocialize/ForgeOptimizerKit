@@ -24,14 +24,19 @@ public enum Destination: Sendable {
     case alongside(suffix: String)  // write next to the input, filename + suffix
     /// Write EXACTLY here (host-dictated; parent created) — the pipeline path.
     ///
-    /// ⚠️ **A `.png`/`.jpg`/`.jpeg` extension on this URL PINS the still format**, exactly as an
-    /// explicit `Options.output` would: Forge will not write bytes of one codec into a path that
-    /// names another. That is deliberate, but it has a trap — a host that mirrors the source
-    /// extension onto its temp path silently benches `webOptimize`'s PNG↔JPEG race for every PNG
-    /// source, and the receipt looks like an ordinary PNG win because it IS one; it just never
-    /// had a competitor. Pass an **extension-less** path when you want the race to decide, and
-    /// read the chosen container back from `OptimizeResult.outputType`.
-    /// (Video is unaffected: the optimize container is `.mp4` regardless.)
+    /// The extension on this URL is **advisory**: Forge does not derive the container from it.
+    /// `optimize` writes HEIC bytes for stills and HEVC-in-mp4 for video whatever the path says
+    /// (`.fileURL("out.jpg")` receives HEIC; `.fileURL("clip.webm")` receives mp4) — read the real
+    /// container back from `OptimizeResult.outputType` and name the deliverable from that.
+    ///
+    /// ⚠️ **One exception: on `webOptimize`, a `.png`/`.jpg`/`.jpeg` extension PINS that still
+    /// format**, exactly as an explicit `Options.output` would (a `.jpg` pin on real transparency
+    /// is refused, same as the option). That is deliberate, but it has a trap — a host that
+    /// mirrors the source extension onto its temp path silently benches the PNG↔JPEG race for
+    /// every PNG source, and the receipt looks like an ordinary PNG win because it IS one; it
+    /// just never had a competitor. Pass an **extension-less** path when you want the race to
+    /// decide. An explicit `Options.output` that contradicts a `.png`/`.jpg` host path is refused
+    /// on both profiles.
     case fileURL(URL)
     case inMemory                   // return bytes in the receipt, write nothing
 }
@@ -140,7 +145,9 @@ public struct Options: Sendable {
     /// isn't smaller: an honest skip would keep the original, and the original's metadata is
     /// exactly what the caller asked to shed. Two things are never treated as metadata: ICC color
     /// profiles (the pixels' rendering contract) and orientation, which is baked into pixels at
-    /// decode so outputs render upright in both modes.
+    /// decode so outputs render upright in both modes. The one path the guarantee cannot reach is
+    /// a REFUSAL: an alpha video `optimize` declines keeps the original, metadata included, and
+    /// the receipt's `strippedMetadata` stays false — the skip reason says why nothing shipped.
     public var stripMetadata: Bool
     /// `analyze`-only: integrity verification tier (see `IntegrityLevel`).
     public var integrity: IntegrityLevel
@@ -321,6 +328,18 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// source (the consumer camera path: the clip's own noise probe proved the content noisy, and
     /// fidelity-to-noise is not the promise). The receipt must say which reference held the floor.
     public var denoisedReference: Bool = false
+    /// What the consumer camera self-gate did on this item: `"off"` (`Options.cameraGate`),
+    /// `"suppressed"` (an explicit `.graphic` class), `"clean"` (probed, no sensor noise),
+    /// `"fired"` (probed noisy → denoised reference at the camera floor), or `"unavailable"` (the
+    /// probe could not run on this OS/input). nil under every other preset, which never runs the
+    /// gate. `denoisedReference` alone cannot separate "probed clean" from "never probed", and
+    /// calibrating the gate's threshold needs exactly that split.
+    public var cameraGate: String? = nil
+    /// The source carried real transparency that the deliverable cannot: the GIF→mp4 web
+    /// conversion composites over white by convention (a `<video>` has no alpha either). This is
+    /// the one route where the Kit knowingly flattens, so the receipt says so — the flatten is
+    /// invisible in the bytes and to the scorer.
+    public var flattenedAlpha: Bool = false
 
     /// Planner-hint receipt trio (§6.3) — set ONLY when an injected `ContentHintProvider`'s hint
     /// CHANGED planner behavior: it raised the starting floor (`raised-*` outcomes) or it
@@ -373,6 +392,7 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         }
         if let c = codec { parts.append("→\(c)") }
         if strippedMetadata { parts.append("strip-metadata") }
+        if flattenedAlpha { parts.append("alpha-flattened (white)") }
         if let q = qualityFloor {
             if let base = floorRaisedFrom, let cls = contentClass {
                 var raise = "raised from \(Int(base)) · \(cls)"

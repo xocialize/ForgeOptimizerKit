@@ -55,17 +55,24 @@ provenance, measured-not-requested transforms, and honest skips with sizes
   guarantee-keeper ships. Transparency is detected at the **pixel** level (an unused alpha channel
   doesn't bench the race); a host-pinned URL that names a format pins it.
 - **Animated GIF → mp4** — browser-convention timing (delays ≤ 10 ms play as 100 ms), floor-searched
-  like any video. Single-frame GIFs are stills.
+  like any video. Single-frame GIFs are stills. **This is the one route that knowingly flattens
+  transparency** — over white, the background a web GIF was authored against (a `<video>` has no
+  alpha either) — and the receipt says so (`recipe.flattenedAlpha`, `flattened_alpha` in NDJSON).
 - **Audio rides along honestly** — AAC passes through byte-identical; above-web-rate AAC normalizes
   to ~96 kbps/channel on the web profiles; non-AAC transcodes to AAC-LC.
 - **Alpha video is refused, not flattened** — every video deliverable here is HEVC- or
   H.264-in-mp4, and no mp4 configuration carries an alpha channel. A ProRes 4444 or
-  HEVC-with-alpha source is therefore `.skipped("alpha content …")` with the original kept. It has
-  to be a refusal rather than a caveat because nothing downstream could catch it: the flattened
-  output is a complete, plausible video, the byte "win" is large (a measured −99%, most of it the
-  discarded alpha), and SSIMULACRA2 composites both sides over an opaque ground before scoring, so
-  a flattened candidate clears its floor against a flattened reference. **Stills are the opposite
-  case: HEIC carries alpha and `optimize` keeps it**, so transparent stills optimize normally.
+  HEVC-with-alpha source is therefore `.skipped("alpha content …")` with the original kept (an
+  explicit `output: .hevc` on such a source *fails* the item — an unhonourable conversion request,
+  not a policy skip — and `analyze` recommends `passthrough` for it). It has to be a refusal rather
+  than a caveat because nothing downstream could catch it: the flattened output is a complete,
+  plausible video, the byte "win" is large (a measured −99%, most of it the discarded alpha), and
+  SSIMULACRA2 composites both sides over an opaque ground before scoring, so a flattened candidate
+  clears its floor against a flattened reference. The test is the stream's *declared* alpha
+  channel (the probe never decodes), so a 4444 master whose alpha plane happens to be opaque is
+  refused too — a skip is the cheap direction to be wrong in. **Stills are the opposite case: HEIC
+  carries alpha and `optimize` keeps it**, so transparent stills optimize normally; the animated
+  GIF → mp4 conversion is the documented exception above.
 - **VFR-safe** — frame timing is preserved 1:1 through every encode.
 
 Real, reproducible example (CC-licensed Wikimedia GIFs through `weboptimize --quality consumer`):
@@ -146,14 +153,18 @@ not always read as clean to the probe (a 1080p presentation slide measured 86.3 
 turn it off rather than hope. Declaring `Options.contentClass = .graphic` turns it off too and says
 more: rendered content is definitionally not camera capture, and the class also raises the floor.
 (`.general` deliberately does not suppress it — that value *includes* the camera footage the gate
-exists for.)
+exists for.) The receipt carries what the gate did (`recipe.cameraGate`: `off` / `suppressed` /
+`clean` / `fired` / `unavailable`; `camera_gate` in NDJSON), so a host can verify its policy was
+honoured and calibration rows can separate "probed clean" from "never probed".
 
-⚠️ **A `.fileURL` destination whose extension names a still format PINS that format**, exactly as an
-explicit `Options.output` would — Forge will not write bytes of one codec into a path that names
-another. That is deliberate, but a host that mirrors the source extension onto its temp path
-silently benches `webOptimize`'s PNG↔JPEG race for every PNG source, and the receipt looks like an
-ordinary PNG win because it *is* one; it just never had a competitor. Pass an **extension-less**
-path when you want the race to decide, and read the container back from `OptimizeResult.outputType`.
+The extension on a `.fileURL` destination is **advisory** — Forge writes its opinionated container
+(HEIC stills, HEVC-in-mp4 video) to the path as given and the host reads the real container back
+from `OptimizeResult.outputType`. ⚠️ **The one exception is `webOptimize` stills: a `.png`/`.jpg`
+extension PINS that format**, exactly as an explicit `Options.output` would (a `.jpg` pin on real
+transparency is refused, same as the option). A host that mirrors the source extension onto its
+temp path therefore silently benches the PNG↔JPEG race for every PNG source, and the receipt looks
+like an ordinary PNG win because it *is* one; it just never had a competitor. Pass an
+**extension-less** path when you want the race to decide.
 
 ## CLI
 

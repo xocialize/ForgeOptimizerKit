@@ -193,6 +193,18 @@ final class OutputOptionsTests: XCTestCase {
         assertFails(r, containing: "transparency")
     }
 
+    /// The host-pinned `.jpg` is honoured on the web race exactly like `Options.output = .jpeg` —
+    /// INCLUDING the refusal. PNG bytes must never land in a path that names JPEG.
+    func testHostPinnedJPGRefusesRealTransparency() async throws {
+        let src = tmp.appendingPathComponent("alpha.png")
+        try write(makePhotoImage(64, 64, alpha: true), as: .png, to: src)
+        let out = tmp.appendingPathComponent("alpha--web.jpg")
+        let r = try await firstResult(
+            try ForgeOptimizer().webOptimize(.url(src), to: .fileURL(out), Options()))
+        assertFails(r, containing: "transparency")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: out.path), "a refusal writes nothing")
+    }
+
     func testOptionsPinConflictingWithHostPinnedURLFails() async throws {
         let src = tmp.appendingPathComponent("photo.jpg")
         try write(makePhotoImage(64, 64), as: .jpeg, to: src)

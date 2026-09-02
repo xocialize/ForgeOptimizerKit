@@ -149,6 +149,18 @@ public struct ForgeOptimizer: Sendable {
                                                  detail: sanity.joined(separator: "; ")))
                     verdict.escalate(to: .suspect)
                 }
+                // The planning verb must not recommend what the executing verb refuses: same
+                // probe, same predicate as `optimizeVideo`'s alpha refusal. `passthrough` +
+                // a "not optimizable" note is the shape `unprobeable` already uses.
+                if let v, Self.refusesAlpha(v) {
+                    return Analysis(input: url, kind: .video, width: v.width, height: v.height,
+                                    bytes: bytes, codecID: v.codecID, qualityScore: nil,
+                                    recommendation: AppliedRecipe(),
+                                    estimate: SavingsEstimate(
+                                        estimatedFraction: nil,
+                                        note: "not optimizable: " + Self.alphaRefusalReason),
+                                    integrity: IntegrityReport(verdict: verdict, checks: checks))
+                }
                 var recipe = AppliedRecipe()
                 recipe.codec = "HEVC"
                 recipe.normalized = !info.container.isNativeApple
@@ -545,12 +557,23 @@ public struct ForgeOptimizer: Sendable {
                     "output format \(requested.rawValue) conflicts with the host-pinned '.\(pinnedExt)' destination")
             }
         }
+        // The host-pinned extension counts as a pin only where it is honoured — the web race. The
+        // native deliverable is HEIC whatever the path says (see `Destination.fileURL`).
+        let hostPin: StillFormat? = profile == .web
+            ? (pinnedExt == "png" ? .png : pinnedExt != nil ? .jpeg : nil)
+            : nil
+        let pin: StillFormat? = requested ?? hostPin
         // JPEG has no alpha. The race's transparency gate quietly routes implicit paths to PNG;
-        // an EXPLICIT .jpeg on a transparent image gets a refusal instead — shipping PNG against
-        // the pin and compositing the alpha away are both silent reinterpretations.
-        if requested == .jpeg, Self.hasRealTransparency(cg) {
+        // an EXPLICIT .jpeg — `Options.output` or a host-pinned `.jpg` path — on a transparent
+        // image gets a refusal instead: shipping PNG bytes into a `.jpg` path and compositing the
+        // alpha away are both silent reinterpretations.
+        if pin == .jpeg, Self.hasRealTransparency(cg) {
             throw ForgeError.invalidOptions(
-                "JPEG cannot represent transparency and this image has transparent pixels — use .png or .heic")
+                requested == .jpeg
+                    ? "JPEG cannot represent transparency and this image has transparent pixels — use .png or .heic"
+                    : "JPEG cannot represent transparency and this image has transparent pixels — the "
+                      + "host-pinned '.\(pinnedExt ?? "jpg")' destination cannot hold it; pin .png or "
+                      + "pass an extension-less path")
         }
 
         // GPU-accelerate the SSIMULACRA2 — full-GPU per-channel path (CPU fallback when no Metal device).
@@ -592,9 +615,7 @@ public struct ForgeOptimizer: Sendable {
             // flat graphics ring + inflate under JPEG and PNG wins on size, transparency is PNG by
             // construction. No content classifier to mis-tune; the outcome decides.
             // An explicit `Options.output` pin folds in exactly like a host-pinned URL: it benches
-            // the other lane rather than changing the mechanics.
-            let pin: StillFormat? = requested
-                ?? (pinnedExt == "png" ? .png : pinnedExt != nil ? .jpeg : nil)
+            // the other lane rather than changing the mechanics (`pin` resolves both, above).
             let png = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
             // Gate on TRUE transparency, not channel presence: opaque-RGBA is everywhere in
             // consumer content (screenshots, decoded video frames, editor exports), and treating
@@ -686,6 +707,16 @@ public struct ForgeOptimizer: Sendable {
     private func optimizeAnimatedGIF(_ url: URL, to destination: Destination, _ options: Options,
                                      start: Date) async throws -> OptimizeResult {
         let sourceBytes = fileSize(url)
+        // Transparency composites over WHITE on this route (the mezzanine's web-background
+        // convention; a `<video>` has no alpha either). It is the one place the Kit knowingly
+        // flattens — the alpha-VIDEO rule is a refusal — so the receipt must say so: the flatten
+        // is invisible in the bytes and to the scorer. Frame 0 is the right sample; later delta
+        // frames use transparent pixels as "unchanged" markers, not visible alpha.
+        let flattened: Bool = {
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let first = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
+            return Self.hasRealTransparency(first)
+        }()
         let mezz = FileManager.default.temporaryDirectory
             .appendingPathComponent("forge-gif-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: mezz) }
@@ -702,6 +733,7 @@ public struct ForgeOptimizer: Sendable {
         // Writer-clean encode: the strip guarantee holds — claimed on deliveries only.
         recipe.strippedMetadata = options.stripMetadata && r.delivered
         recipe.qualityFloor = options.quality.floor
+        recipe.flattenedAlpha = flattened && r.delivered   // a skip keeps the transparent original
         let before = MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight)
         let after = MediaStats(bytes: r.delivered ? r.outputBytes : sourceBytes,
                                width: r.width, height: r.height,
@@ -724,35 +756,43 @@ public struct ForgeOptimizer: Sendable {
         UTType(filenameExtension: url.pathExtension)?.conforms(to: .gif) == true
     }
 
-    /// Whether the consumer preset's camera-noise self-gate may run for this request.
+    /// Whether the consumer preset's camera-noise self-gate may run for this request. The
+    /// rationale (why rendered content must be able to opt out, the AB-A-0055 measurement) lives
+    /// on `CameraGate`; this is the mechanism.
     ///
-    /// Two suppressions, for different reasons:
+    /// Two suppressions: `.off` states the POLICY; an explicit `.graphic` class states the CONTENT
+    /// (rendered / vector / text is definitionally not camera capture). `.general` deliberately
+    /// does NOT suppress — it means "everything else", which INCLUDES handheld footage, the exact
+    /// content the gate exists for. (The one place a declared class is asymmetric: it silences the
+    /// §6.3 hint for BOTH values because a hint estimates the very axis the caller stated; the gate
+    /// measures a different axis, so only the value that settles that axis silences it.)
     ///
-    /// - **`cameraGate == .off`** — the host states the POLICY. A signage host whose content is
-    ///   rendered, never captured, wants the preset's own floor regardless of what a probe says.
-    /// - **`contentClass == .graphic`** — the host states the CONTENT, and rendered / vector /
-    ///   text content is definitionally not camera capture, so there is nothing for the gate to
-    ///   detect. `.general` deliberately does NOT suppress: it means "everything else", which
-    ///   INCLUDES handheld footage — the exact content the gate exists for. (This is the one
-    ///   place a declared class is asymmetric. It suppresses the §6.3 hint for BOTH values,
-    ///   because a hint estimates the very axis the caller just stated; the gate measures a
-    ///   different axis, so only the value that settles that axis silences it.)
-    ///
-    /// Why suppression is the right shape rather than a tie-break: the gate is the planner's only
-    /// floor-LOWERING device (consumer 75 → 70, scored against a denoised reference), and it ran
-    /// ahead of everything else. So a fired gate outranked an explicit `.graphic` and took its
-    /// floor from 90 to 70 — while softening, in the reference itself, exactly the text edges
-    /// that class exists to protect. `Options.contentClass` is documented as something that "can
-    /// strengthen the promise, never weaken it", and this is what made that false.
-    ///
-    /// Measured (AB-A-0055): a rendered 1080p presentation slide probes **86.3** against a gate of
-    /// 90 — it crosses, so this is not a hypothetical. The probe's own calibration expected clean
-    /// content at 95.9–99.5 and camera grain near 65; rendered slides land in between, and no
-    /// threshold in that gap separates them (cf. AB-L-0050, where clean signage landed 0.87 short).
-    /// A caller who knows what the content is does not need the probe to guess.
+    /// Suppression rather than a tie-break because the gate is the planner's only floor-LOWERING
+    /// device and it runs ahead of the floor chain: a fired gate used to outrank an explicit
+    /// `.graphic` and take its floor from 90 to 70, softening in the reference itself exactly the
+    /// text edges that class exists to protect — while `Options.contentClass` is documented as
+    /// able to "strengthen the promise, never weaken it".
     static func cameraGateAllowed(_ options: Options) -> Bool {
-        if case .off = options.cameraGate { return false }
-        return options.contentClass != .graphic
+        options.cameraGate == .auto && options.contentClass != .graphic
+    }
+
+    /// The alpha-refusal predicate `optimizeVideo` and `analyze` share, so the planning verb never
+    /// recommends what the executing verb declines. Declaration-level by design (media-bridge's
+    /// `hasAlpha` reads the format description, never pixels): refusing an opaque-but-tagged plane
+    /// costs a skip, flattening a real one costs a wrong file. A stream this Kit cannot decode is
+    /// left to the codec path — its honest failure names the real blocker, not alpha.
+    static func refusesAlpha(_ stream: VideoStreamInfo) -> Bool {
+        stream.hasAlpha && stream.nativelyDecodable
+    }
+
+    static let alphaRefusalReason = "alpha content — the mp4 deliverable cannot carry an alpha "
+        + "channel and flattening it would be silent; original kept"
+
+    /// The one wording for a floor miss, fed the floor the search actually held — every video
+    /// skip path formats it from the same number the receipt's `qualityFloor` carries, so the
+    /// text cannot cite a bar nothing was measured against.
+    static func floorMissReason(_ floor: Double) -> String {
+        "couldn't reach the SSIMU2 ≥ \(Int(floor)) floor"
     }
 
     /// Whether any pixel actually USES the alpha channel (< 255). Channel PRESENCE is not
@@ -840,38 +880,51 @@ public struct ForgeOptimizer: Sendable {
                                start: Date, profile: OutputProfile,
                                emit: ProgressEmit? = nil) async throws -> OptimizeResult {
         emit?(.searching, 0.02, "Preparing source — probing container and streams")
+        // Destination validation FIRST (`.inMemory` is unimplemented for video; an output on the
+        // input's own path is refused) — before any I/O and before any policy answer, so a bad
+        // argument surfaces as `.failed`, never as a plausible-looking `.skipped`. Pure: it builds
+        // URLs and throws, touching no file. The upscale branch re-resolves for itself.
+        let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let sourceBytes = fileSize(url)
         // ONE probe, before any routing. `.web` needs the container/codec answer for its remux
         // decision, and EVERY path — including upscale — needs the alpha answer immediately below.
-        // (`.native` used to skip the probe entirely; the cost is metadata-only, no decode.)
-        let info = await MediaMetrics.time("kit.probe", lane: "io",
-                                           attrs: ["input": url.lastPathComponent]) {
-            try? await MediaBridge.probe(url: url)
-        }
+        // Under `.native` the probe is gated on AVFoundation readability: `MediaBridge.probe`'s
+        // Matroska fallback reads the WHOLE file into memory to parse headers (a plain
+        // `Data(contentsOf:)`, not a bounded read), and the native path cannot consume a Matroska
+        // container anyway — it fails at the encoder exactly as it did before the probe was
+        // hoisted, without a multi-GB read first. For AVFoundation containers the probe IS
+        // metadata-only, no decode.
+        let avReadable = !((try? await AVURLAsset(url: url).loadTracks(withMediaType: .video)) ?? []).isEmpty
+        let info: MediaInfo? = (profile == .web || avReadable)
+            ? await MediaMetrics.time("kit.probe", lane: "io",
+                                      attrs: ["input": url.lastPathComponent]) {
+                try? await MediaBridge.probe(url: url)
+            }
+            : nil
 
         // ── Alpha: refuse, don't flatten ───────────────────────────────────────────────────
         // Every video deliverable this Kit produces is HEVC- or H.264-in-mp4, and no mp4
         // configuration carries an alpha channel (`AVVideoCodecType.hevcWithAlpha` writes only
-        // `.mov`). So an alpha source taking the optimize path comes out OPAQUE.
-        //
-        // The reason that has to be a refusal rather than a documented caveat is that nothing
-        // downstream can notice. The output is a complete, plausible video; the byte win looks
-        // excellent (measured: a ProRes 4444 cutout "optimized" −99%, most of it the discarded
-        // alpha); and the quality gate cannot object, because SSIMULACRA2 composites both sides
-        // over an opaque ground before scoring — a flattened candidate is measured against a
-        // flattened reference and clears its floor. An automatic optimizer would therefore
-        // report a clean success while shipping a takeover overlay with its transparency gone.
-        //
-        // Keeping the original is the honest outcome: `.skipped` leaves the source in place and
-        // says why. Preserving alpha properly means a `.mov` + HEVC-with-alpha deliverable AND a
-        // quality metric that scores the alpha plane — a feature, not a guard, and not this fix.
-        if let stream = info?.videoStreams.first, stream.hasAlpha {
+        // `.mov`), so an alpha source taking the optimize path would come out OPAQUE — and nothing
+        // downstream could notice: the output is a complete, plausible video, the byte win looks
+        // excellent (measured −99% on a ProRes 4444 cutout, most of it the discarded alpha), and
+        // SSIMULACRA2 composites both sides over an opaque ground before scoring, so a flattened
+        // candidate clears its floor against a flattened reference. Keeping the original is the
+        // honest outcome. Preserving alpha properly (a `.mov` HEVC-with-alpha deliverable plus a
+        // metric that scores the alpha plane) is a feature, not this guard. README carries the
+        // full rationale.
+        if let stream = info?.videoStreams.first, Self.refusesAlpha(stream) {
+            // An explicit `.hevc` pin is a conversion REQUEST, and an unhonourable request fails
+            // the item (the `OutputFormat` contract) rather than reading as a policy skip.
+            if options.output == .hevc {
+                throw ForgeError.invalidOptions(
+                    "HEVC-in-mp4 cannot carry this source's alpha channel — " + Self.alphaRefusalReason)
+            }
+            let kept = MediaStats(bytes: sourceBytes, width: stream.width, height: stream.height)
             return OptimizeResult(
                 input: url, kind: .video, output: .none, recipe: AppliedRecipe(),
-                before: MediaStats(bytes: sourceBytes, width: stream.width, height: stream.height),
-                after: MediaStats(bytes: sourceBytes, width: stream.width, height: stream.height),
-                status: .skipped("alpha content — the mp4 deliverable cannot carry an alpha "
-                                 + "channel and flattening it would be silent; original kept"),
+                before: kept, after: kept,   // nothing was produced — the kept original is the after-state
+                status: .skipped(Self.alphaRefusalReason),
                 elapsed: Date().timeIntervalSince(start))
         }
 
@@ -882,7 +935,6 @@ public struct ForgeOptimizer: Sendable {
                                           start: start, profile: profile)
         }
 
-        let outURL = try resolveVideoOutputURL(for: url, to: destination)
         let encodeProfile: VideoQualityTarget.EncodeProfile
         var webReady = false
         var encodeInput = url
@@ -947,15 +999,28 @@ public struct ForgeOptimizer: Sendable {
         // The weaker floor is unreachable by clean content BY CONSTRUCTION of the gate.
         var denoiseStrength: Float? = nil
         var cameraFloor: Double? = nil
-        if case .consumer = options.quality, Self.cameraGateAllowed(options) {
-            emit?(.searching, 0.03, "Probing sensor noise (camera self-gate)")
-            if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput),
-               probe < ContentClassifier.Calibration.cameraNoiseGate {
-                let floor = ContentClassifier.Calibration.cameraDenoisedFloor
-                cameraFloor = floor
-                denoiseStrength = 0.1
-                emit?(.searching, 0.04,
-                      "Camera noise detected — scoring against a denoised reference at floor \(Int(floor))")
+        // The gate's disposition is receipted (`recipe.cameraGate`): `denoisedReference` alone
+        // cannot tell "probed clean" from "never probed", and calibrating the threshold needs it.
+        var cameraGateOutcome: String? = nil
+        if case .consumer = options.quality {
+            if !Self.cameraGateAllowed(options) {
+                cameraGateOutcome = options.cameraGate == .off ? "off" : "suppressed"
+            } else {
+                emit?(.searching, 0.03, "Probing sensor noise (camera self-gate)")
+                if let probe = await VideoQualityTarget.noiseProbe(input: encodeInput) {
+                    if probe < ContentClassifier.Calibration.cameraNoiseGate {
+                        let floor = ContentClassifier.Calibration.cameraDenoisedFloor
+                        cameraFloor = floor
+                        denoiseStrength = 0.1
+                        cameraGateOutcome = "fired"
+                        emit?(.searching, 0.04,
+                              "Camera noise detected — scoring against a denoised reference at floor \(Int(floor))")
+                    } else {
+                        cameraGateOutcome = "clean"
+                    }
+                } else {
+                    cameraGateOutcome = "unavailable"   // probe needs macOS 26+ / a decodable input
+                }
             }
         }
 
@@ -1114,7 +1179,12 @@ public struct ForgeOptimizer: Sendable {
             case nil:      hintOutcome = .unverified
             }
             MediaMetrics.event("kit.hint.posthoc", attrs: ["outcome": hintOutcome!.rawValue])
-        } else if !hintOverreached {
+        } else if !hintOverreached, cameraFloor == nil {
+            // A fired camera gate suppresses the ratchet for the same reason it suppresses the
+            // hint (above): the denoised-reference regime and a class raise are different
+            // currencies, and `classRaisedFloor` anchors its overshoot signal on the PRESET floor,
+            // not the camera floor the search actually held. Handheld sensor noise is not graphic
+            // content; making the exclusion explicit beats leaving it to precedence order.
             // Per-class floor ratchet — planner policy (see ContentClassifier). Graphic-static
             // content clears the preset floor with huge overshoot at tiny bitrates AND is the
             // class where artifacts glare on signage, so a delivered preset-floor result gets one
@@ -1148,6 +1218,11 @@ public struct ForgeOptimizer: Sendable {
                                                         targetScore: raised,
                                                         maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                         profile: encodeProfile,
+                                                        // Always nil here (the gate suppresses the
+                                                        // ratchet) — threaded so the re-run can
+                                                        // never score against a different reference
+                                                        // than `recipe.denoisedReference` claims.
+                                                        denoiseStrength: denoiseStrength,
                                                         onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                                base: 0.50,
                                                                                                span: 0.45))
@@ -1173,6 +1248,7 @@ public struct ForgeOptimizer: Sendable {
             recipe.contentClass = ContentClassifier.ContentClass.graphic.rawValue
         }
         recipe.denoisedReference = denoiseStrength != nil
+        recipe.cameraGate = cameraGateOutcome
         if let hint, let hintOutcome {
             // The hint changed behavior (raised the start, or over-reached and fell back) —
             // receipt it. An ignored hint (low confidence / general / no raise applicable) is
@@ -1200,24 +1276,20 @@ public struct ForgeOptimizer: Sendable {
                          qualityScore: chosen.score, qualityAggregation: aggregation)
             : MediaStats(bytes: sourceBytes, width: chosen.sourceWidth, height: chosen.sourceHeight,
                          qualityScore: chosen.score, qualityAggregation: aggregation)
+        // A floor miss names `effectiveFloor` — the floor actually searched, the same number the
+        // recipe carries — never the preset: a camera gate (75→70), a declared class (→90) or a
+        // hint all move it, and citing the preset made the skip name a bar nothing was measured
+        // against.
+        let skipReason: String = chosen.metTarget
+            ? (webReady ? "already web-ready; re-encode not smaller than source" : "not smaller than source")
+            : Self.floorMissReason(effectiveFloor)
         // `output` is `.none` unless the encode delivered — it leaves NO file at `outURL` otherwise,
         // so the receipt must match (no `.file` pointing at a nonexistent path → no host orphan).
         // `delivered` is the encode profile's own rule; don't re-derive it here.
         return OptimizeResult(
             input: url, kind: .video, output: chosen.delivered ? .file(outURL) : .none,
             recipe: recipe, before: before, after: after,
-            status: chosen.delivered ? .optimized
-                                : .skipped(chosen.metTarget ? (webReady ? "already web-ready; re-encode not smaller than source"
-                                                                        : "not smaller than source")
-                                                            // `effectiveFloor`, not the preset: the
-                                                            // floor actually searched is what the
-                                                            // attempt missed, and it is what the
-                                                            // recipe reports two lines up. A camera
-                                                            // gate (75→70), a declared class (→90)
-                                                            // or a hint all move it, and naming the
-                                                            // preset instead made the skip cite a
-                                                            // bar nothing was ever measured against.
-                                                            : "couldn't reach the SSIMU2 ≥ \(Int(effectiveFloor)) floor"),
+            status: chosen.delivered ? .optimized : .skipped(skipReason),
             elapsed: Date().timeIntervalSince(start),
             outputType: chosen.delivered ? .mpeg4Movie : nil)   // HEVC- or H.264-in-mp4 per the profile
     }
@@ -1349,8 +1421,7 @@ public struct ForgeOptimizer: Sendable {
             return OptimizeResult(
                 input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
                 recipe: recipe, before: before, after: after,
-                status: r.delivered ? .optimized
-                                    : .skipped("couldn't reach the SSIMU2 ≥ \(Int(options.quality.floor)) floor"),
+                status: r.delivered ? .optimized : .skipped(Self.floorMissReason(options.quality.floor)),
                 elapsed: Date().timeIntervalSince(start),
                 outputType: r.delivered ? .mpeg4Movie : nil)
         }
