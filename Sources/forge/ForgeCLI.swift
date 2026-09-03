@@ -66,7 +66,8 @@ struct ForgeCLI {
                                       output: outputFormat(from: args),
                                       stripMetadata: args.contains("--strip-metadata"),
                                       contentClass: contentClass(from: args),
-                                      cameraGate: args.contains("--no-camera-gate") ? .off : .auto)
+                                      cameraGate: args.contains("--no-camera-gate") ? .off : .auto,
+                                      secondary: secondaryRendition(from: args, outDir: outDir, input: url))
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -205,6 +206,17 @@ struct ForgeCLI {
         case .failed(let why):
             print("✘ \(r.input.lastPathComponent)  failed — \(why)")
         }
+        // The secondary is a SECOND artifact, so it gets its own line rather than being folded into
+        // the primary's — and it names its provenance, because the number beside it is a floor it
+        // cleared, not a floor it was searched for.
+        if let sec = r.secondary, case .file(let u) = sec.output {
+            let ratio = r.before.bytes > 0
+                ? " (−\(pct(Double(r.before.bytes - sec.bytes) / Double(r.before.bytes))) vs source)" : ""
+            print("  ↳ \(u.lastPathComponent)  \(bytes(sec.bytes))\(ratio) · "
+                  + String(format: "SSIMU2 %.1f · %@", sec.score, sec.provenance))
+        } else if let floor = r.recipe.secondaryFloor, let why = r.recipe.secondaryOutcome {
+            print("  ↳ no @SSIMU2≥\(Int(floor)) rendition — \(why)")
+        }
     }
 
     // MARK: - JSON receipts (NDJSON; keys sorted so output is stable for tooling)
@@ -253,6 +265,31 @@ struct ForgeCLI {
             o["hint_class"] = hintClass
             if let c = r.recipe.contentHintConfidence { o["hint_confidence"] = round2(c) }
             if let outcome = r.recipe.contentHintOutcome { o["hint_outcome"] = outcome }
+        }
+        // The secondary rung, structured. `provenance` ships with it deliberately: a ledger that
+        // records the score without it will read as "optimized at 80", which is the one claim this
+        // rendition cannot make (AB-A-0059).
+        if let floor = r.recipe.secondaryFloor {
+            var sec: [String: Any] = ["floor": floor,
+                                      "outcome": r.recipe.secondaryOutcome ?? "unknown"]
+            if let s2 = r.secondary {
+                sec["ssimu2"] = round2(s2.score)
+                sec["search_floor"] = s2.searchFloor
+                sec["bytes"] = s2.bytes
+                sec["width"] = s2.width
+                sec["height"] = s2.height
+                sec["provenance"] = s2.provenance
+                // Small ⇒ close to what a dedicated search would find; large ⇒ the ladder never
+                // approached this floor (see `SecondaryResult.overshoot` for the measured split).
+                sec["overshoot"] = round2(s2.overshoot)
+                sec["aggregation"] = ["percentile": s2.aggregation.percentile,
+                                      "min": round2(s2.aggregation.minimum),
+                                      "mean": round2(s2.aggregation.mean),
+                                      "frames_scored": s2.aggregation.framesScored,
+                                      "frame_count": s2.aggregation.frameCount] as [String: Any]
+                if case .file(let u) = s2.output { sec["output"] = u.path }
+            }
+            o["secondary"] = sec
         }
         switch r.output {
         case .file(let u):  o["output"] = u.path
@@ -303,12 +340,17 @@ struct ForgeCLI {
           forge analyze     <file> [--deep] [--json]
                 --deep adds decode-to-EOF integrity verification
           forge optimize    <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--content-class C] [--no-camera-gate] [--json]
+                            [--strip-metadata] [--content-class C] [--no-camera-gate]
+                            [--secondary-floor N] [--json]
                 native deliverables: HEIC stills · HEVC+AAC mp4 video
                 --content-class graphic|general — state the content class instead of detecting it
                 (auto-detection is gated off); graphic starts at the class floor, general keeps the preset
+                --secondary-floor N — video only. Also write <stem>.secondary.mp4: the smallest
+                candidate the floor search ALREADY encoded that cleared N. Free (no second search),
+                and NOT the smallest file that clears N — the receipt says "harvested" for that reason
           forge weboptimize <file> <out-dir> [--quality Q] [--max-height N] [--format F]
-                            [--strip-metadata] [--content-class C] [--no-camera-gate] [--json]
+                            [--strip-metadata] [--content-class C] [--no-camera-gate]
+                            [--secondary-floor N] [--json]
                 web deliverables: PNG/JPEG race stills · H.264+AAC mp4 video · GIF→mp4
           forge sweep       <file-or-dir>
                 re-baseline CSV: each image × {max, balanced, consumer, aggressive}, in memory
@@ -380,6 +422,20 @@ struct ForgeCLI {
     /// auto-detection (which is gated off; see `ContentClassifier.autoDetectEnabled`). `graphic`
     /// starts the first search at the class floor; `general` explicitly keeps the preset and
     /// suppresses any hint. Absent = no opinion.
+    /// `--secondary-floor N` → the weaker rung, written beside the primary as `<stem>.secondary.mp4`.
+    ///
+    /// The Kit takes an explicit URL (a host names its own outputs); a CLI legitimately derives one,
+    /// and `.secondary` in the name is the point — this file is NOT the smallest thing that clears
+    /// N, and a name that hides that invites it into a ledger as if it were. Video only; on a still
+    /// the receipt says `video-only` and nothing is written.
+    static func secondaryRendition(from args: [String], outDir: URL, input: URL) -> SecondaryRendition? {
+        guard let i = args.firstIndex(of: "--secondary-floor"), i + 1 < args.count,
+              let floor = Double(args[i + 1]) else { return nil }
+        let stem = input.deletingPathExtension().lastPathComponent
+        return SecondaryRendition(floor: floor,
+                                  output: outDir.appendingPathComponent("\(stem).secondary.mp4"))
+    }
+
     static func contentClass(from args: [String]) -> ContentClassifier.ContentClass? {
         guard let i = args.firstIndex(of: "--content-class") else { return nil }
         // A typo must NOT degrade to "no opinion": the whole point of this flag is that the caller

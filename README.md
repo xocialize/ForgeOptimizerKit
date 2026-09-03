@@ -73,6 +73,15 @@ provenance, measured-not-requested transforms, and honest skips with sizes
   refused too — a skip is the cheap direction to be wrong in. **Stills are the opposite case: HEIC
   carries alpha and `optimize` keeps it**, so transparent stills optimize normally; the animated
   GIF → mp4 conversion is the documented exception above.
+- **A second, weaker-floor rendition for free** (`Options.secondary`) — for a delivery rung a
+  constrained venue can actually pull down. The floor search encodes and scores a whole ladder of
+  complete deliverables and deletes every one it does not ship; ask for a secondary floor and the
+  smallest candidate that cleared it is kept instead — same codec, container, resolution and muxed
+  audio, no second search (measured 11.5 s → 11.4 s and 34.5 s → 34.6 s on two signage masters).
+  Delivered only when it is **strictly smaller than what ships**, because a rendition that isn't
+  smaller isn't one. **It is a harvest, not a search**: `SecondaryResult.provenance` renders
+  `harvested @SSIMU2≥80 (from the ≥90 search)` so a ledger cannot record it as the smallest file
+  that clears 80. How close it came is readable from `overshoot` — see below.
 - **VFR-safe** — frame timing is preserved 1:1 through every encode.
 
 Real, reproducible example (CC-licensed Wikimedia GIFs through `weboptimize --quality consumer`):
@@ -82,6 +91,37 @@ Real, reproducible example (CC-licensed Wikimedia GIFs through `weboptimize --qu
 ✔ muybridge_horse.gif  →H.264 @SSIMU2≥75   555 KB → 43 KB  (−92%) · SSIMU2 78.3
 ✔ rotating_earth.gif   →H.264 @SSIMU2≥75   978 KB → 245 KB (−75%) · SSIMU2 76.1
 ```
+
+### What the harvested rendition actually costs you
+
+Measured 2026-09-03 on the signage corpus (AB-A-0059) — `optimize --quality max` (floor 90) with
+`--secondary-floor 80`, against a **dedicated** `--quality balanced` run of the same master:
+
+| master (sizes MB = 10⁶ B, as the NDJSON reports them) | source | primary @90 | harvested @80 | dedicated @80 | overshoot |
+|---|---|---|---|---|---|
+| is_keynote_airace_1080p | 10.36 MB | *skipped* | **7.96 MB** (82.1) | 7.26 MB (80.2) | 2.1 → **+10%** |
+| ibmplaycharacters_1080p | 3.22 MB | *skipped* | **2.75 MB** (82.8) | 2.49 MB (80.4) | 2.8 → **+10%** |
+| tp_layersb_1080p | 3.78 MB | *skipped* | **3.22 MB** (80.7) | 2.96 MB (80.2) | 0.7 → **+9%** |
+| ibmplaycharacters_master | 17.02 MB | 13.81 MB (90.3) | 10.61 MB (87.5) | **3.91 MB** (80.5) | 7.5 → **+171%** |
+| tp_honda_1080p | 6.72 MB | *skipped* | `no-candidate` | *skipped* (72.1) | — |
+| is_architecture_1080p | 4.17 MB | *skipped* | `no-candidate` | *skipped* (77.3) | — |
+
+Three things to read out of it.
+
+**The free version is near-optimal exactly when you need it.** When the primary floor is
+UNREACHABLE the search spends its whole ladder around the achievable ceiling — which is where the
+weaker floor lives — so the harvest lands within ~10%. When the primary floor CLEARS, the search
+stops at the smallest candidate meeting it and never probes far below, so the lowest thing it ever
+scored sits just under the *primary* floor (87.5, not 80) and the harvest is 2.7× a real
+floor-80 file. `overshoot` (score − floor) is the tell, and it is on the receipt.
+
+**`no-candidate` usually means the content, not the harvest.** On both masters that reported it, a
+dedicated floor-80 search also skipped, at the identical scores — nothing was missed. It is still
+worth distinguishing from `not-smaller`: persistent `no-candidate` on content that *can* reach the
+floor is the argument for spending a real second search.
+
+**Six masters is a calibration, not a fit.** Read the overshoot boundary as "single digits good,
+high single digits worth a second look".
 
 ## Use
 
@@ -95,6 +135,21 @@ for await r in try forge.optimize(.url(input), to: .directory(outDir),
                                   Options(quality: .balanced)) {
     print(r.recipe)                       // "normalize →HEVC @SSIMU2≥80"
     print(r.before.bytes, "→", r.after.bytes, r.after.qualityScore ?? 0)
+}
+
+// A second rendition at a weaker floor, harvested from the same search (see the table above).
+// The URL is stated, never derived: Forge writes only where the host names.
+for await r in try forge.optimize(.url(master), to: .fileURL(heroURL),
+                                  Options(quality: .max,
+                                          secondary: .init(floor: 80, output: wifiURL))) {
+    if let rung = r.secondary {
+        print(rung.bytes, rung.score, rung.provenance)   // "harvested @SSIMU2≥80 (from the ≥90 search)"
+        print(rung.overshoot)                            // ~2 = near-optimal · ~7 = pay for a real search
+    } else {
+        // Always answered, never silent: "no-candidate" · "not-smaller" · "video-only" ·
+        // "unsupported-route". A host has to be able to tell a policy from a failure.
+        print("no rendition:", r.recipe.secondaryOutcome ?? "-")
+    }
 }
 
 // webOptimize — web-universal outputs. The consumer preset: floor 75, the 1080p rung by default
@@ -172,10 +227,21 @@ like an ordinary PNG win because it *is* one; it just never had a competitor. Pa
 forge analyze     <file> [--deep] [--json]     # --deep = decode-to-EOF verification
 forge optimize    <file> <out-dir> [--quality max|balanced|consumer|aggressive|<0–100>]
                   [--max-height N] [--format auto|heic|jpeg|png|hevc] [--strip-metadata]
-                  [--content-class graphic|general] [--no-camera-gate] [--json]
+                  [--content-class graphic|general] [--no-camera-gate]
+                  [--secondary-floor N] [--json]
 forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format …]
-                  [--strip-metadata] [--content-class …] [--no-camera-gate] [--json]
+                  [--strip-metadata] [--content-class …] [--no-camera-gate]
+                  [--secondary-floor N] [--json]
 forge sweep | score | vscore | voptimize …     # run `forge` bare for the full surface
+```
+
+`--secondary-floor N` (video) also writes `<stem>.secondary.mp4` — the weaker rung, harvested from
+the search that already ran. The `.secondary` in the name is deliberate: it is not the smallest file
+that clears N, and a neutral name invites it into a ledger as though it were.
+
+```
+• is_keynote_airace_1080p.mp4  skipped — couldn't reach the SSIMU2 ≥ 90 floor
+  ↳ is_keynote_airace_1080p.secondary.mp4  7.6 MB (−23% vs source) · SSIMU2 82.1 · harvested @SSIMU2≥80 (from the ≥90 search)
 ```
 
 `--json` streams NDJSON receipts on stdout (one object per item + a summary; exit 1 on any

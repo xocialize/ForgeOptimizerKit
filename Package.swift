@@ -21,9 +21,15 @@ let package = Package(
         //    item here) no longer reads a whole MKV/WebM master into RAM to learn its track list;
         //  · 0.37.2: `VideoQualityTarget.encode` / the SR pipeline refuse alpha sources themselves
         //    (`flattenAlpha: true` is the explicit opt-in) — so `forge voptimize`, which drives the
-        //    encoder directly, can no longer flatten silently either.
+        //    encoder directly, can no longer flatten silently either;
+        //  · 0.38.0: `secondaryFloor`/`secondaryOutput` + `Result.secondary` — the harvest behind
+        //    `Options.secondary` (AB-A-0059). Below this the Kit has no way to keep a scored
+        //    candidate: they are all swept with the temps microseconds after the search ends;
+        //  · 0.38.1: `SecondaryOutcome.deliveryFailed` — a failed COPY no longer reports as the
+        //    `not-smaller` refusal, so `recipe.secondaryOutcome` cannot send a host after a
+        //    dedicated search to fix what was a disk fault.
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.3"),
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.38.1"),
     ],
     targets: [
         .target(

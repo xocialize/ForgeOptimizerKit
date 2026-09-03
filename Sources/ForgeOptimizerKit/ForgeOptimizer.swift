@@ -453,13 +453,36 @@ public struct ForgeOptimizer: Sendable {
                              emit: ProgressEmit? = nil) async throws -> OptimizeResult {
         let kind = mediaKind(of: url)
         try Self.validate(options.output, for: kind, profile: profile)
+        let result: OptimizeResult
         switch kind {
-        case .image: return try await optimizeImage(url, to: destination, options, start: start,
-                                                    profile: profile, emit: emit)
-        case .video: return try await optimizeVideo(url, to: destination, options, start: start,
-                                                    profile: profile, emit: emit)
+        case .image: result = try await optimizeImage(url, to: destination, options, start: start,
+                                                      profile: profile, emit: emit)
+        case .video: result = try await optimizeVideo(url, to: destination, options, start: start,
+                                                      profile: profile, emit: emit)
         case .unknown: throw ForgeError.unsupportedMedia(url)
         }
+        return Self.notingUnansweredSecondary(result, options, kind: kind)
+    }
+
+    /// A `Options.secondary` request that reached a route which does not implement it must still be
+    /// ANSWERED. Stamped here, at the router, rather than in each route: this way a route that
+    /// never learns about secondary renditions — including one written later — produces an honest
+    /// receipt by default instead of a silent omission, and the caller can always tell "nothing
+    /// qualified" from "this path does not do that". Routes that DO answer set the outcome
+    /// themselves and are left untouched.
+    private static func notingUnansweredSecondary(_ r: OptimizeResult, _ options: Options,
+                                                  kind: MediaKind) -> OptimizeResult {
+        guard let ask = options.secondary, r.recipe.secondaryOutcome == nil else { return r }
+        var recipe = r.recipe
+        recipe.secondaryFloor = ask.floor
+        // Stills have no uplink problem worth a second rung (they clear their floors at a few MB);
+        // the video routes that land here are the conversions — GIF → web mp4, upscale → web, the
+        // alpha refusal — which encode toward a different contract or produce nothing at all.
+        recipe.secondaryOutcome = kind == .image ? "video-only" : "unsupported-route"
+        return OptimizeResult(input: r.input, kind: r.kind, output: r.output, recipe: recipe,
+                              before: r.before, after: r.after, status: r.status,
+                              elapsed: r.elapsed, context: r.context, outputType: r.outputType,
+                              secondary: r.secondary)
     }
 
     /// `Options.output` × media kind × verb, checked before any decode runs. Invalid pairings fail
@@ -876,6 +899,40 @@ public struct ForgeOptimizer: Sendable {
         }
     }
 
+    /// Turn a search's harvested rendition into the Kit's receipt shape, re-checked against the
+    /// bytes that ACTUALLY ship on this route.
+    ///
+    /// The re-check exists for one route: the lossless web REMUX, which the Kit may ship in place
+    /// of the search's own deliverable. media-bridge compared the harvest against its encode (or
+    /// the source) because those are the only two outcomes it knows about — it has never heard of
+    /// the remux. Everywhere else `shippedBytes` is the number it already used and this agrees with
+    /// it by construction, which is the point of having one rule in one place.
+    ///
+    /// Returns the receipt and the outcome string, and REMOVES the file when the re-check refuses
+    /// it: leaving a rendition on disk that the receipt does not mention is the orphan this Kit
+    /// refuses everywhere else.
+    private static func adoptSecondary(_ r: VideoQualityTarget.Result, ask: SecondaryRendition?,
+                                       shippedBytes: Int) -> (SecondaryResult?, String?) {
+        guard let ask else { return (nil, nil) }
+        guard let harvest = r.secondary else {
+            return (nil, r.secondaryOutcome?.rawValue ?? VideoQualityTarget.SecondaryOutcome.noCandidate.rawValue)
+        }
+        guard harvest.outputBytes < shippedBytes else {
+            try? FileManager.default.removeItem(at: ask.output)
+            return (nil, VideoQualityTarget.SecondaryOutcome.notSmaller.rawValue)
+        }
+        let receipt = SecondaryResult(
+            output: .file(ask.output), floor: harvest.floor, searchFloor: harvest.searchFloor,
+            bytes: harvest.outputBytes, width: harvest.width, height: harvest.height,
+            score: harvest.score,
+            aggregation: .init(percentile: harvest.aggregation.percentile,
+                               minimum: harvest.aggregation.minimum,
+                               mean: harvest.aggregation.mean,
+                               framesScored: harvest.aggregation.framesScored,
+                               frameCount: harvest.aggregation.frameCount))
+        return (receipt, VideoQualityTarget.SecondaryOutcome.delivered.rawValue)
+    }
+
     private func optimizeVideo(_ url: URL, to destination: Destination, _ options: Options,
                                start: Date, profile: OutputProfile,
                                emit: ProgressEmit? = nil) async throws -> OptimizeResult {
@@ -1083,11 +1140,20 @@ public struct ForgeOptimizer: Sendable {
         // DEEP PROGRESS SEAM (media-bridge 0.28.0): the search's own pass-granular
         // `SearchProgress` maps into this item's emitter — pass index/planned, the bitrate under
         // test, and the best-so-far, live. The UI already renders `detail`.
+        // The secondary rendition rides on the SAME search — no second pass, no second ceiling.
+        // It is threaded into every `encode` below that could produce the delivered primary, and
+        // the two artifacts always come from ONE run: a re-run that replaces the primary replaces
+        // its secondary too (see the ratchet's `companions:`), because they share a floor regime, a
+        // reference and a resolution, and a mixed pair would make the receipt describe something
+        // that never existed.
+        let secondaryAsk = options.secondary
         var r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: startFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
                                                     denoiseStrength: denoiseStrength,
+                                                    secondaryFloor: secondaryAsk?.floor,
+                                                    secondaryOutput: secondaryAsk?.output,
                                                     onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                            base: 0.05,
                                                                                            span: 0.90))
@@ -1107,11 +1173,18 @@ public struct ForgeOptimizer: Sendable {
                   "The hinted floor (SSIMULACRA2 ≥ \(Int(hinted))) can't deliver — re-running at "
                   + "the preset floor (≥ \(Int(baselineFloor)))")
             try? FileManager.default.removeItem(at: outURL)   // a best-effort partial never leaks into the re-run
+            // The abandoned attempt's secondary goes with it. The re-run's own delivery would
+            // overwrite or clear this URL anyway; doing it here makes the pairing explicit rather
+            // than dependent on a downstream guarantee — and a throw between the two would
+            // otherwise leave a rendition attributed to a search that was discarded.
+            if let secondaryAsk { try? FileManager.default.removeItem(at: secondaryAsk.output) }
             r = try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
                                                     targetScore: baselineFloor,
                                                     maxHeight: options.resolution.maxHeight ?? options.quality.impliedMaxHeight,
                                                     profile: encodeProfile,
                                                     denoiseStrength: denoiseStrength,
+                                                    secondaryFloor: secondaryAsk?.floor,
+                                                    secondaryOutput: secondaryAsk?.output,
                                                     onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                            base: 0.50,
                                                                                            span: 0.45))
@@ -1135,12 +1208,20 @@ public struct ForgeOptimizer: Sendable {
             recipe.codec = "H.264"
             recipe.remuxed = true
             recipe.strippedMetadata = options.stripMetadata
+            // The search lost to the remux, but its harvest is still a real rendition — measured,
+            // playable, and (almost always) far below a ~source-size lossless rewrap. It is kept on
+            // its own merits, re-checked against the bytes that ship HERE rather than against the
+            // encode that was discarded.
+            let (secondary, secondaryOutcome) = Self.adoptSecondary(r, ask: secondaryAsk,
+                                                                    shippedBytes: remuxBytes)
+            recipe.secondaryFloor = secondaryAsk?.floor
+            recipe.secondaryOutcome = secondaryOutcome
             return OptimizeResult(
                 input: url, kind: .video, output: .file(outURL), recipe: recipe,
                 before: MediaStats(bytes: sourceBytes, width: r.sourceWidth, height: r.sourceHeight),
                 after: MediaStats(bytes: remuxBytes, width: r.sourceWidth, height: r.sourceHeight),
                 status: .optimized, elapsed: Date().timeIntervalSince(start),
-                outputType: .mpeg4Movie)
+                outputType: .mpeg4Movie, secondary: secondary)
         }
 
         var chosen = r
@@ -1213,6 +1294,10 @@ public struct ForgeOptimizer: Sendable {
                 // and no `.forge-ratchet-*.tmp` survives. `nil` means the original was kept.
                 let rerun = try await RatchetStash.attemptReplacing(
                     outURL,
+                    // The secondary is stashed and restored WITH the primary: if the raised-floor
+                    // re-run is declined, the rendition that ships beside the kept original must be
+                    // the one that search produced, not the abandoned attempt's.
+                    companions: secondaryAsk.map { [$0.output] } ?? [],
                     accept: { $0.delivered && $0.metTarget }
                 ) {
                     try await VideoQualityTarget.encode(input: encodeInput, output: outURL,
@@ -1224,6 +1309,8 @@ public struct ForgeOptimizer: Sendable {
                                                         // never score against a different reference
                                                         // than `recipe.denoisedReference` claims.
                                                         denoiseStrength: denoiseStrength,
+                                                        secondaryFloor: secondaryAsk?.floor,
+                                                        secondaryOutput: secondaryAsk?.output,
                                                         onProgress: Self.searchProgressAdapter(emit: emit,
                                                                                                base: 0.50,
                                                                                                span: 0.45))
@@ -1250,6 +1337,13 @@ public struct ForgeOptimizer: Sendable {
         }
         recipe.denoisedReference = denoiseStrength != nil
         recipe.cameraGate = cameraGateOutcome
+        // `chosen` is the run whose primary ships, so its harvest is the matching secondary — the
+        // ratchet restored the pair together, so these two can never come from different searches.
+        let (secondary, secondaryOutcome) = Self.adoptSecondary(
+            chosen, ask: secondaryAsk,
+            shippedBytes: chosen.delivered ? chosen.outputBytes : sourceBytes)
+        recipe.secondaryFloor = secondaryAsk?.floor
+        recipe.secondaryOutcome = secondaryOutcome
         if let hint, let hintOutcome {
             // The hint changed behavior (raised the start, or over-reached and fell back) —
             // receipt it. An ignored hint (low confidence / general / no raise applicable) is
@@ -1292,7 +1386,11 @@ public struct ForgeOptimizer: Sendable {
             recipe: recipe, before: before, after: after,
             status: chosen.delivered ? .optimized : .skipped(skipReason),
             elapsed: Date().timeIntervalSince(start),
-            outputType: chosen.delivered ? .mpeg4Movie : nil)   // HEVC- or H.264-in-mp4 per the profile
+            outputType: chosen.delivered ? .mpeg4Movie : nil,   // HEVC- or H.264-in-mp4 per the profile
+            // A `.skipped` primary WITH a secondary is the case AB-A-0059 exists for: the floor was
+            // unreachable at any size worth shipping, and the weaker rung is the only deliverable.
+            // `status` still describes the primary — it is not softened by the rendition beside it.
+            secondary: secondary)
     }
 
     /// The class ratchet's decision: classify the preset-floor result mechanically and return the

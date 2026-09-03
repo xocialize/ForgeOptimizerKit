@@ -96,6 +96,75 @@ final class RatchetStashTests: XCTestCase {
         try assertDeliverable(is: better, "the ratchet's whole point: the stricter result wins")
     }
 
+    // MARK: - companions: a run's outputs are a matched set
+
+    /// The secondary rendition (AB-A-0059) ships beside the primary and comes from the SAME search.
+    /// A declined re-run must therefore put back BOTH — restoring the primary while leaving the
+    /// re-run's rendition in place would hand the caller a pair that never existed together
+    /// (different floor regime, different reference, possibly different resolution) under one
+    /// receipt.
+    func testDecliningAttemptRestoresCompanionsToo() async throws {
+        let out = deliverable!
+        let companion = dir.appendingPathComponent("out.secondary.mp4")
+        let originalCompanion = Data("the rendition from the first search".utf8)
+        try originalCompanion.write(to: companion)
+
+        let kept = try await RatchetStash.attemptReplacing(
+            out, companions: [companion], accept: { (ok: Bool) in ok }
+        ) {
+            try Data("a worse encode".utf8).write(to: out)
+            try Data("the re-run's rendition".utf8).write(to: companion)
+            return false
+        }
+
+        XCTAssertNil(kept)
+        try assertDeliverable(is: original, "the primary must be the first search's")
+        XCTAssertEqual(try Data(contentsOf: companion), originalCompanion,
+                       "the rendition beside it must be the SAME search's, not the abandoned one's")
+    }
+
+    /// The other half: a re-run that IS accepted keeps its own pair, and no stash survives.
+    func testAcceptedAttemptKeepsItsOwnCompanion() async throws {
+        let out = deliverable!
+        let companion = dir.appendingPathComponent("out.secondary.mp4")
+        try Data("the rendition from the first search".utf8).write(to: companion)
+        let betterCompanion = Data("the raised-floor search's rendition".utf8)
+
+        let kept = try await RatchetStash.attemptReplacing(
+            out, companions: [companion], accept: { (ok: Bool) in ok }
+        ) {
+            try Data("the raised-floor encode".utf8).write(to: out)
+            try betterCompanion.write(to: companion)
+            return true
+        }
+
+        XCTAssertEqual(kept, true)
+        XCTAssertEqual(try Data(contentsOf: companion), betterCompanion)
+        XCTAssertEqual(try strayStashes(), [], "no companion stash may outlive the call")
+    }
+
+    /// When the original run produced NO rendition, a declined re-run's rendition must be REMOVED,
+    /// not left behind. Otherwise the file on disk would be the only record of a search whose
+    /// result was thrown away — and the receipt, which describes the kept original, would not
+    /// mention it at all.
+    func testDecliningAttemptRemovesACompanionTheOriginalNeverHad() async throws {
+        let out = deliverable!
+        let companion = dir.appendingPathComponent("out.secondary.mp4")   // deliberately absent
+
+        let kept = try await RatchetStash.attemptReplacing(
+            out, companions: [companion], accept: { (ok: Bool) in ok }
+        ) {
+            try Data("a worse encode".utf8).write(to: out)
+            try Data("a rendition with no counterpart".utf8).write(to: companion)
+            return false
+        }
+
+        XCTAssertNil(kept)
+        try assertDeliverable(is: original, "the original still stands")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: companion.path),
+                       "an orphan rendition from a discarded search must not survive it")
+    }
+
     func testStashFailureThrowsBeforeAnythingIsRisked() async throws {
         let missing = dir.appendingPathComponent("never-written.mp4")
         var attempted = false

@@ -170,14 +170,44 @@ public struct Options: Sendable {
     /// `.auto` by default; no effect under any other preset, which never run the probe.
     public var cameraGate: CameraGate
 
+    /// **A second, weaker-floor rendition beside the primary — taken from the search that already
+    /// ran, not from a second one.** `nil` (the default) changes nothing.
+    ///
+    /// `optimize` on video encodes and scores a whole ladder of candidates on its way to the floor
+    /// and deletes every one it does not ship. Ask for a `secondary` and the smallest of those that
+    /// cleared its floor is delivered to `secondary.output` instead of being swept — a complete
+    /// file, same codec/container/resolution, audio muxed in, for no additional encode time.
+    ///
+    /// The intended use is a delivery rung for constrained playback (the bad-uplink venue), chosen
+    /// per destination beside the primary, where the alternative is either shipping nothing or
+    /// paying a second full search.
+    ///
+    /// ⚠️ **It is a harvest, not a search.** What lands is whichever bitrate the primary's bisection
+    /// happened to try that cleared `floor` — the smallest such, but drawn from a ladder built for a
+    /// different floor. A dedicated `optimize` at `floor` will generally produce a smaller file.
+    /// `SecondaryResult.provenance` says exactly this, and it belongs in any ledger that records the
+    /// rendition, so the choice to take the free one stays a visible choice.
+    ///
+    /// **Video only** — and only the ordinary `optimize` route. Stills clear their floors at a few
+    /// MB and have no uplink problem, and the conversion routes (animated GIF → web mp4, the
+    /// upscale → web deliverable) already encode toward a different contract. Asking anyway is not
+    /// an error: nothing is written and `AppliedRecipe.secondaryOutcome` records why.
+    ///
+    /// Nothing is ever written outside `secondary.output` and the primary destination — the
+    /// `OptimizeRequest` write contract holds, which is why the URL is stated here rather than
+    /// derived from the primary's.
+    public var secondary: SecondaryRendition?
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
                 integrity: IntegrityLevel = .structural,
                 contentClass: ContentClassifier.ContentClass? = nil,
-                cameraGate: CameraGate = .auto) {
+                cameraGate: CameraGate = .auto,
+                secondary: SecondaryRendition? = nil) {
         self.contentClass = contentClass
         self.cameraGate = cameraGate
+        self.secondary = secondary
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance
@@ -185,6 +215,78 @@ public struct Options: Sendable {
         self.output = output
         self.stripMetadata = stripMetadata
         self.integrity = integrity
+    }
+}
+
+/// A request for the secondary rendition (`Options.secondary`): the floor it must clear and the
+/// exact URL it lands at. Both are required — a floor with nowhere to write is not a request, and a
+/// URL is never derived from the primary's, because a host that names its outputs must keep naming
+/// them.
+public struct SecondaryRendition: Sendable {
+    /// The SSIMULACRA2 floor the harvested candidate must have cleared. Meaningful only *below* the
+    /// preset's own floor: at or above it, every qualifying candidate is the primary or larger, and
+    /// the "strictly smaller than the primary" rule can only refuse.
+    public var floor: Double
+    /// Where the rendition lands. Left empty (nothing written, anything already there removed) when
+    /// no candidate qualifies — same no-orphan rule the primary destination follows.
+    public var output: URL
+
+    public init(floor: Double, output: URL) {
+        self.floor = floor
+        self.output = output
+    }
+}
+
+/// The delivered secondary rendition. Present only when one was asked for AND a candidate cleared
+/// its floor AND that candidate is strictly smaller than what shipped as the primary (or than the
+/// source, when the primary declined) — otherwise nil, and `AppliedRecipe.secondaryOutcome` says
+/// which of those it was.
+public struct SecondaryResult: Sendable {
+    public let output: Output
+    /// The floor this rendition cleared.
+    public let floor: Double
+    /// The floor the SEARCH was run at — the primary's. `floor` was never searched for, and the two
+    /// numbers together are what make `provenance` sayable.
+    public let searchFloor: Double
+    public let bytes: Int
+    public let width: Int
+    public let height: Int
+    /// Achieved p10 SSIMULACRA2, at or above `floor`.
+    public let score: Double
+    /// The reduction behind `score`, on the same terms as the primary's `MediaStats`.
+    public let aggregation: MediaStats.QualityAggregation
+
+    public init(output: Output, floor: Double, searchFloor: Double, bytes: Int,
+                width: Int, height: Int, score: Double,
+                aggregation: MediaStats.QualityAggregation) {
+        self.output = output; self.floor = floor; self.searchFloor = searchFloor
+        self.bytes = bytes; self.width = width; self.height = height
+        self.score = score; self.aggregation = aggregation
+    }
+
+    /// How far ABOVE `floor` this rendition landed — the number that says whether the free version
+    /// was good enough, or whether a dedicated `optimize` at `floor` is worth its minutes.
+    ///
+    /// A SMALL overshoot means the primary search's candidate ladder had probes near `floor`, so
+    /// the harvest is close to what a real search would find. A LARGE one means the primary floor
+    /// cleared early and the search never went looking down there. Measured on the signage corpus
+    /// at floor 80 (2026-09-03, AB-A-0059), harvested bytes vs a dedicated `.balanced` run:
+    /// overshoot 0.7 / 2.1 / 2.8 → **+9% / +10% / +10%**; overshoot 7.5 → **+171%** (10.61 MB where
+    /// a dedicated search found 3.91 MB). Four masters is a calibration, not a fit — read it as
+    /// "single digits good, high single digits worth a second look", not as a threshold.
+    ///
+    /// The corollary is the useful one for a host: the cases where the primary SKIPS — which is
+    /// precisely when a second rung is needed at all — are the cases where the harvest is nearly
+    /// optimal, because a search that could not reach its floor spent its whole ladder near the
+    /// achievable ceiling.
+    public var overshoot: Double { score - floor }
+
+    /// **Put this in the ledger, not "optimized at \(floor)".** It is the difference between a
+    /// rendition that was searched for and one that fell out of a search for something else — the
+    /// first is the smallest file that clears `floor`, the second merely clears it. An operator who
+    /// later needs the bytes can then ask for a dedicated run, knowing one was never made.
+    public var provenance: String {
+        String(format: "harvested @SSIMU2≥%.0f (from the ≥%.0f search)", floor, searchFloor)
     }
 }
 
@@ -341,6 +443,25 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// invisible in the bytes and to the scorer.
     public var flattenedAlpha: Bool = false
 
+    /// The secondary floor asked for (`Options.secondary.floor`), set whenever one was asked for —
+    /// delivered or not. Paired with `secondaryOutcome`, which says what became of the request.
+    public var secondaryFloor: Double? = nil
+    /// What the secondary-rendition request produced on this item. nil when none was made.
+    ///
+    /// `"delivered"` · `"no-candidate"` (nothing the search encoded cleared the floor) ·
+    /// `"not-smaller"` (something did, but not smaller than what ships — refused, because a
+    /// rendition that isn't smaller is not one) · `"delivery-failed"` (a qualifying candidate
+    /// existed and the copy failed — a disk fault, not a refusal, and worth retrying where the
+    /// other two are not) · `"video-only"` (asked for on a still) · `"unsupported-route"` (asked
+    /// for on a conversion path that encodes toward a different contract: GIF → web mp4,
+    /// upscale → web, or a refusal).
+    ///
+    /// A string rather than a bool for the same reason `cameraGate` is one: "nothing shipped" has
+    /// several distinct causes and each implies a different next move — only `"no-candidate"`,
+    /// persistently and on content that CAN reach the floor, is an argument for spending a real
+    /// second search.
+    public var secondaryOutcome: String? = nil
+
     /// Planner-hint receipt trio (§6.3) — set ONLY when an injected `ContentHintProvider`'s hint
     /// CHANGED planner behavior: it raised the starting floor (`raised-*` outcomes) or it
     /// over-reached and the preset-floor search restored the contract (`overreached`). A hint that
@@ -415,6 +536,15 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
                 }
             }
         }
+        // A secondary rendition is a SECOND artifact, so it is stated as one rather than folded
+        // into the primary's chain — and stated as harvested, never as a floor it was searched for.
+        if let sf = secondaryFloor {
+            switch secondaryOutcome {
+            case "delivered"?: parts.append("+ harvested @SSIMU2≥\(Int(sf))")
+            case let other?:   parts.append("+ no @SSIMU2≥\(Int(sf)) rendition (\(other))")
+            case nil:          break
+            }
+        }
         return parts.isEmpty ? "passthrough" : parts.joined(separator: " ")
     }
 }
@@ -448,13 +578,21 @@ public struct OptimizeResult: Sendable {
     /// set its `content_type` (`outputType?.preferredMIMEType`) + deliverable extension
     /// (`outputType?.preferredFilenameExtension`). nil on `.skipped`/`.failed`.
     public let outputType: UTType?
+    /// The weaker-floor rendition delivered beside the primary (`Options.secondary`), when one was.
+    ///
+    /// Independent of `status`: a `.skipped` primary with a non-nil `secondary` is the case the
+    /// feature exists for — the floor could not be met at any size worth shipping, and the smaller
+    /// rung is the only thing that ships. `savedBytes`/`Summary` deliberately ignore it: they
+    /// describe what happened to the source, and the source still has exactly one primary.
+    public let secondary: SecondaryResult?
 
     public init(input: URL, kind: MediaKind, output: Output, recipe: AppliedRecipe,
                 before: MediaStats, after: MediaStats, status: Status, elapsed: TimeInterval,
-                context: String? = nil, outputType: UTType? = nil) {
+                context: String? = nil, outputType: UTType? = nil,
+                secondary: SecondaryResult? = nil) {
         self.input = input; self.kind = kind; self.output = output; self.recipe = recipe
         self.before = before; self.after = after; self.status = status; self.elapsed = elapsed
-        self.context = context; self.outputType = outputType
+        self.context = context; self.outputType = outputType; self.secondary = secondary
     }
 
     public var savedBytes: Int { max(0, before.bytes - after.bytes) }
@@ -466,7 +604,7 @@ public struct OptimizeResult: Sendable {
     public func with(context: String?) -> OptimizeResult {
         OptimizeResult(input: input, kind: kind, output: output, recipe: recipe, before: before,
                        after: after, status: status, elapsed: elapsed, context: context,
-                       outputType: outputType)
+                       outputType: outputType, secondary: secondary)
     }
 }
 

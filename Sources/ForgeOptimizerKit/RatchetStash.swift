@@ -20,6 +20,12 @@ enum RatchetStash {
     ///
     /// - Parameters:
     ///   - deliverable: the URL holding the result already in hand. Must exist.
+    ///   - companions: further URLs the attempt also writes, which belong to the SAME result and
+    ///     must be restored or discarded WITH it — today the secondary rendition. Each is stashed
+    ///     only if it exists, and on a restore a companion the original run did not produce is
+    ///     removed rather than left behind: a run's outputs are a matched set (same floor regime,
+    ///     same reference, same resolution), and mixing one run's primary with another run's
+    ///     companion would make the receipt describe a pair that never existed together.
     ///   - accept: whether the attempt's result is good enough to replace the original.
     ///   - attempt: the stricter attempt, which writes its own output to `deliverable`.
     /// - Returns: the attempt's result when it was accepted; `nil` when the original was kept —
@@ -30,17 +36,44 @@ enum RatchetStash {
     ///   result, but it must not eat one either.
     static func attemptReplacing<T>(
         _ deliverable: URL,
+        companions: [URL] = [],
         accept: (T) -> Bool,
         _ attempt: () async throws -> T
     ) async throws -> T? {
-        let stash = deliverable.deletingLastPathComponent()
-            .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
+        func stashURL(beside url: URL) -> URL {
+            url.deletingLastPathComponent()
+                .appendingPathComponent(".forge-ratchet-\(UUID().uuidString).tmp")
+        }
+        let stash = stashURL(beside: deliverable)
         try FileManager.default.moveItem(at: deliverable, to: stash)
+        // Companions are stashed AFTER the deliverable: the move above is the only one allowed to
+        // throw out of here (nothing has been risked yet), and a companion that cannot be moved
+        // must not strand the deliverable in its stash.
+        var companionStash: [(live: URL, stashed: URL?)] = []
+        for c in companions {
+            guard FileManager.default.fileExists(atPath: c.path) else {
+                companionStash.append((c, nil))   // nothing to keep — but still ours to clean up
+                continue
+            }
+            let s = stashURL(beside: c)
+            if (try? FileManager.default.moveItem(at: c, to: s)) != nil {
+                companionStash.append((c, s))
+            } else {
+                companionStash.append((c, nil))
+                MediaMetrics.event("kit.ratchet.companion_stash_failed", attrs: ["url": c.lastPathComponent])
+            }
+        }
 
         func restore() {
             try? FileManager.default.removeItem(at: deliverable)   // a partial write never survives
             do { try FileManager.default.moveItem(at: stash, to: deliverable) }
             catch { MediaMetrics.event("kit.ratchet.restore_failed", attrs: ["error": "\(error)"]) }
+            for (live, stashed) in companionStash {
+                try? FileManager.default.removeItem(at: live)      // whatever the attempt wrote goes
+                guard let stashed else { continue }                // the original had none → none stands
+                do { try FileManager.default.moveItem(at: stashed, to: live) }
+                catch { MediaMetrics.event("kit.ratchet.restore_failed", attrs: ["error": "\(error)"]) }
+            }
         }
 
         let result: T
@@ -56,6 +89,7 @@ enum RatchetStash {
 
         guard accept(result) else { restore(); return nil }
         try? FileManager.default.removeItem(at: stash)
+        for (_, stashed) in companionStash { if let stashed { try? FileManager.default.removeItem(at: stashed) } }
         return result
     }
 }
