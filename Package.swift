@@ -23,7 +23,7 @@ let package = Package(
         //    (`flattenAlpha: true` is the explicit opt-in) — so `forge voptimize`, which drives the
         //    encoder directly, can no longer flatten silently either.
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.2"),
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.3"),
     ],
     targets: [
         .target(
