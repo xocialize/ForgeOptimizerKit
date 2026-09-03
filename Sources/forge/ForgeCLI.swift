@@ -17,7 +17,7 @@ import MediaMetrics
 //                     [--content-class C] [--no-camera-gate] [--json]
 //   forge sweep       <file-or-dir>
 //   forge score       <ref> <distorted> [--metal]
-//   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink]
+//   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink] [--flatten-alpha]
 //   forge vscore      <ref> <distorted> [--stride N]
 //
 // `--json` streams NDJSON receipts (one object per item, then a `"type":"summary"` object) —
@@ -141,10 +141,14 @@ struct ForgeCLI {
                 let floor = quality(from: args).floor
                 let maxH = args.firstIndex(of: "--max-height").flatMap {
                     args.count > $0 + 1 ? Int(args[$0 + 1]) : nil }
+                // An alpha source is refused by the encoder itself (media-bridge ≥ 0.37.2) — the
+                // bench verb inherits the same guard `forge optimize` applies, and `--flatten-alpha`
+                // is the explicit opt-in for measuring an opaque-tagged plane on purpose.
                 let r = try await VideoQualityTarget.encode(input: URL(fileURLWithPath: args[1]),
                                                             output: URL(fileURLWithPath: args[2]),
                                                             targetScore: floor, maxHeight: maxH,
-                                                            profile: encodeProfile(from: args))
+                                                            profile: encodeProfile(from: args),
+                                                            flattenAlpha: args.contains("--flatten-alpha"))
                 print(String(format: "✔ %d×%d · %.1f Mbps · p10 %.1f · %@ → %@ (−%.0f%%) · met=%@",
                              r.width, r.height, Double(r.bitrate) / 1_000_000, r.score,
                              bytes(r.inputBytes), bytes(r.outputBytes),
@@ -311,8 +315,10 @@ struct ForgeCLI {
           forge score       <ref> <distorted> [--metal]
                 pure-Swift SSIMULACRA2 on a still pair (parity-diff vs canonical)
           forge voptimize   <in> <out.mp4> [--quality Q] [--max-height N]
-                            [--profile native|web|webshrink]
-                low-level video floor search (media-bridge direct; no Kit semantics)
+                            [--profile native|web|webshrink] [--flatten-alpha]
+                low-level video floor search (media-bridge direct; no Kit semantics).
+                An alpha source is refused by the encoder; --flatten-alpha composites it
+                away on purpose (for measuring an opaque-tagged 4444 master, say)
           forge vscore      <ref> <distorted> [--stride N]
                 per-frame SSIMULACRA2 of a video pair, p10-aggregated
 

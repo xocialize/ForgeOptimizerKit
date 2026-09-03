@@ -18,9 +18,12 @@ let package = Package(
         //    camera self-gate fires, and the item never returns to the host;
         //  · `VideoStreamInfo.hasAlpha` is what the alpha refusal in `optimizeVideo` reads;
         //  · 0.37.1: the Matroska demux opens files memory-mapped — `probe` (run on every video
-        //    item here) no longer reads a whole MKV/WebM master into RAM to learn its track list.
+        //    item here) no longer reads a whole MKV/WebM master into RAM to learn its track list;
+        //  · 0.37.2: `VideoQualityTarget.encode` / the SR pipeline refuse alpha sources themselves
+        //    (`flattenAlpha: true` is the explicit opt-in) — so `forge voptimize`, which drives the
+        //    encoder directly, can no longer flatten silently either.
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.1"),
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.37.2"),
     ],
     targets: [
         .target(
