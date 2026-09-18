@@ -1,5 +1,5 @@
 {
-  "originHash" : "d890595c898874f6d04c9aa7714a221a02d4bec74e118d0986c29a39fd0d2036",
+  "originHash" : "f0f70e8abea75fcd2e6097ae904e4a70ffa1f40714bf14eb75781a59d46cffb8",
   "pins" : [
     {
       "identity" : "matroska-swift",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/media-bridge.git",
       "state" : {
-        "revision" : "8405f587633aa64c61a8995f4da0557067f68c04",
-        "version" : "0.38.1"
+        "revision" : "51b1965e6b115c32291ceea6d50a69cd3145c53c",
+        "version" : "0.39.0"
       }
     }
   ],

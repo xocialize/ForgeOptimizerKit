@@ -7,7 +7,7 @@ stack. Three verbs over one media foundation:
 |---|---|---|
 | **analyze** | probe + **verify integrity** + recommend, read-only → `Analysis` (corrupt files yield a diagnosis, never vanish) | probe + millisecond byte walks (box chains · PNG CRCs · JPEG EOI · EBML sizes); `Options(integrity: .deep)` adds decode-to-EOF |
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (stills) · target-quality HEVC mp4 (video), SSIMULACRA2-guided |
-| **webOptimize** | same optimizer, web-universal outputs — stills race **JPEG vs PNG**, video → **H.264 + AAC mp4**, animated **GIF → mp4** | the full pipeline below |
+| **webOptimize** | same optimizer, web-universal outputs — stills race **WebP (or JPEG) vs PNG**, video → **H.264 + AAC mp4**, animated **GIF → mp4** | the full pipeline below |
 | **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
 
 **Depends on [`media-bridge`](https://github.com/xocialize/media-bridge) only** — pure-Swift, FFmpeg-free,
@@ -51,9 +51,17 @@ provenance, measured-not-requested transforms, and honest skips with sizes
 - **HDR → SDR for the web** — HLG/PQ sources (every recent iPhone) tone-map once in the mezzanine
   and ship correctly-tagged BT.709; the native profile preserves HDR untouched (HDR HEVC is a
   first-class Apple deliverable).
-- **Web stills race, not classify** — a JPEG floor search runs against lossless PNG and the smaller
+- **Web stills race, not classify** — a lossy floor search (WebP when a `webp-swift` encoder is
+  registered, JPEG otherwise — `Options.webLossy`) runs against lossless PNG and the smaller
   guarantee-keeper ships. Transparency is detected at the **pixel** level (an unused alpha channel
   doesn't bench the race); a host-pinned URL that names a format pins it.
+- **The WebP lane** — register an encoder once (`WebPStillEncoder.register()`, from
+  [webp-swift](https://github.com/xocialize/webp-swift)) and the web race's lossy lane becomes WebP:
+  ~30% under the JPEG deliverable at the same floor on the signage corpus, and it carries alpha, so
+  transparent stills race instead of defaulting to PNG. Nothing registered → the JPEG race, unchanged.
+  `Options(webLossy: .jpeg)` / `--web-lossy jpeg` keeps JPEG on purpose (email, Office);
+  `.webp` / `--format webp` pins it and fails honestly without an encoder. WebP deliverables are
+  metadata-clean (no ImageIO rewrap for WebP) and the receipt says so.
 - **Animated GIF → mp4** — browser-convention timing (delays ≤ 10 ms play as 100 ms), floor-searched
   like any video. Single-frame GIFs are stills. **This is the one route that knowingly flattens
   transparency** — over white, the background a web GIF was authored against (a `<video>` has no

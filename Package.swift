@@ -28,8 +28,12 @@ let package = Package(
         //  · 0.38.1: `SecondaryOutcome.deliveryFailed` — a failed COPY no longer reports as the
         //    `not-smaller` refusal, so `recipe.secondaryOutcome` cannot send a host after a
         //    dedicated search to fix what was a disk fault.
+        //  · 0.39.0: the external still-encoder seam — `ExternalStillEncoder`,
+        //    `MediaBridge.externalStillEncoder(for:)`, the generic floor search
+        //    `ImageQualityTarget.encode(_:targetScore:codec:encoder:)` and `StillFormat.webp`.
+        //    The web race's WebP lane (`Options.webLossy`, `OutputFormat.webp`) is built on all four.
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.38.1"),
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.39.0"),
     ],
     targets: [
         .target(

@@ -14,7 +14,7 @@ import MediaMetrics
 //   forge optimize    <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata]
 //                     [--content-class C] [--no-camera-gate] [--json]
 //   forge weboptimize <file> <out-dir> [--quality …] [--max-height N] [--format F] [--strip-metadata]
-//                     [--content-class C] [--no-camera-gate] [--json]
+//                     [--content-class C] [--no-camera-gate] [--web-lossy L] [--json]
 //   forge sweep       <file-or-dir>
 //   forge score       <ref> <distorted> [--metal]
 //   forge voptimize   <in> <out.mp4> [--quality …] [--max-height N] [--profile native|web|webshrink] [--flatten-alpha]
@@ -67,7 +67,8 @@ struct ForgeCLI {
                                       stripMetadata: args.contains("--strip-metadata"),
                                       contentClass: contentClass(from: args),
                                       cameraGate: args.contains("--no-camera-gate") ? .off : .auto,
-                                      secondary: secondaryRendition(from: args, outDir: outDir, input: url))
+                                      secondary: secondaryRendition(from: args, outDir: outDir, input: url),
+                                      webLossy: webLossy(from: args))
                 var results: [OptimizeResult] = []
                 // Stage narration goes to STDERR as it happens (stdout stays receipt/NDJSON-clean):
                 // a 4K floor search is minutes of real work and the phases are worth naming. Only
@@ -371,6 +372,8 @@ struct ForgeCLI {
           --strip-metadata  metadata-clean deliverable (EXIF/GPS/IPTC/XMP; orientation is baked
                             into pixels either way) — the default preserves stills metadata
           --no-camera-gate  skip the consumer preset's camera-noise probe, keeping the preset floor
+          --web-lossy L     weboptimize's lossy lane: auto (WebP when an encoder is registered, else
+                            JPEG — the default) | webp (fails honestly without one) | jpeg
                             and the source as the scoring reference. For content you know is
                             RENDERED (signage, slides, motion graphics) — the gate's denoised
                             reference softens text edges. --content-class graphic implies it.
@@ -399,10 +402,26 @@ struct ForgeCLI {
         case "heic": return .heic
         case "jpeg", "jpg": return .jpeg
         case "png": return .png
+        case "webp": return .webp
         case "hevc": return .hevc
         default:
             FileHandle.standardError.write(Data(
-                "error: unknown --format '\(args[i + 1])' (auto | heic | jpeg | png | hevc)\n".utf8))
+                "error: unknown --format '\(args[i + 1])' (auto | heic | jpeg | png | webp | hevc)\n".utf8))
+            exit(2)
+        }
+    }
+
+    /// `--web-lossy` → `Options.webLossy`: the web race's lossy lane. Same rule as `--format` — a
+    /// typo exits 2 rather than silently meaning `.auto`.
+    static func webLossy(from args: [String]) -> WebLossyCodec {
+        guard let i = args.firstIndex(of: "--web-lossy"), i + 1 < args.count else { return .auto }
+        switch args[i + 1].lowercased() {
+        case "auto": return .auto
+        case "webp": return .webp
+        case "jpeg", "jpg": return .jpeg
+        default:
+            FileHandle.standardError.write(Data(
+                "error: unknown --web-lossy '\(args[i + 1])' (auto | webp | jpeg)\n".utf8))
             exit(2)
         }
     }

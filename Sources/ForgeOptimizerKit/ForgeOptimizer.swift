@@ -113,6 +113,10 @@ public struct ForgeOptimizer: Sendable {
                 case .png:
                     recipe.codec = "PNG"                        // lossless: no floor to carry
                     recipe.normalized = meta.format != .png
+                case .webp:
+                    recipe.codec = "WebP"
+                    recipe.qualityFloor = options.quality.floor
+                    recipe.normalized = meta.format != .webp
                 }
                 let estimate = SavingsEstimate(
                     estimatedFraction: nil,
@@ -496,7 +500,9 @@ public struct ForgeOptimizer: Sendable {
             throw ForgeError.invalidOptions("HEVC is the video codec — stills take .heic, .jpeg, or .png")
         case (.image, .heic) where profile == .web:
             throw ForgeError.invalidOptions(
-                "HEIC is not web-universal — webOptimize stills race PNG/JPEG (use optimize for HEIC)")
+                "HEIC is not web-universal — webOptimize stills race PNG against WebP or JPEG (use optimize for HEIC)")
+        case (.image, .webp) where !MediaBridge.canEncodeStill(.webp):
+            throw ForgeError.invalidOptions(Self.noWebPEncoder)
         case (.image, _):
             return
         case (.video, .hevc):
@@ -566,7 +572,7 @@ public struct ForgeOptimizer: Sendable {
         let pinnedExt: String? = {
             if case .fileURL(let u) = destination {
                 let e = u.pathExtension.lowercased()
-                if ["png", "jpg", "jpeg"].contains(e) { return e }
+                if ["png", "jpg", "jpeg", "webp"].contains(e) { return e }
             }
             return nil
         }()
@@ -575,6 +581,7 @@ public struct ForgeOptimizer: Sendable {
         if let requested, let pinnedExt {
             let matches = (requested == .png && pinnedExt == "png")
                 || (requested == .jpeg && (pinnedExt == "jpg" || pinnedExt == "jpeg"))
+                || (requested == .webp && pinnedExt == "webp")
             guard matches else {
                 throw ForgeError.invalidOptions(
                     "output format \(requested.rawValue) conflicts with the host-pinned '.\(pinnedExt)' destination")
@@ -583,7 +590,7 @@ public struct ForgeOptimizer: Sendable {
         // The host-pinned extension counts as a pin only where it is honoured — the web race. The
         // native deliverable is HEIC whatever the path says (see `Destination.fileURL`).
         let hostPin: StillFormat? = profile == .web
-            ? (pinnedExt == "png" ? .png : pinnedExt != nil ? .jpeg : nil)
+            ? (pinnedExt == "png" ? .png : pinnedExt == "webp" ? .webp : pinnedExt != nil ? .jpeg : nil)
             : nil
         let pin: StillFormat? = requested ?? hostPin
         // JPEG has no alpha. The race's transparency gate quietly routes implicit paths to PNG;
@@ -630,10 +637,20 @@ public struct ForgeOptimizer: Sendable {
                 recipe.codec = "PNG"
                 recipe.qualityFloor = nil                       // PNG has no floor: lossless
                 outExt = "png"; outType = .png
+            case .webp:
+                // An explicit pin under the native verb: conversion semantics, like `.jpeg`/`.png`.
+                // Validation already proved an encoder is registered.
+                let encoded = try await Self.encodeWebP(cg, floor: options.quality.floor,
+                                                        scalars: scalars)
+                data = encoded.data; score = encoded.score
+                recipe.codec = "WebP"
+                recipe.qualityFloor = options.quality.floor
+                outExt = "webp"; outType = .webP
             }
         case .web:
-            // The web still is a RACE, not a classification: the lossless PNG always runs; a JPEG
-            // floor search runs alongside unless the image carries alpha (JPEG has none). Ship the
+            // The web still is a RACE, not a classification: the lossless PNG always runs; a lossy
+            // floor search runs alongside — WebP when an encoder is registered (it carries alpha, so
+            // it competes on transparent stills too), JPEG otherwise and only on opaque pixels. Ship the
             // smaller deliverable that keeps its guarantee — photos land 5–10× under PNG via JPEG,
             // flat graphics ring + inflate under JPEG and PNG wins on size, transparency is PNG by
             // construction. No content classifier to mis-tune; the outcome decides.
@@ -645,16 +662,23 @@ public struct ForgeOptimizer: Sendable {
             // the mere existence of an alpha channel as transparency silently benched the JPEG
             // race on exactly the photos it exists for (a real 6 MP frame shipped 2.3 MB PNG
             // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
-            var jpeg: ImageQualityTarget.Result?
-            if pin != .png, !Self.hasRealTransparency(cg) {
-                jpeg = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
-                                                               channelScalars: scalars)
+            let lane = try Self.webLossyLane(pin: pin, preference: options.webLossy)
+            var lossy: ImageQualityTarget.Result?
+            switch lane {
+            case .webp:
+                lossy = try await Self.encodeWebP(cg, floor: options.quality.floor, scalars: scalars)
+            case .jpeg where !Self.hasRealTransparency(cg):
+                lossy = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
+                                                                channelScalars: scalars)
+            default:
+                break                       // benched to PNG: a .png pin, or JPEG facing transparency
             }
-            if let jpeg, pin == .jpeg || (jpeg.metTarget && jpeg.data.count < png.data.count) {
-                data = jpeg.data; score = jpeg.score
-                recipe.codec = "JPEG"
+            if let lossy, let lane, pin == lane || (lossy.metTarget && lossy.data.count < png.data.count) {
+                data = lossy.data; score = lossy.score
+                recipe.codec = lane == .webp ? "WebP" : "JPEG"
                 recipe.qualityFloor = options.quality.floor
-                outExt = "jpg"; outType = .jpeg
+                outExt = lane == .webp ? "webp" : "jpg"
+                outType = lane == .webp ? .webP : .jpeg
             } else {
                 data = png.data; score = png.score
                 recipe.codec = "PNG"
@@ -668,13 +692,22 @@ public struct ForgeOptimizer: Sendable {
         // metadata into the deliverable losslessly (the compressed payload is untouched).
         // Orientation is excluded either way: it was baked into pixels at decode, and a carried
         // tag would rotate the output a second time.
+        var metadataDropped = false
         if !options.stripMetadata, let metadata = still.metadata {
-            data = Self.injectingMetadata(metadata, into: data, type: outType) ?? data
+            if outType == .webP {
+                // WebP metadata (EXIF/XMP/ICC chunks) needs libwebp's mux, not ImageIO's rewrap —
+                // `CGImageDestination` cannot open a WebP. The lane ships clean bytes and the
+                // receipt says so, rather than claiming a carry that never happened. Orientation
+                // was baked upright at decode either way.
+                metadataDropped = true
+            } else {
+                data = Self.injectingMetadata(metadata, into: data, type: outType) ?? data
+            }
         }
 
         // Honest skip applies to the non-enhanced path only — enhance is an explicit opt-in transform.
         // Native: skip whenever the re-encode isn't smaller. Web: skip only when the input is
-        // already web-native (PNG or JPEG) — the original itself is a valid web deliverable and a
+        // already web-native (PNG, JPEG or WebP) — the original itself is a valid web deliverable and a
         // bigger re-encode would be a strict loss — EXCEPT when a host-pinned URL or an explicit
         // `Options.output` requests a DIFFERENT format than the source's: that is a format
         // conversion, and a conversion delivers even when larger (the same semantics the video
@@ -683,11 +716,13 @@ public struct ForgeOptimizer: Sendable {
         // metadata is exactly what the caller asked to shed.
         let sourceFormat = probedStillFormat(url)
         let webNativeFormat: String? = profile == .web
-            ? (sourceFormat == .png || sourceFormat == .jpeg ? sourceFormat?.rawValue : nil)
+            ? (sourceFormat == .png || sourceFormat == .jpeg || sourceFormat == .webp
+               ? sourceFormat?.rawValue : nil)
             : nil
         let pinnedMatchesSource = pinnedExt == nil
             || (pinnedExt == "png" && webNativeFormat == "PNG")
             || ((pinnedExt == "jpg" || pinnedExt == "jpeg") && webNativeFormat == "JPEG")
+            || (pinnedExt == "webp" && webNativeFormat == "WebP")
         let optionsConversion = requested != nil && requested != sourceFormat
         let stripDelivers = options.stripMetadata && still.metadata != nil
         let sizeGated = !optionsConversion && !stripDelivers
@@ -708,7 +743,7 @@ public struct ForgeOptimizer: Sendable {
         // claiming a strip that shipped nothing would be the receipt lying. (A skip under
         // `stripMetadata` can only happen on a metadata-free source; `stripDelivers` forces
         // delivery otherwise.)
-        recipe.strippedMetadata = options.stripMetadata
+        recipe.strippedMetadata = options.stripMetadata || metadataDropped
         let output = try MediaMetrics.time("kit.write", lane: "io") {
             try write(data, for: url, ext: outExt, to: destination)
         }
@@ -841,7 +876,46 @@ public struct ForgeOptimizer: Sendable {
     }
 
     /// The still-format routing vocabulary an `Options.output` pin (or a probed source) resolves to.
-    enum StillFormat: String { case heic = "HEIC", jpeg = "JPEG", png = "PNG" }
+    enum StillFormat: String { case heic = "HEIC", jpeg = "JPEG", png = "PNG", webp = "WebP" }
+
+    static let noWebPEncoder =
+        "no WebP encoder is registered — link webp-swift and call WebPStillEncoder.register() at startup"
+
+    /// Which lossy lane the web race runs, or nil when it is benched to PNG. A pin outranks the
+    /// preference (`Options.webLossy`); `.auto` is WebP when an encoder is registered and JPEG
+    /// otherwise; `.webp` — pinned or preferred — with nothing registered throws rather than shipping
+    /// JPEG under a different name.
+    static func webLossyLane(pin: StillFormat?, preference: WebLossyCodec) throws -> StillFormat? {
+        switch pin {
+        case .png?, .heic?: return nil                  // .heic is unreachable under web (validation)
+        case .jpeg?: return .jpeg
+        case .webp?:
+            guard MediaBridge.canEncodeStill(.webp) else { throw ForgeError.invalidOptions(noWebPEncoder) }
+            return .webp
+        case nil: break
+        }
+        switch preference {
+        case .jpeg: return .jpeg
+        case .webp:
+            guard MediaBridge.canEncodeStill(.webp) else { throw ForgeError.invalidOptions(noWebPEncoder) }
+            return .webp
+        case .auto: return MediaBridge.canEncodeStill(.webp) ? .webp : .jpeg
+        }
+    }
+
+    /// The WebP lane: the registered `ExternalStillEncoder` driven through media-bridge's generic
+    /// floor search — the same law and the same decode-and-score-the-bytes rule as JPEG and HEIC.
+    /// The encoder maps the [0, 1] knob onto libwebp's scale and keeps it lossy end to end.
+    static func encodeWebP(_ image: CGImage, floor: Double,
+                           scalars: SSIMULACRA2.ChannelScalars?) async throws -> ImageQualityTarget.Result {
+        guard let encoder = MediaBridge.externalStillEncoder(for: .webp) else {
+            throw ForgeError.invalidOptions(noWebPEncoder)
+        }
+        return try await ImageQualityTarget.encode(image, targetScore: floor, codec: "webp",
+                                                   channelScalars: scalars) { cg, knob in
+            try encoder.encode(cg, quality: knob)
+        }
+    }
 
     /// The still format an explicit `Options.output` names — nil for `.auto` (and `.hevc`, which
     /// validation keeps off the image path).
@@ -851,17 +925,19 @@ public struct ForgeOptimizer: Sendable {
         case .heic: return .heic
         case .jpeg: return .jpeg
         case .png: return .png
+        case .webp: return .webp
         }
     }
 
     /// The source's ACTUAL still format (probed, not extension-guessed) — nil when it isn't one of
-    /// the three routing formats or can't be probed. Feeds the conversion-vs-optimization decision
+    /// the four routing formats or can't be probed. Feeds the conversion-vs-optimization decision
     /// and the web honest-skip gate.
     private func probedStillFormat(_ url: URL) -> StillFormat? {
         switch (try? ImageBridgeFactory.makeProbe().probe(url: url))?.format {
         case .png: return .png
         case .jpeg: return .jpeg
         case .heic: return .heic
+        case .webp: return .webp
         default: return nil
         }
     }

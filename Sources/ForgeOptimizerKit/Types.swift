@@ -102,15 +102,31 @@ public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors o
 public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
 
 /// The deliverable format. `.auto` = the verb's opinionated default (optimize: HEIC stills /
-/// HEVC video; webOptimize: PNG↔JPEG race / H.264 video). An explicit still format
-/// (`.heic`/`.jpeg`/`.png`) pins the stills encode with **conversion semantics**: it delivers even
-/// when larger than the source, because the caller asked for the format, not for a size win
-/// (pinning the format the source already has keeps the honest-skip size gate). `.hevc` names the
-/// native video default and is video-only. Invalid pairings — a still format on video, `.hevc` on
-/// a still, `.heic` under `webOptimize`, a pin that contradicts a host-pinned `.fileURL`
-/// extension, `.jpeg` on an image with real transparency, any still pin on an animated GIF headed
-/// to web video — fail the item honestly rather than silently reinterpreting the request.
-public enum OutputFormat: Sendable { case auto, heic, jpeg, png, hevc }
+/// HEVC video; webOptimize: a PNG↔lossy race — WebP when an encoder is registered, JPEG
+/// otherwise, see `WebLossyCodec` — / H.264 video). An explicit still format
+/// (`.heic`/`.jpeg`/`.png`/`.webp`) pins the stills encode with **conversion semantics**: it
+/// delivers even when larger than the source, because the caller asked for the format, not for a
+/// size win (pinning the format the source already has keeps the honest-skip size gate). `.hevc`
+/// names the native video default and is video-only. Invalid pairings — a still format on video,
+/// `.hevc` on a still, `.heic` under `webOptimize`, `.webp` with no WebP encoder registered, a pin
+/// that contradicts a host-pinned `.fileURL` extension, `.jpeg` on an image with real transparency,
+/// any still pin on an animated GIF headed to web video — fail the item honestly rather than
+/// silently reinterpreting the request.
+public enum OutputFormat: Sendable { case auto, heic, jpeg, png, webp, hevc }
+
+/// Which lossy codec the web still race runs beside lossless PNG.
+///
+/// `.auto` (the default) is **WebP when a WebP encoder is registered** with media-bridge
+/// (`MediaBridge.register(externalStillEncoder:)` — `webp-swift` ships the one-liner) and JPEG
+/// otherwise, so a host that registers nothing gets exactly the race it always had. WebP carries
+/// alpha, so under it a transparent still competes with PNG where JPEG never could; measured on the
+/// signage corpus it lands ~30% under the JPEG deliverable at the same floor (WEBP-NATIVE.md).
+///
+/// `.jpeg` keeps the JPEG lane on purpose — for deliverables headed somewhere WebP does not play
+/// (email clients, Office) — and `.webp` insists on WebP, failing the item honestly when no encoder
+/// is registered rather than shipping JPEG under a different name. A pin (`Options.output`, or a
+/// host-pinned extension) outranks this: a pin names a format; this only names a lane.
+public enum WebLossyCodec: Sendable { case auto, webp, jpeg }
 
 /// How hard `analyze` verifies file integrity. `.structural` (the default) runs millisecond byte
 /// walks — box chains, PNG CRCs, JPEG EOI, EBML sizes — safe on every ingest; `.deep` adds a full
@@ -198,16 +214,22 @@ public struct Options: Sendable {
     /// derived from the primary's.
     public var secondary: SecondaryRendition?
 
+    /// The web race's lossy lane (see `WebLossyCodec`). `.auto` by default; no effect under
+    /// `optimize`, whose native deliverable is HEIC, or on video.
+    public var webLossy: WebLossyCodec
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
                 integrity: IntegrityLevel = .structural,
                 contentClass: ContentClassifier.ContentClass? = nil,
                 cameraGate: CameraGate = .auto,
-                secondary: SecondaryRendition? = nil) {
+                secondary: SecondaryRendition? = nil,
+                webLossy: WebLossyCodec = .auto) {
         self.contentClass = contentClass
         self.cameraGate = cameraGate
         self.secondary = secondary
+        self.webLossy = webLossy
         self.quality = quality
         self.resolution = resolution
         self.enhance = enhance
