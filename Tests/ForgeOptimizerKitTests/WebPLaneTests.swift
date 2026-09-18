@@ -188,6 +188,37 @@ final class WebPLaneTests: XCTestCase {
         }
     }
 
+    /// Claims WebP but caps its quality — a stand-in for WebP lossy's 4:2:0 ceiling at a high floor.
+    private struct WeakWebP: ExternalStillEncoder {
+        var format: ExternalStillFormat { .webp }
+        var supportsAlpha: Bool { true }
+        var supportsLossless: Bool { true }
+        func encode(_ image: CGImage, quality: Double) throws -> Data {
+            try FakeWebP.imageIO(image, type: .jpeg, quality: min(quality, 0.05))
+        }
+        func encodeLossless(_ image: CGImage) throws -> Data { try FakeWebP.imageIO(image, type: .png, quality: 1) }
+    }
+
+    /// The max-preset finding: when the WebP lane cannot clear the floor, the race tries JPEG before
+    /// it settles for PNG — under `.webp` as well as `.auto`, because both only name a preference.
+    func testWebPThatMissesTheFloorFallsBackToJPEG() async throws {
+        MediaBridge.register(externalStillEncoder: WeakWebP())
+        for lane in [WebLossyCodec.auto, .webp] {
+            let r = try await run(try photoSource("photo-\(lane).png"), Options(webLossy: lane))
+            guard case .optimized = r.status else { return XCTFail("got \(r.status)") }
+            XCTAssertEqual(r.outputType, .jpeg, "under \(lane), a WebP lane that misses the floor hands over to JPEG")
+            XCTAssertEqual(r.recipe.codec, "JPEG")
+            XCTAssertEqual(r.recipe.qualityFloor, Options().quality.floor)
+        }
+    }
+
+    /// A `.webp` PIN is a format demand, not a preference: it ships WebP best-effort, never JPEG.
+    func testAWebPPinNeverFallsBackToJPEG() async throws {
+        MediaBridge.register(externalStillEncoder: WeakWebP())
+        let r = try await run(try photoSource(), Options(output: .webp))
+        XCTAssertEqual(r.outputType, .webP)
+    }
+
     func testAnalyzeRecommendsAnExplicitWebPPin() async throws {
         let forge = ForgeOptimizer()
         var analyses: [Analysis] = []

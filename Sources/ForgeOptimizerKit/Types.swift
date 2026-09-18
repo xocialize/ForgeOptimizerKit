@@ -126,6 +126,11 @@ public enum OutputFormat: Sendable { case auto, heic, jpeg, png, webp, hevc }
 /// (email clients, Office) — and `.webp` insists on WebP, failing the item honestly when no encoder
 /// is registered rather than shipping JPEG under a different name. A pin (`Options.output`, or a
 /// host-pinned extension) outranks this: a pin names a format; this only names a lane.
+///
+/// One rule both `.auto` and `.webp` share: WebP lossy is 4:2:0 only, so at a high floor (the max
+/// preset) it can miss on a photo where JPEG does not. An unpinned WebP lane that misses the floor
+/// tries JPEG before the race settles for lossless PNG — the promise is the smallest file that keeps
+/// the guarantee, and the receipt names whichever codec kept it. A `.webp` **pin** never does this.
 public enum WebLossyCodec: Sendable { case auto, webp, jpeg }
 
 /// How hard `analyze` verifies file integrity. `.structural` (the default) runs millisecond byte

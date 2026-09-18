@@ -663,22 +663,37 @@ public struct ForgeOptimizer: Sendable {
             // race on exactly the photos it exists for (a real 6 MP frame shipped 2.3 MB PNG
             // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
             let lane = try Self.webLossyLane(pin: pin, preference: options.webLossy)
+            let transparent = Self.hasRealTransparency(cg)
             var lossy: ImageQualityTarget.Result?
+            var lossyFormat: StillFormat?
             switch lane {
             case .webp:
                 lossy = try await Self.encodeWebP(cg, floor: options.quality.floor, scalars: scalars)
-            case .jpeg where !Self.hasRealTransparency(cg):
+                lossyFormat = .webp
+            case .jpeg where !transparent:
                 lossy = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
                                                                 channelScalars: scalars)
+                lossyFormat = .jpeg
             default:
                 break                       // benched to PNG: a .png pin, or JPEG facing transparency
             }
-            if let lossy, let lane, pin == lane || (lossy.metTarget && lossy.data.count < png.data.count) {
+            // WebP lossy is 4:2:0 only, and SSIMULACRA2 scores chroma: at a high floor (the max
+            // preset's 90) its search can miss on photos where JPEG — 4:4:4 at high quality — does
+            // not (measured 2026-09-18: 6/10 corpus photos at floor 90). The promise is the smallest
+            // file that keeps the guarantee, so an unpinned WebP lane that missed tries JPEG before
+            // the race settles for lossless PNG. Transparency stays on WebP/PNG: JPEG has no alpha.
+            if lossyFormat == .webp, let webp = lossy, !webp.metTarget, pin == nil, !transparent {
+                let jpeg = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
+                                                                   channelScalars: scalars)
+                if jpeg.metTarget { lossy = jpeg; lossyFormat = .jpeg }
+            }
+            if let lossy, let lossyFormat,
+               pin == lossyFormat || (lossy.metTarget && lossy.data.count < png.data.count) {
                 data = lossy.data; score = lossy.score
-                recipe.codec = lane == .webp ? "WebP" : "JPEG"
+                recipe.codec = lossyFormat == .webp ? "WebP" : "JPEG"
                 recipe.qualityFloor = options.quality.floor
-                outExt = lane == .webp ? "webp" : "jpg"
-                outType = lane == .webp ? .webP : .jpeg
+                outExt = lossyFormat == .webp ? "webp" : "jpg"
+                outType = lossyFormat == .webp ? .webP : .jpeg
             } else {
                 data = png.data; score = png.score
                 recipe.codec = "PNG"
