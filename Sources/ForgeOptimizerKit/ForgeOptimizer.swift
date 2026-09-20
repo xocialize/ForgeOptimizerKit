@@ -65,12 +65,14 @@ public struct ForgeOptimizer: Sendable {
     public func analyze(_ source: Source, _ options: Options = .init()) -> AsyncStream<Analysis> {
         let urls = source.urls
         return AsyncStream { continuation in
-            Task {
+            let producer = Task {
                 for url in urls {
+                    guard !Task.isCancelled else { break }
                     continuation.yield(await analyzeOne(url, options))
                 }
                 continuation.finish()
             }
+            continuation.onTermination = { @Sendable _ in producer.cancel() }
         }
     }
 
@@ -242,7 +244,7 @@ public struct ForgeOptimizer: Sendable {
         try prepareDestination(destination)
         let urls = source.urls
         return AsyncStream { continuation in
-            Task {
+            let producer = Task {
                 let itemCount = urls.count
                 // One body for both schedules: emits, span, and failure isolation are per-item
                 // and identical either way. (Vs the historical serial loop, the finalizing emit
@@ -277,7 +279,7 @@ public struct ForgeOptimizer: Sendable {
                 }
                 let width = effectiveBulkWidth
                 if width > 1 {
-                    await runBulk(urls, width: width,
+                    await runBulk(urls, width: width, control: nil,
                                   isStill: { mediaKind(of: $0) == .image },
                                   process: processItem,
                                   yield: { continuation.yield($0) })
@@ -288,6 +290,8 @@ public struct ForgeOptimizer: Sendable {
                 }
                 continuation.finish()
             }
+            // An abandoned or cancelled consumer cancels the producer (see `run`).
+            continuation.onTermination = { @Sendable _ in producer.cancel() }
         }
     }
 
@@ -296,26 +300,36 @@ public struct ForgeOptimizer: Sendable {
     /// plus coarse per-item stages today (see `OptimizeProgress` — per-pass fractions arrive with the
     /// media-bridge 0.28.0 adoption). Single-flight + busy-rejection live in `ForgeOptimizerService`,
     /// not here.
+    /// `control` is the "stop after the current items" lever (`BulkControl`); cancelling the
+    /// consuming task is "stop now". Either way nothing more is admitted; see `BulkControl`.
     public func optimize(_ requests: [OptimizeRequest],
-                         progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+                         progress: (@Sendable (OptimizeProgress) -> Void)? = nil,
+                         control: BulkControl? = nil)
         -> AsyncStream<OptimizeResult> {
-        run(requests, progress: progress, profile: .native)
+        run(requests, progress: progress, profile: .native, control: control)
     }
 
     /// Pipeline form of `webOptimize` — the host-dictated-URL seam, web-universal outputs. Name the
     /// output URLs `.png` / `.mp4`; `outputType` on the receipt stays the authoritative type either way.
     public func webOptimize(_ requests: [OptimizeRequest],
-                            progress: (@Sendable (OptimizeProgress) -> Void)? = nil)
+                            progress: (@Sendable (OptimizeProgress) -> Void)? = nil,
+                            control: BulkControl? = nil)
         -> AsyncStream<OptimizeResult> {
-        run(requests, progress: progress, profile: .web)
+        run(requests, progress: progress, profile: .web, control: control)
+    }
+
+    /// Whether the run may admit another item: not cancelled, not stopped.
+    private static func admits(_ control: BulkControl?) -> Bool {
+        !Task.isCancelled && !(control?.isStopped ?? false)
     }
 
     private func run(_ requests: [OptimizeRequest],
                      progress: (@Sendable (OptimizeProgress) -> Void)?,
-                     profile: OutputProfile)
+                     profile: OutputProfile,
+                     control: BulkControl? = nil)
         -> AsyncStream<OptimizeResult> {
         AsyncStream { continuation in
-            Task {
+            let producer = Task {
                 let itemCount = requests.count
                 @Sendable func processItem(_ i: Int, _ req: OptimizeRequest) async -> OptimizeResult {
                     let start = Date()
@@ -339,27 +353,34 @@ public struct ForgeOptimizer: Sendable {
                         return r.with(context: req.context)
                     } catch {
                         let bytes = fileSize(req.input)
+                        // A cancelled item is a stop the host asked for, not a defect: it reads
+                        // "cancelled" on the receipt, never a CancellationError description.
+                        let why = (error is CancellationError || Task.isCancelled) ? "cancelled" : "\(error)"
                         return OptimizeResult(
                             input: req.input, kind: mediaKind(of: req.input), output: .none,
                             recipe: AppliedRecipe(), before: MediaStats(bytes: bytes, width: 0, height: 0),
                             after: MediaStats(bytes: bytes, width: 0, height: 0),
-                            status: .failed("\(error)"), elapsed: Date().timeIntervalSince(start),
+                            status: .failed(why), elapsed: Date().timeIntervalSince(start),
                             context: req.context)
                     }
                 }
                 let width = effectiveBulkWidth
                 if width > 1 {
-                    await runBulk(requests, width: width,
+                    await runBulk(requests, width: width, control: control,
                                   isStill: { mediaKind(of: $0.input) == .image },
                                   process: processItem,
                                   yield: { continuation.yield($0) })
                 } else {
                     for (i, req) in requests.enumerated() {
+                        guard Self.admits(control) else { break }
                         continuation.yield(await processItem(i, req))
                     }
                 }
                 continuation.finish()
             }
+            // An abandoned or cancelled consumer cancels the producer: no work continues behind a
+            // stream nobody is reading. In-flight items abort at their next cancellation point.
+            continuation.onTermination = { @Sendable _ in producer.cancel() }
         }
     }
 
@@ -374,12 +395,12 @@ public struct ForgeOptimizer: Sendable {
     /// the buffer/next-yield state lives on the calling task only, so the drain is race-free by
     /// construction. Failure isolation is `process`'s own (identical to the serial loop's body).
     private func runBulk<Item: Sendable>(
-        _ items: [Item], width: Int,
+        _ items: [Item], width: Int, control: BulkControl?,
         isStill: (Item) -> Bool,
         process: @escaping @Sendable (Int, Item) async -> OptimizeResult,
         yield: (OptimizeResult) -> Void) async {
         var i = 0
-        while i < items.count {
+        while i < items.count, Self.admits(control) {
             guard isStill(items[i]) else {
                 yield(await process(i, items[i]))
                 i += 1
@@ -402,6 +423,9 @@ public struct ForgeOptimizer: Sendable {
                             nextYield += 1
                         }
                     }
+                    // Admission is checked per item, AFTER draining a slot: a stop lets the
+                    // items already in the group finish (drained below) and admits no more.
+                    guard Self.admits(control) else { break }
                     group.addTask { (index, await process(index, item)) }
                     submitted += 1
                 }

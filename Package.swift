@@ -33,7 +33,9 @@ let package = Package(
         //    `ImageQualityTarget.encode(_:targetScore:codec:encoder:)` and `StillFormat.webp`.
         //    The web race's WebP lane (`Options.webLossy`, `OutputFormat.webp`) is built on all four.
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.39.0"),
+        //  · 0.39.1: a cancellation point before every still-search pass — "stop now" on a
+        //    still costs one pass, not one item (the bulk stop levers, `BulkControl`).
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.39.1"),
     ],
     targets: [
         .target(

@@ -169,6 +169,13 @@ for await r in try forge.webOptimize(.url(phoneClip), to: .directory(outDir),
     }
 }
 
+// Two stop levers for a bulk run: `control.stop()` admits nothing more and lets the items in
+// flight finish and deliver ("stop after current"); cancelling the consuming task stops now —
+// in-flight items abort at their next cancellation point (a video at its next encode boundary,
+// a still at its next search pass) and read `.failed("cancelled")`. Abandoning the stream is a
+// cancel: nothing keeps running behind a stream nobody reads.
+let control = BulkControl()
+// … forge.webOptimize(requests, progress: narrate, control: control)
 // progress — a 4K floor search is minutes of real work; narrate it instead of spinning.
 // `detail` carries the human stage line (bookend events carry none); `itemIndex`/`itemCount`
 // locate the item in a batch. The handler fires on the optimizer's task — hop to your actor
