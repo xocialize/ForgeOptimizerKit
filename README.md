@@ -261,7 +261,7 @@ that clears N, and a neutral name invites it into a ledger as though it were.
 
 `--json` streams NDJSON receipts on stdout (one object per item + a summary; exit 1 on any
 per-item failure). Optimize verbs narrate their stages to **stderr** as they happen — the same
-`progress:` events as the library example above — so stdout stays machine-clean either way.
+`progress:` events as the library example above — so stdout stays machine-clean either way. The encoder is public library API — `ReceiptJSON.result(_:)` / `analysis(_:)` / `summary(_:)` / `line(_:)` (sorted keys, one object per line, `Decimal`-rounded numbers) — so a host writing its own manifest (the ML[X] Media Optimizer's batch receipt) emits exactly the CLI's shape.
 
 ## Build
 
