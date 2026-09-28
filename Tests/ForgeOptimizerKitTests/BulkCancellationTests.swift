@@ -19,29 +19,35 @@ final class BulkCancellationTests: XCTestCase {
 
     override func tearDown() { try? FileManager.default.removeItem(at: tmp) }
 
-    /// Photo-like 256² stills: a real web race per item (PNG + a JPEG floor search), ~0.2 s each,
-    /// so a cancel has passes to land between.
-    private func makeStills(_ n: Int) throws -> [OptimizeRequest] {
-        var bytes = [UInt8](repeating: 0, count: 256 * 256 * 4)
-        var seed: UInt32 = 0x9E3779B9
-        func grain() -> Double { seed = seed &* 1664525 &+ 1013904223; return Double(Int32(truncatingIfNeeded: seed >> 8) % 13) - 6 }
-        for y in 0..<256 { for x in 0..<256 {
-            let fx = Double(x) / 256, fy = Double(y) / 256
-            let l1 = 110 + 70 * sin(fx * 4.1 + 0.6) * cos(fy * 2.9 + 1.1), l2 = 40 * sin((fx + fy) * 6.3)
-            let i = (y * 256 + x) * 4
-            bytes[i] = UInt8(clamping: Int(l1 + l2 * 0.7 + grain())); bytes[i + 1] = UInt8(clamping: Int(l1 * 0.9 + l2 + grain()))
-            bytes[i + 2] = UInt8(clamping: Int(l1 * 1.1 + l2 * 0.4 + grain())); bytes[i + 3] = 255
-        } }
-        let ctx = CGContext(data: &bytes, width: 256, height: 256, bitsPerComponent: 8, bytesPerRow: 1024,
-                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-        let image = ctx.makeImage()!
+    /// Photo-like stills: a real web race per item (PNG + a JPEG floor search), ~0.2 s each at the
+    /// default 256², so a cancel has passes to land between. `firstSide` sizes item 0 alone.
+    private func makeStills(_ n: Int, side: Int = 256, firstSide: Int? = nil) throws -> [OptimizeRequest] {
+        let image = photoLikeStill(side)
+        let first = firstSide.map { photoLikeStill($0) } ?? image
         return try (0..<n).map { i in
             let src = tmp.appendingPathComponent("still-\(i).png")
             let dst = CGImageDestinationCreateWithURL(src as CFURL, UTType.png.identifier as CFString, 1, nil)!
-            CGImageDestinationAddImage(dst, image, nil); CGImageDestinationFinalize(dst)
+            CGImageDestinationAddImage(dst, i == 0 ? first : image, nil); CGImageDestinationFinalize(dst)
             return OptimizeRequest(input: src, output: tmp.appendingPathComponent("out/still-\(i)"),
                                    options: Options(), context: "\(i)")
         }
+    }
+
+    private func photoLikeStill(_ side: Int) -> CGImage {
+        // The context owns its pixels: the image may share them copy-on-write, so they must outlive this call.
+        let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        let bytes = ctx.data!.assumingMemoryBound(to: UInt8.self)
+        var seed: UInt32 = 0x9E3779B9
+        func grain() -> Double { seed = seed &* 1664525 &+ 1013904223; return Double(Int32(truncatingIfNeeded: seed >> 8) % 13) - 6 }
+        for y in 0..<side { for x in 0..<side {
+            let fx = Double(x) / Double(side), fy = Double(y) / Double(side)
+            let l1 = 110 + 70 * sin(fx * 4.1 + 0.6) * cos(fy * 2.9 + 1.1), l2 = 40 * sin((fx + fy) * 6.3)
+            let i = y * ctx.bytesPerRow + x * 4
+            bytes[i] = UInt8(clamping: Int(l1 + l2 * 0.7 + grain())); bytes[i + 1] = UInt8(clamping: Int(l1 * 0.9 + l2 + grain()))
+            bytes[i + 2] = UInt8(clamping: Int(l1 * 1.1 + l2 * 0.4 + grain())); bytes[i + 3] = 255
+        } }
+        return ctx.makeImage()!
     }
 
     private func outputs() throws -> Int {
@@ -51,8 +57,14 @@ final class BulkCancellationTests: XCTestCase {
     /// stop() after the first receipt: the items in the group finish and deliver, nothing more is
     /// admitted. Bound: the first, up to `width` in flight, plus one the producer may have admitted
     /// before the stop landed (yields never wait for the consumer).
+    ///
+    /// Item 0 is small and the rest are large, so the next slot frees ~0.75 s after the first
+    /// receipt rather than milliseconds after it: the bound measures the stop, not how promptly the
+    /// consumer is scheduled. With twelve identical items, items 1 and 2 finished alongside item 0,
+    /// and a consumer late by two completions let two extra admissions in — 6 receipts, on CI and
+    /// under local CPU contention alike (2026-09-28).
     func testStopAfterCurrentAdmitsNothingMore() async throws {
-        let requests = try makeStills(12)
+        let requests = try makeStills(12, side: 512, firstSide: 128)
         let forge = ForgeOptimizer(bulkConcurrency: width)
         let control = BulkControl()
         var received: [OptimizeResult] = []
