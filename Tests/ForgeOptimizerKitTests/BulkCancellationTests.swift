@@ -2,6 +2,7 @@ import XCTest
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import os
 @testable import ForgeOptimizerKit
 
 /// The two stop levers of a bulk run, and the promise behind each: `BulkControl.stop()` admits
@@ -19,15 +20,14 @@ final class BulkCancellationTests: XCTestCase {
 
     override func tearDown() { try? FileManager.default.removeItem(at: tmp) }
 
-    /// Photo-like stills: a real web race per item (PNG + a JPEG floor search), ~0.2 s each at the
-    /// default 256², so a cancel has passes to land between. `firstSide` sizes item 0 alone.
-    private func makeStills(_ n: Int, side: Int = 256, firstSide: Int? = nil) throws -> [OptimizeRequest] {
-        let image = photoLikeStill(side)
-        let first = firstSide.map { photoLikeStill($0) } ?? image
+    /// Photo-like 256² stills: a real web race per item (PNG + a JPEG floor search), ~0.2 s each,
+    /// so a cancel has passes to land between.
+    private func makeStills(_ n: Int) throws -> [OptimizeRequest] {
+        let image = photoLikeStill(256)
         return try (0..<n).map { i in
             let src = tmp.appendingPathComponent("still-\(i).png")
             let dst = CGImageDestinationCreateWithURL(src as CFURL, UTType.png.identifier as CFString, 1, nil)!
-            CGImageDestinationAddImage(dst, i == 0 ? first : image, nil); CGImageDestinationFinalize(dst)
+            CGImageDestinationAddImage(dst, image, nil); CGImageDestinationFinalize(dst)
             return OptimizeRequest(input: src, output: tmp.appendingPathComponent("out/still-\(i)"),
                                    options: Options(), context: "\(i)")
         }
@@ -54,17 +54,24 @@ final class BulkCancellationTests: XCTestCase {
         try FileManager.default.contentsOfDirectory(atPath: tmp.appendingPathComponent("out").path).count
     }
 
-    /// stop() after the first receipt: the items in the group finish and deliver, nothing more is
-    /// admitted. Bound: the first, up to `width` in flight, plus one the producer may have admitted
-    /// before the stop landed (yields never wait for the consumer).
-    ///
-    /// Item 0 is small and the rest are large, so the next slot frees ~0.75 s after the first
-    /// receipt rather than milliseconds after it: the bound measures the stop, not how promptly the
-    /// consumer is scheduled. With twelve identical items, items 1 and 2 finished alongside item 0,
-    /// and a consumer late by two completions let two extra admissions in — 6 receipts, on CI and
-    /// under local CPU contention alike (2026-09-28).
+    /// stop() after the first receipt: the items already admitted finish and deliver, and nothing
+    /// more is admitted. How many get in before the stop lands is the consumer's scheduling, not
+    /// the promise — yields never wait for the consumer, so a late one lets the producer keep
+    /// filling slots — and a bound on it turned CI red (run 36455208268: 6 receipts against 5).
+    /// So the control reports what the stop landed on, and the run must deliver exactly that.
+    /// Twelve identical items finish in clusters, so the stop tends to land while the producer is
+    /// still admitting: the interleaving the gate has to get right.
     func testStopAfterCurrentAdmitsNothingMore() async throws {
-        let requests = try makeStills(12, side: 512, firstSide: 128)
+        try await assertStopDeliversExactlyWhatItAdmitted(width: width)
+    }
+
+    /// The serial path (width 1 — what an injected enhancer forces) runs the same gate.
+    func testStopAfterCurrentAdmitsNothingMoreOnTheSerialPath() async throws {
+        try await assertStopDeliversExactlyWhatItAdmitted(width: 1)
+    }
+
+    private func assertStopDeliversExactlyWhatItAdmitted(width: Int) async throws {
+        let requests = try makeStills(12)
         let forge = ForgeOptimizer(bulkConcurrency: width)
         let control = BulkControl()
         var received: [OptimizeResult] = []
@@ -73,11 +80,31 @@ final class BulkCancellationTests: XCTestCase {
             if received.count == 1 { control.stop() }
         }
         XCTAssertGreaterThanOrEqual(received.count, 1)
-        XCTAssertLessThanOrEqual(received.count, 1 + width + 1, "stop admits nothing more: \(received.count) receipts")
+        let admitted = try XCTUnwrap(control.admittedAtStop, "stop() records the admissions it landed on")
+        XCTAssertEqual(received.count, admitted,
+                       "stop admits nothing more: \(received.count) receipts, \(admitted) admitted when the stop landed")
         XCTAssertTrue(received.allSatisfy { if case .optimized = $0.status { return true }; return false },
                       "the items that ran, ran to completion — a stop cancels nothing")
         XCTAssertEqual(received.map(\.context), (0..<received.count).map { "\($0)" }, "still in submission order")
         XCTAssertEqual(try outputs(), received.count, "every receipt has its file and nothing else was written")
+    }
+
+    /// The gate both runners call once per item: an admission either precedes `stop()` and is in
+    /// `admittedAtStop`, or is refused — also when admissions race the stop from many threads,
+    /// which is what makes that count exact. A second stop() moves nothing.
+    func testTheGateCountsExactlyTheAdmissionsBeforeTheStop() {
+        XCTAssertNil(BulkControl().admittedAtStop, "no stop, nothing to report")
+        let control = BulkControl()
+        let admitted = OSAllocatedUnfairLock(initialState: 0)
+        DispatchQueue.concurrentPerform(iterations: 20_000) { i in
+            if i == 10_000 { control.stop() }
+            if control.admit() { admitted.withLock { $0 += 1 } }
+        }
+        let got = admitted.withLock { $0 }
+        XCTAssertEqual(control.admittedAtStop, got)
+        XCTAssertFalse(control.admit(), "a stopped control admits nothing")
+        control.stop()
+        XCTAssertEqual(control.admittedAtStop, got, "stop() is idempotent: the first stop's count stands")
     }
 
     /// Cancelling the consumer after the first receipt ends the stream at once and cancels the

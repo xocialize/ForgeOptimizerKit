@@ -318,9 +318,10 @@ public struct ForgeOptimizer: Sendable {
         run(requests, progress: progress, profile: .web, control: control)
     }
 
-    /// Whether the run may admit another item: not cancelled, not stopped.
-    private static func admits(_ control: BulkControl?) -> Bool {
-        !Task.isCancelled && !(control?.isStopped ?? false)
+    /// Admits one more item, or refuses once the run is cancelled or stopped. Called exactly once
+    /// per item, just before it starts, so the control's count is the items that actually started.
+    private static func admit(_ control: BulkControl?) -> Bool {
+        !Task.isCancelled && (control?.admit() ?? true)
     }
 
     private func run(_ requests: [OptimizeRequest],
@@ -372,7 +373,7 @@ public struct ForgeOptimizer: Sendable {
                                   yield: { continuation.yield($0) })
                 } else {
                     for (i, req) in requests.enumerated() {
-                        guard Self.admits(control) else { break }
+                        guard Self.admit(control) else { break }
                         continuation.yield(await processItem(i, req))
                     }
                 }
@@ -394,14 +395,17 @@ public struct ForgeOptimizer: Sendable {
     /// Results yield strictly in **submission order** — completions buffer until their turn — and
     /// the buffer/next-yield state lives on the calling task only, so the drain is race-free by
     /// construction. Failure isolation is `process`'s own (identical to the serial loop's body).
+    /// Every item, still or not, passes `admit` exactly once, just before it starts; a refusal
+    /// ends the run once the items already started have delivered.
     private func runBulk<Item: Sendable>(
         _ items: [Item], width: Int, control: BulkControl?,
         isStill: (Item) -> Bool,
         process: @escaping @Sendable (Int, Item) async -> OptimizeResult,
         yield: (OptimizeResult) -> Void) async {
         var i = 0
-        while i < items.count, Self.admits(control) {
+        while i < items.count {
             guard isStill(items[i]) else {
+                guard Self.admit(control) else { return }
                 yield(await process(i, items[i]))
                 i += 1
                 continue
@@ -413,6 +417,7 @@ public struct ForgeOptimizer: Sendable {
             }
             var buffer: [Int: OptimizeResult] = [:]
             var nextYield = run[0].index
+            var refused = false
             await withTaskGroup(of: (Int, OptimizeResult).self) { group in
                 var submitted = 0
                 for (index, item) in run {
@@ -425,7 +430,7 @@ public struct ForgeOptimizer: Sendable {
                     }
                     // Admission is checked per item, AFTER draining a slot: a stop lets the
                     // items already in the group finish (drained below) and admits no more.
-                    guard Self.admits(control) else { break }
+                    guard Self.admit(control) else { refused = true; break }
                     group.addTask { (index, await process(index, item)) }
                     submitted += 1
                 }
@@ -437,6 +442,7 @@ public struct ForgeOptimizer: Sendable {
                     }
                 }
             }
+            if refused { return }
         }
     }
 
