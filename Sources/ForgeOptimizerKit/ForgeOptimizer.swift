@@ -585,15 +585,19 @@ public struct ForgeOptimizer: Sendable {
         // Phase B: engine-backed restore/upscale before encode (opt-in + enhancer present).
         let enhanced = options.enhance != .off && enhancer != nil
         if enhanced, let enhancer {
+            try await Self.requireUpscaleTier(options, of: enhancer)
             let widthBefore = cg.width
-            cg = try await MediaMetrics.time("kit.enhance", lane: "gpu",
-                                             attrs: ["w": "\(cg.width)", "h": "\(cg.height)"]) {
-                try await enhancer.enhance(cg, options: options)
+            let outcome = try await MediaMetrics.time("kit.enhance", lane: "gpu",
+                                                      attrs: ["w": "\(cg.width)", "h": "\(cg.height)"]) {
+                try await enhancer.enhanceReporting(cg, options: options)
             }
+            cg = outcome.image
             recipe.restored = true
-            // Measured, not requested (BRIDGE-062). The enhance seam returns only a CGImage, so the
-            // artifact is the only thing that can be trusted about what happened to it.
+            // Measured, not requested (BRIDGE-062): the artifact is the only thing that can be trusted
+            // about the scale. The backer is what the enhancer reported running (AB-T-0187).
             recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
+            recipe.setUpscaleBacker(reportedTier: outcome.upscaleTier, reportedModel: outcome.upscaleModel,
+                                    options: options)
         }
 
         // A host-dictated URL that NAMES a still format pins it — the host baked the path
@@ -1571,6 +1575,16 @@ public struct ForgeOptimizer: Sendable {
         return info.audioStreams.allSatisfy { $0.codecID == "A_AAC" }
     }
 
+    /// Refuse an upscale tier the enhancer says it cannot run — before any work, and never by running
+    /// the other tier instead (`ForgeError.upscaleTierUnavailable`). No-op when no upscale is asked for.
+    static func requireUpscaleTier(_ options: Options, of enhancer: any ImageEnhancer) async throws {
+        guard options.upscale != .none else { return }
+        let verdict = await enhancer.availability(of: options.upscaleTier)
+        if let why = verdict.unavailableReason {
+            throw ForgeError.upscaleTierUnavailable(options.upscaleTier, why)
+        }
+    }
+
     /// V4b — temporally-consistent video upscale: per-frame engine SR (the `ImageEnhancer`, applying the
     /// requested upscale factor) + SEA-RAFT flow-guided stabilization, written as an opaque HEVC deliverable.
     /// Standalone (V1): the upscaled clip IS the output — composing with the SSIMULACRA2 quality-target encode
@@ -1581,6 +1595,7 @@ public struct ForgeOptimizer: Sendable {
     private func upscaleVideo(_ url: URL, to destination: Destination, _ options: Options,
                               enhancer: any ImageEnhancer, start: Date,
                               profile: OutputProfile) async throws -> OptimizeResult {
+        try await Self.requireUpscaleTier(options, of: enhancer)
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         // Measure the SOURCE before the pipeline runs. `outURL` can resolve to the input's own path, in
         // which case reading it afterwards reports the output's geometry as the input's — which is how
@@ -1593,9 +1608,14 @@ public struct ForgeOptimizer: Sendable {
                 .appendingPathComponent("forge-upweb-\(UUID().uuidString).mp4")
             : outURL
         defer { if profile == .web { try? FileManager.default.removeItem(at: sinkURL) } }
+        let backers = BackerTally()
         let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
             input: url, output: sinkURL,
-            enhance: { try await enhancer.enhance($0, options: options) },
+            enhance: {
+                let frame = try await enhancer.enhanceReporting($0, options: options)
+                backers.note(frame)
+                return frame.image
+            },
             flow: { a, b in
                 if let flowProv { return try await flowProv.flow(a, b) }
                 return DenseFlow(width: a.width, height: a.height,
@@ -1603,6 +1623,8 @@ public struct ForgeOptimizer: Sendable {
             })
 
         var recipe = AppliedRecipe()
+        let reported = backers.summary
+        recipe.setUpscaleBacker(reportedTier: reported.tier, reportedModel: reported.model, options: options)
         let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
         guard outcome.framesWritten > 0, fileSize(sinkURL) > 0 else {
             try? FileManager.default.removeItem(at: sinkURL)

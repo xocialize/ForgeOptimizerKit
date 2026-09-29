@@ -99,7 +99,20 @@ public enum QualityTarget: Sendable {
 public enum CameraGate: Sendable { case auto, off }
 
 public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors only `.off`
-public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine / Real-ESRGAN)
+public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine — see `UpscaleTier` for which model)
+
+/// Which upscale backer runs when `Options.upscale` asks for one — a **cost** choice, not a
+/// degradation route.
+///
+/// The Kit only names the choice; the enhancer maps it to a model. ForgeCore's engine enhancer runs
+/// NERVE for `.fast` and RealPLKSR for `.best`, measured at 0.75 s and 3.7 s for 1080p ×4 on an M5
+/// Max. RealPLKSR beat the previous fast tier at all 12 degradation rungs, clean included
+/// (AB-R-0285), so the honest axis is time: no classifier decides this, the user does.
+///
+/// A tier the enhancer cannot run fails the item. It is never swapped for the other tier (see
+/// `ImageEnhancer.availability(of:)`), and the receipt records the tier and model the enhancer
+/// reports having run (`AppliedRecipe.upscaleTier` / `upscaleModel`) — never this request.
+public enum UpscaleTier: String, Sendable, CaseIterable { case fast, best }
 
 /// The deliverable format. `.auto` = the verb's opinionated default (optimize: HEIC stills /
 /// HEVC video; webOptimize: a PNG↔lossy race — WebP when an encoder is registered, JPEG
@@ -156,6 +169,9 @@ public struct Options: Sendable {
     public var resolution: ResolutionTarget
     public var enhance: EnhancePolicy
     public var upscale: UpscaleFactor
+    /// Which backer runs the upscale (see `UpscaleTier`). `.fast` by default; ignored when
+    /// `upscale == .none`.
+    public var upscaleTier: UpscaleTier
     public var output: OutputFormat
     /// Shed carried metadata (EXIF/GPS/IPTC/XMP…) from the deliverable. `false` (default)
     /// preserves: a still carries the source's metadata over losslessly; the video remux
@@ -225,6 +241,7 @@ public struct Options: Sendable {
 
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
+                upscaleTier: UpscaleTier = .fast,
                 output: OutputFormat = .auto, stripMetadata: Bool = false,
                 integrity: IntegrityLevel = .structural,
                 contentClass: ContentClassifier.ContentClass? = nil,
@@ -239,6 +256,7 @@ public struct Options: Sendable {
         self.resolution = resolution
         self.enhance = enhance
         self.upscale = upscale
+        self.upscaleTier = upscaleTier
         self.output = output
         self.stripMetadata = stripMetadata
         self.integrity = integrity
@@ -436,10 +454,21 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// fixed in the model, but a receipt that reports the *request* is only ever accurate by luck — the
     /// next model that cannot honour a scale reopens it. Measuring the artifact cannot be lied to by any
     /// enhancer, present or future, and needs no cooperation from the enhance seam.
-    public var upscaled: Int? = nil       // factor, Phase B (Real-ESRGAN / SeedVR2)
+    public var upscaled: Int? = nil       // factor, Phase B (NERVE / RealPLKSR, per `upscaleModel`)
     /// What the caller asked for, when it differs from `upscaled`. Non-nil means the model did not
     /// honour the request — surfaced rather than silently normalised away.
     public var upscaleRequested: Int? = nil
+    /// The upscale tier the enhancer **reports** having run (`EnhanceOutcome.upscaleTier`) — nil when
+    /// no upscale ran or the enhancer does not report one. Never copied from `Options.upscaleTier`:
+    /// the same rule as `upscaled` (AB-T-0013), because a tag that echoes the request is accurate
+    /// only while every enhancer does exactly as asked.
+    public var upscaleTier: UpscaleTier? = nil
+    /// The model the enhancer reports having run the upscale ("NERVE", "RealPLKSR"), or nil likewise.
+    public var upscaleModel: String? = nil
+    /// The tier the caller asked for, set only when the enhancer reported running a *different* one.
+    /// The Kit refuses a tier the enhancer says it cannot run before asking for it, so a non-nil value
+    /// here means an enhancer substituted anyway — surfaced, like `upscaleRequested`, not hidden.
+    public var upscaleTierRequested: UpscaleTier? = nil
     public var codec: String? = nil       // output format, e.g. "HEIC" / "HEVC"
     /// The `Options.stripMetadata` guarantee held for this deliverable: it carries no source
     /// metadata. On the receipt because a stripped file is indistinguishable from a clean-source
@@ -526,17 +555,38 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         upscaleRequested = (asked != nil && asked != actual) ? asked : nil
     }
 
+    /// Record the tier and model the enhancer **reported** for the upscale, plus the asked-for tier
+    /// when the report names a different one.
+    ///
+    /// Nothing here fills a field from `options` on the report's behalf. An enhancer that reports
+    /// nothing leaves both nil and the receipt says nothing about the backer: unknown is honest, a
+    /// guess from the request is the AB-T-0013 defect again.
+    public mutating func setUpscaleBacker(reportedTier: UpscaleTier?, reportedModel: String?,
+                                          options: Options) {
+        upscaleTier = reportedTier
+        upscaleModel = reportedModel
+        let diverged = options.upscale != .none && reportedTier != nil && reportedTier != options.upscaleTier
+        upscaleTierRequested = diverged ? options.upscaleTier : nil
+    }
+
+    /// `best · RealPLKSR`, `fast · NERVE — asked best`, or just the half that was reported.
+    private var upscaleBackerNote: String? {
+        let named = [upscaleTier?.rawValue, upscaleModel].compactMap { $0 }
+        guard !named.isEmpty else { return nil }
+        let note = named.joined(separator: " · ")
+        return upscaleTierRequested.map { "\(note) — asked \($0.rawValue)" } ?? note
+    }
+
     public var description: String {
         var parts: [String] = []
         if remuxed { parts.append("remux (lossless)") }
         if normalized { parts.append("normalize") }
         if restored { parts.append("restore") }
         if let f = upscaled {
-            if let asked = upscaleRequested, asked != f {
-                parts.append("upscale×\(f) (asked ×\(asked))")
-            } else {
-                parts.append("upscale×\(f)")
-            }
+            var upscale = "upscale×\(f)"
+            if let asked = upscaleRequested, asked != f { upscale += " (asked ×\(asked))" }
+            if let backer = upscaleBackerNote { upscale += " [\(backer)]" }
+            parts.append(upscale)
         }
         if let c = codec { parts.append("→\(c)") }
         if strippedMetadata { parts.append("strip-metadata") }
@@ -768,9 +818,14 @@ public enum ForgeError: Error, CustomStringConvertible {
     /// original) would lose it silently. Derived destinations disambiguate instead; only an *explicit*
     /// `.fileURL` reaches here, because silently renaming an explicit instruction is its own dishonesty.
     case outputWouldOverwriteInput(URL)
+    /// The enhancer said it cannot run the upscale tier asked for (`ImageEnhancer.availability(of:)`),
+    /// with its reason. Refused before any work, never swapped for the other tier: a "Best" that
+    /// quietly ran "Fast" would put the wrong model's pixels under the right name.
+    case upscaleTierUnavailable(UpscaleTier, String)
 
     public var description: String {
         switch self {
+        case .upscaleTierUnavailable(let tier, let why): return "upscale tier '\(tier.rawValue)' unavailable: \(why)"
         case .unsupportedMedia(let u): return "unsupported media: \(u.lastPathComponent)"
         case .decodeFailed(let u): return "decode failed: \(u.lastPathComponent)"
         case .outputWouldOverwriteInput(let u):

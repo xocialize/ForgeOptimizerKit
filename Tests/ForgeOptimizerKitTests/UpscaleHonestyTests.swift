@@ -159,6 +159,221 @@ final class UpscaleHonestyTests: XCTestCase {
         let after = try XCTUnwrap(parsed["after"] as? [String: Any])
         XCTAssertEqual(after["width"] as? Int, result.w)
         XCTAssertEqual(after["height"] as? Int, result.h)
+        // …and so do the structured keys, which a host should never have to parse out of the prose.
+        XCTAssertEqual(parsed["upscaled"] as? Int, 4)
+        XCTAssertEqual(parsed["upscale_requested"] as? Int, 2)
+        XCTAssertNil(parsed["upscale_tier"], "a non-reporting enhancer names no tier — unknown, not guessed")
+        XCTAssertNil(parsed["upscale_model"])
+    }
+
+    // MARK: - The tier and the model (AB-T-0187)
+
+    // `Options.upscaleTier` picks the backer; the receipt names the tier and model the enhancer REPORTS
+    // running. The same rule as the scale above, one field over: a tag copied from the request is right
+    // only while every enhancer does exactly as asked.
+
+    /// The helper, directly: the report wins, the request appears only when the report differs.
+    func testBackerFieldsFollowTheReport() {
+        var asked = Options(upscale: .x4, upscaleTier: .best)
+        var r = AppliedRecipe()
+        r.setUpscaleBacker(reportedTier: .best, reportedModel: "RealPLKSR", options: asked)
+        XCTAssertEqual(r.upscaleTier, .best)
+        XCTAssertEqual(r.upscaleModel, "RealPLKSR")
+        XCTAssertNil(r.upscaleTierRequested, "no divergence to report")
+
+        r.setUpscaleBacker(reportedTier: .fast, reportedModel: "NERVE", options: asked)
+        XCTAssertEqual(r.upscaleTier, .fast, "the tier that ran, not the tier asked for")
+        XCTAssertEqual(r.upscaleTierRequested, .best)
+
+        r.setUpscaleBacker(reportedTier: nil, reportedModel: nil, options: asked)
+        XCTAssertNil(r.upscaleTier, "nothing reported → nothing claimed, whatever was asked")
+        XCTAssertNil(r.upscaleModel)
+        XCTAssertNil(r.upscaleTierRequested, "an unreported tier is unknown, not a divergence")
+
+        asked.upscale = .none
+        r.setUpscaleBacker(reportedTier: .fast, reportedModel: "NERVE", options: asked)
+        XCTAssertNil(r.upscaleTierRequested, "no upscale asked → no tier asked")
+    }
+
+    func testTierDefaultsToFastAndThreadsThroughThePresetInit() {
+        XCTAssertEqual(Options().upscaleTier, .fast)
+        XCTAssertEqual(Options(preset: .balanced, upscale: .x4, upscaleTier: .best).upscaleTier, .best)
+    }
+
+    /// End to end on a still: ask Best, the enhancer runs its best backer, and the struct, the prose
+    /// and the NDJSON all name it.
+    func testStillReceiptNamesTheTierAndModelThatRan() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(64, 48), to: src)
+
+        let enhancer = TieredEnhancer()
+        let r = try await optimizeOne(src, into: dir.appendingPathComponent("out"), enhancer: enhancer,
+                                      Options(quality: .balanced, enhance: .on, upscale: .x2, upscaleTier: .best))
+        guard case .optimized = r.status else { return XCTFail("expected a delivered file, got \(r.status)") }
+        XCTAssertEqual(r.recipe.upscaled, 2)
+        XCTAssertEqual(r.recipe.upscaleTier, .best)
+        XCTAssertEqual(r.recipe.upscaleModel, "BestModel")
+        XCTAssertNil(r.recipe.upscaleTierRequested)
+        XCTAssertTrue(String(describing: r.recipe).contains("upscale×2 [best · BestModel]"), "\(r.recipe)")
+
+        let parsed = try parsedReceipt(r)
+        XCTAssertEqual(parsed["upscale_tier"] as? String, "best")
+        XCTAssertEqual(parsed["upscale_model"] as? String, "BestModel")
+        XCTAssertEqual(parsed["upscaled"] as? Int, 2)
+        XCTAssertNil(parsed["upscale_tier_requested"])
+    }
+
+    /// An enhancer that claims Best, then runs Fast anyway. The receipt must say Fast ran and that
+    /// Best was asked for — the receipt describes the file, not the promise.
+    func testSubstitutedTierIsReportedAsWhatRanWithTheRequestVisible() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(64, 48), to: src)
+
+        let r = try await optimizeOne(src, into: dir.appendingPathComponent("out"),
+                                      enhancer: TieredEnhancer(substitute: .fast),
+                                      Options(quality: .balanced, enhance: .on, upscale: .x2, upscaleTier: .best))
+        XCTAssertEqual(r.recipe.upscaleTier, .fast)
+        XCTAssertEqual(r.recipe.upscaleModel, "FastModel")
+        XCTAssertEqual(r.recipe.upscaleTierRequested, .best)
+        XCTAssertTrue(String(describing: r.recipe).contains("[fast · FastModel — asked best]"), "\(r.recipe)")
+        XCTAssertEqual(try parsedReceipt(r)["upscale_tier_requested"] as? String, "best")
+    }
+
+    /// The no-silent-fallback rule: a tier the enhancer says it cannot run fails the item with the
+    /// enhancer's own reason, before any model work — and nothing is written.
+    func testUnavailableTierFailsTheItemWithItsReasonAndRunsNothing() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(64, 48), to: src)
+        let out = dir.appendingPathComponent("out")
+
+        let enhancer = TieredEnhancer(unavailable: [.best: "BestModel needs 12.6 GB; the budget is 11.8 GB"])
+        let r = try await optimizeOne(src, into: out, enhancer: enhancer,
+                                      Options(quality: .balanced, enhance: .on, upscale: .x4, upscaleTier: .best))
+        guard case .failed(let why) = r.status else { return XCTFail("expected a failed item, got \(r.status)") }
+        XCTAssertEqual(why, "upscale tier 'best' unavailable: BestModel needs 12.6 GB; the budget is 11.8 GB")
+        XCTAssertEqual(enhancer.calls.count, 0, "refused before the enhancer ran — Fast never stood in")
+        guard case .none = r.output else { return XCTFail("a refused item delivers nothing") }
+        let written = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+        XCTAssertTrue(written.isEmpty, "no file left behind: \(written)")
+
+        // The other tier is untouched by the refusal.
+        let fast = try await optimizeOne(src, into: out, enhancer: enhancer,
+                                         Options(quality: .balanced, enhance: .on, upscale: .x4, upscaleTier: .fast))
+        XCTAssertEqual(fast.recipe.upscaleModel, "FastModel")
+    }
+
+    /// An enhancer that predates tiers offers exactly one: Fast runs (and names no model, since none was
+    /// reported); Best is refused rather than silently served by the only backer it has.
+    func testEnhancerWithoutTiersOffersFastOnly() async throws {
+        let legacy = FixedScaleEnhancer(factor: 2)
+        let fastVerdict = await legacy.availability(of: .fast)
+        let bestVerdict = await legacy.availability(of: .best)
+        XCTAssertTrue(fastVerdict.isAvailable)
+        XCTAssertFalse(bestVerdict.isAvailable)
+
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(64, 48), to: src)
+        let best = try await optimizeOne(src, into: dir.appendingPathComponent("best"), enhancer: legacy,
+                                         Options(quality: .balanced, enhance: .on, upscale: .x2, upscaleTier: .best))
+        guard case .failed = best.status else { return XCTFail("Best on a one-tier enhancer must fail, got \(best.status)") }
+
+        let fast = try await optimizeOne(src, into: dir.appendingPathComponent("fast"), enhancer: legacy,
+                                         Options(quality: .balanced, enhance: .on, upscale: .x2))
+        XCTAssertEqual(fast.recipe.upscaled, 2)
+        XCTAssertNil(fast.recipe.upscaleTier, "unreported → unknown, never filled from the request")
+        XCTAssertNil(fast.recipe.upscaleModel)
+    }
+
+    /// Enhance without an upscale asks no tier question: an unavailable Best must not block a restore-only run.
+    func testRestoreOnlyRunIgnoresTheTier() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(makeGradientImage(64, 48), to: src)
+        let enhancer = TieredEnhancer(unavailable: [.best: "not here"])
+        let r = try await optimizeOne(src, into: dir.appendingPathComponent("out"), enhancer: enhancer,
+                                      Options(quality: .balanced, enhance: .on, upscale: .none, upscaleTier: .best))
+        if case .failed(let why) = r.status { XCTFail("restore-only must not consult the tier: \(why)") }
+        XCTAssertEqual(enhancer.calls.count, 1)
+        XCTAssertNil(r.recipe.upscaleTier)
+        XCTAssertNil(r.recipe.upscaleModel)
+    }
+
+    /// Both video call sites carry the backer, gathered from every frame's report.
+    func testVideoReceiptNamesTheBackerOnBothProfiles() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("clip.mp4")
+        try writeGradientClip(to: src, w: 64, h: 48, frames: 4)
+        let forge = ForgeOptimizer(enhancer: TieredEnhancer(), flowProvider: ZeroFlowProvider())
+        let ask = Options(quality: .aggressive, upscale: .x2, upscaleTier: .best)
+
+        for profile in ["native", "web"] {
+            let out = dir.appendingPathComponent(profile)
+            let stream = profile == "web"
+                ? try forge.webOptimize(.url(src), to: .directory(out), ask)
+                : try forge.optimize(.url(src), to: .directory(out), ask)
+            var result: OptimizeResult?
+            for await r in stream { result = r }
+            let r = try XCTUnwrap(result, profile)
+            XCTAssertEqual(r.recipe.upscaled, 2, profile)
+            XCTAssertEqual(r.recipe.upscaleTier, .best, profile)
+            XCTAssertEqual(r.recipe.upscaleModel, "BestModel", profile)
+        }
+    }
+
+    /// Frames that disagree on the backer: the clip keeps no single-model claim.
+    func testVideoWhoseFramesRanDifferentModelsClaimsNoSingleBacker() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("clip.mp4")
+        try writeGradientClip(to: src, w: 64, h: 48, frames: 4)
+        let forge = ForgeOptimizer(enhancer: AlternatingModelEnhancer(), flowProvider: ZeroFlowProvider())
+        var result: OptimizeResult?
+        for await r in try forge.optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
+                                          Options(quality: .aggressive, upscale: .x2)) { result = r }
+        let r = try XCTUnwrap(result)
+        XCTAssertEqual(r.recipe.upscaleTier, .fast, "every frame reported fast")
+        XCTAssertEqual(r.recipe.upscaleModel, "ModelA+ModelB", "two backers ran, so the receipt names both")
+    }
+
+    /// A video refused on its tier fails before the SR pipeline starts.
+    func testVideoUnavailableTierFailsBeforeAnyFrame() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("clip.mp4")
+        try writeGradientClip(to: src, w: 64, h: 48, frames: 4)
+        let enhancer = TieredEnhancer(unavailable: [.best: "not registered"])
+        let forge = ForgeOptimizer(enhancer: enhancer, flowProvider: ZeroFlowProvider())
+        var result: OptimizeResult?
+        for await r in try forge.optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
+                                          Options(quality: .aggressive, upscale: .x2, upscaleTier: .best)) { result = r }
+        let r = try XCTUnwrap(result)
+        guard case .failed(let why) = r.status else { return XCTFail("expected a failed item, got \(r.status)") }
+        XCTAssertEqual(why, "upscale tier 'best' unavailable: not registered")
+        XCTAssertEqual(enhancer.calls.count, 0)
+    }
+
+    private func optimizeOne(_ src: URL, into out: URL, enhancer: any ImageEnhancer,
+                             _ options: Options) async throws -> OptimizeResult {
+        var results: [OptimizeResult] = []
+        for await r in try ForgeOptimizer(enhancer: enhancer).optimize(.url(src), to: .directory(out), options) {
+            results.append(r)
+        }
+        return try XCTUnwrap(results.first)
+    }
+
+    private func parsedReceipt(_ r: OptimizeResult) throws -> [String: Any] {
+        let line = try XCTUnwrap(ReceiptJSON.line(ReceiptJSON.result(r)))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
     }
 
     // MARK: - Fixtures
@@ -254,4 +469,55 @@ struct FixedScaleEnhancer: ImageEnhancer {
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage() ?? image
     }
+}
+
+/// Two tiers, two named backers, each honouring the scale — and reporting what it ran. `unavailable`
+/// is what `availability(of:)` refuses, with its reason; `substitute` makes it run that tier whatever
+/// was asked, the misbehaviour a receipt has to expose rather than paper over.
+struct TieredEnhancer: ImageEnhancer {
+    var unavailable: [UpscaleTier: String] = [:]
+    var substitute: UpscaleTier? = nil
+    let calls = CallCounter()
+
+    static func model(for tier: UpscaleTier) -> String { tier == .fast ? "FastModel" : "BestModel" }
+
+    func enhance(_ image: CGImage, options: Options) async throws -> CGImage {
+        try await enhanceReporting(image, options: options).image
+    }
+
+    func enhanceReporting(_ image: CGImage, options: Options) async throws -> EnhanceOutcome {
+        calls.increment()
+        let factor: Int = switch options.upscale { case .none: 1; case .x2: 2; case .x4: 4 }
+        guard factor > 1 else { return EnhanceOutcome(image: image) }
+        let scaled = try await FixedScaleEnhancer(factor: factor).enhance(image, options: options)
+        let ran = substitute ?? options.upscaleTier
+        return EnhanceOutcome(image: scaled, upscaleTier: ran, upscaleModel: Self.model(for: ran))
+    }
+
+    func availability(of tier: UpscaleTier) async -> UpscaleTierAvailability {
+        if let why = unavailable[tier] { return .unavailable(tier, model: Self.model(for: tier), reason: why) }
+        return .available(tier, model: Self.model(for: tier))
+    }
+}
+
+/// Reports the fast tier on every frame but alternates the model behind it — a clip that had two backers.
+struct AlternatingModelEnhancer: ImageEnhancer {
+    let calls = CallCounter()
+
+    func enhance(_ image: CGImage, options: Options) async throws -> CGImage {
+        try await enhanceReporting(image, options: options).image
+    }
+
+    func enhanceReporting(_ image: CGImage, options: Options) async throws -> EnhanceOutcome {
+        let n = calls.increment()
+        let scaled = try await FixedScaleEnhancer(factor: 2).enhance(image, options: options)
+        return EnhanceOutcome(image: scaled, upscaleTier: .fast, upscaleModel: n % 2 == 1 ? "ModelA" : "ModelB")
+    }
+}
+
+final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return n }
+    @discardableResult func increment() -> Int { lock.lock(); defer { lock.unlock() }; n += 1; return n }
 }

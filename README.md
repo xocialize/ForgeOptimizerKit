@@ -228,6 +228,14 @@ exists for.) The receipt carries what the gate did (`recipe.cameraGate`: `off` /
 `clean` / `fired` / `unavailable`; `camera_gate` in NDJSON), so a host can verify its policy was
 honoured and calibration rows can separate "probed clean" from "never probed".
 
+`Options.upscaleTier` (`.fast` / `.best`) picks which backer runs an `Options.upscale` — a **cost** choice
+the enhancer maps to a model (ForgeCore: NERVE for Fast, RealPLKSR for Best). The Kit asks the enhancer
+first (`ImageEnhancer.availability(of:)`) and **fails the item** on a tier it cannot run, with the
+enhancer's reason; it never runs the other tier instead. The receipt names the tier and model the
+enhancer **reported** running (`recipe.upscaleTier` / `upscaleModel`; `upscale_tier` / `upscale_model`
+in NDJSON, beside the measured `upscaled` factor) — never the request, and nothing at all when the
+enhancer does not report. An enhancer that predates tiers offers `.fast` only.
+
 The extension on a `.fileURL` destination is **advisory** — Forge writes its opinionated container
 (HEIC stills, HEVC-in-mp4 video) to the path as given and the host reads the real container back
 from `OptimizeResult.outputType`. ⚠️ **The one exception is `webOptimize` stills: a `.png`/`.jpg`

@@ -72,6 +72,13 @@ public enum ReceiptJSON {
         // "probed clean" from "never probed" (--no-camera-gate / --content-class graphic).
         if let gate = r.recipe.cameraGate { o["camera_gate"] = gate }
         if r.recipe.flattenedAlpha { o["flattened_alpha"] = true }
+        // The upscale, structured: the factor measured from the pixels, and the tier + model the
+        // enhancer REPORTED running — each key present only when there is something to say.
+        if let f = r.recipe.upscaled { o["upscaled"] = f }
+        if let asked = r.recipe.upscaleRequested { o["upscale_requested"] = asked }
+        if let tier = r.recipe.upscaleTier { o["upscale_tier"] = tier.rawValue }
+        if let model = r.recipe.upscaleModel { o["upscale_model"] = model }
+        if let askedTier = r.recipe.upscaleTierRequested { o["upscale_tier_requested"] = askedTier.rawValue }
         if let hintClass = r.recipe.contentHintClass {
             o["hint_class"] = hintClass
             if let c = r.recipe.contentHintConfidence { o["hint_confidence"] = round2(c) }
