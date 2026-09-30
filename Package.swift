@@ -35,7 +35,10 @@ let package = Package(
         // (0.34.0 brought MediaMetrics + `encode(onProgress:)` + `denoiseStrength`/`noiseProbe`.)
         //  · 0.39.1: a cancellation point before every still-search pass — "stop now" on a
         //    still costs one pass, not one item (the bulk stop levers, `BulkControl`).
-        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.39.1"),
+        //  · 0.40.0: `SSIMULACRA2Metal.idleWorkingSetBytes` / `trimIdle(toBytes:)` — the Kit releases the
+        //    scorer's over-budget working sets after every item (an 8K output's ≈ 3.85 GB set outlived its item
+        //    and the next item's upscale stacked on it: 11.68 GB, AB-T-0193).
+        .package(url: "https://github.com/xocialize/media-bridge.git", from: "0.40.0"),
     ],
     targets: [
         .target(

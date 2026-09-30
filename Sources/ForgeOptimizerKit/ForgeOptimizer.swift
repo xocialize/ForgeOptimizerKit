@@ -485,6 +485,12 @@ public struct ForgeOptimizer: Sendable {
     private func optimizeOne(_ url: URL, to destination: Destination, _ options: Options,
                              start: Date, profile: OutputProfile = .native,
                              emit: ProgressEmit? = nil) async throws -> OptimizeResult {
+        // The scorer keeps a working set per image size so the next score at that size can reuse it — right within a
+        // search and across a batch of same-size items, wrong for one large item: a 4320×7680 still left ≈ 3.85 GB idle
+        // until a score at OTHER dimensions came along, by which time the next item's upscale had stacked on top of it
+        // (ForgeOptimizer, Best ×4 then ×2: 11.68 GB process peak, AB-T-0193). Released after every item, however it
+        // ended; anything within the budget stays warm.
+        defer { SSIMULACRA2Metal.shared?.trimIdle(toBytes: Self.scorerIdleRetentionBytes) }
         let kind = mediaKind(of: url)
         try Self.validate(options.output, for: kind, profile: profile)
         let result: OptimizeResult
@@ -497,6 +503,11 @@ public struct ForgeOptimizer: Sendable {
         }
         return Self.notingUnansweredSecondary(result, options, kind: kind)
     }
+
+    /// Idle SSIMULACRA2 working-set bytes the scorer may keep from one item to the next. A set costs ~116 B per pixel,
+    /// so 1 GiB keeps a 4K still's set (≈ 0.96 GB) or two 1080p ones (≈ 0.24 GB each) warm for the next item of that
+    /// size, and releases anything larger — an 8K output's ≈ 3.85 GB — when its item ends.
+    static let scorerIdleRetentionBytes = 1 << 30
 
     /// A `Options.secondary` request that reached a route which does not implement it must still be
     /// ANSWERED. Stamped here, at the router, rather than in each route: this way a route that
