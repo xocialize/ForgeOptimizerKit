@@ -27,7 +27,8 @@ public protocol ImageEnhancer: Sendable {
     ///
     /// Default: a single tier — `.fast` available, `.best` not. An enhancer that predates tiers
     /// runs whatever it runs, and offering a choice it would ignore is exactly the silent fallback
-    /// this seam exists to prevent.
+    /// this seam exists to prevent. `.liveAction` is never an enhancer's: it is a whole-clip video
+    /// tier (`VideoUpscaler`), and the Kit refuses it on a still before asking.
     func availability(of tier: UpscaleTier) async -> UpscaleTierAvailability
 }
 
@@ -40,6 +41,7 @@ public extension ImageEnhancer {
         switch tier {
         case .fast: return .available(.fast)
         case .best: return .unavailable(.best, reason: "this enhancer offers a single upscale tier")
+        case .liveAction: return .unavailable(.liveAction, reason: UpscaleTier.liveActionStillReason)
         }
     }
 }

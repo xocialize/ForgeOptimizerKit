@@ -112,7 +112,20 @@ public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine 
 /// A tier the enhancer cannot run fails the item. It is never swapped for the other tier (see
 /// `ImageEnhancer.availability(of:)`), and the receipt records the tier and model the enhancer
 /// reports having run (`AppliedRecipe.upscaleTier` / `upscaleModel`) — never this request.
-public enum UpscaleTier: String, Sendable, CaseIterable { case fast, best }
+///
+/// `.liveAction` is the one tier that is a **content declaration** as well as a choice: a video-only,
+/// whole-clip tier served by the injected `VideoUpscaler` (ForgeCore runs FlashVSR), never by the
+/// per-frame `ImageEnhancer`. FlashVSR is generative — it invents photographic detail, which is the
+/// point on camera footage and wrong on anime, cartoons, graphics and text — and nothing in Forge can
+/// tell the two apart reliably, so the caller choosing this tier is the statement that the clip is live
+/// action. A still asked for it fails the item (`ForgeError.upscaleTierUnavailable`).
+public enum UpscaleTier: String, Sendable, CaseIterable {
+    case fast, best
+    case liveAction = "live-action"
+
+    /// Runs on a whole clip through `VideoUpscaler` rather than per frame through `ImageEnhancer`.
+    public var isVideoOnly: Bool { self == .liveAction }
+}
 
 /// The deliverable format. `.auto` = the verb's opinionated default (optimize: HEIC stills /
 /// HEVC video; webOptimize: a PNG↔lossy race — WebP when an encoder is registered, JPEG
@@ -170,7 +183,7 @@ public struct Options: Sendable {
     public var enhance: EnhancePolicy
     public var upscale: UpscaleFactor
     /// Which backer runs the upscale (see `UpscaleTier`). `.fast` by default; ignored when
-    /// `upscale == .none`.
+    /// `upscale == .none`. `.liveAction` is video-only and routes the clip to the `VideoUpscaler`.
     public var upscaleTier: UpscaleTier
     public var output: OutputFormat
     /// Shed carried metadata (EXIF/GPS/IPTC/XMP…) from the deliverable. `false` (default)
@@ -818,7 +831,8 @@ public enum ForgeError: Error, CustomStringConvertible {
     /// original) would lose it silently. Derived destinations disambiguate instead; only an *explicit*
     /// `.fileURL` reaches here, because silently renaming an explicit instruction is its own dishonesty.
     case outputWouldOverwriteInput(URL)
-    /// The enhancer said it cannot run the upscale tier asked for (`ImageEnhancer.availability(of:)`),
+    /// The enhancer (or, for `.liveAction`, the video upscaler) said it cannot run the upscale tier
+    /// asked for (`ImageEnhancer.availability(of:)`, `VideoUpscaler.availability(of:width:height:factor:)`),
     /// with its reason. Refused before any work, never swapped for the other tier: a "Best" that
     /// quietly ran "Fast" would put the wrong model's pixels under the right name.
     case upscaleTierUnavailable(UpscaleTier, String)

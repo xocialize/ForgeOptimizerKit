@@ -236,6 +236,18 @@ enhancer **reported** running (`recipe.upscaleTier` / `upscaleModel`; `upscale_t
 in NDJSON, beside the measured `upscaled` factor) — never the request, and nothing at all when the
 enhancer does not report. An enhancer that predates tiers offers `.fast` only.
 
+`.liveAction` is the third tier, and the odd one: **video only, whole clip, and a content declaration.** It routes the
+clip to an injected `VideoUpscaler` (`ForgeOptimizer(videoUpscaler:)`; ForgeCore's runs FlashVSR) instead of the
+per-frame enhancer + SEA-RAFT path. FlashVSR is generative — it invents photographic detail, which is the point on
+camera footage and wrong on anime, cartoons, graphics and on-screen text — and nothing in Forge tells those apart
+reliably, so choosing the tier is the caller saying the clip is live action. The Kit asks the upscaler first, **with
+the clip's size** (a streaming video model's memory follows the output frame, so one clip fits where a larger one
+does not), fails the item on a refusal with its reason, and never hands the clip to the per-frame tiers instead; no
+upscaler attached is a refusal too. The upscaler writes video only, so the Kit muxes the source's audio back in
+(passthrough; LPCM that an mp4 cannot carry becomes AAC). `optimize` delivers that clip; `webOptimize` runs the
+H.264 floor search over it. The receipt reads `upscale_tier: "live-action"` with the reported model, and the factor
+and codec measured from the delivered file. A still asked for `.liveAction` fails the item.
+
 The extension on a `.fileURL` destination is **advisory** — Forge writes its opinionated container
 (HEIC stills, HEVC-in-mp4 video) to the path as given and the host reads the real container back
 from `OptimizeResult.outputType`. ⚠️ **The one exception is `webOptimize` stills: a `.png`/`.jpg`

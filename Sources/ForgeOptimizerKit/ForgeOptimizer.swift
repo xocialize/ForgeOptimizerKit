@@ -26,12 +26,18 @@ public struct ForgeOptimizer: Sendable {
     /// the first search's own behavior (and pays a second search for it).
     private let hintProvider: (any ContentHintProvider)?
 
+    /// The clip-level video upscale seam (`UpscaleTier.liveAction` — ForgeCore runs FlashVSR). `nil` → a
+    /// `.liveAction` request fails the item with that reason; it is never handed to the per-frame path.
+    private let videoUpscaler: (any VideoUpscaler)?
+
     public init(enhancer: (any ImageEnhancer)? = nil, flowProvider: (any VideoFlowProvider)? = nil,
                 hintProvider: (any ContentHintProvider)? = nil,
+                videoUpscaler: (any VideoUpscaler)? = nil,
                 bulkConcurrency: Int? = nil) {
         self.enhancer = enhancer
         self.flowProvider = flowProvider
         self.hintProvider = hintProvider
+        self.videoUpscaler = videoUpscaler
         self.bulkConcurrency = bulkConcurrency
     }
 
@@ -1122,6 +1128,14 @@ public struct ForgeOptimizer: Sendable {
                 elapsed: Date().timeIntervalSince(start))
         }
 
+        // The live-action tier is a whole-clip model behind its own seam. Routed on the tier alone, BEFORE the
+        // per-frame branch, so a missing or refusing video upscaler fails the item rather than letting the
+        // enhancer's frames stand in for a model the caller did not choose.
+        if options.upscale != .none, options.upscaleTier.isVideoOnly {
+            return try await upscaleVideoClip(url, to: destination, options, start: start,
+                                              profile: profile, emit: emit)
+        }
+
         // Upscale is a *quality* op (HD→4K), the opposite of compression — when requested and an enhancer is
         // present, run the temporally-consistent per-frame SR pipeline (V1: standalone HEVC deliverable).
         if options.upscale != .none, let enhancer {
@@ -1590,6 +1604,10 @@ public struct ForgeOptimizer: Sendable {
     /// the other tier instead (`ForgeError.upscaleTierUnavailable`). No-op when no upscale is asked for.
     static func requireUpscaleTier(_ options: Options, of enhancer: any ImageEnhancer) async throws {
         guard options.upscale != .none else { return }
+        // A whole-clip tier never reaches a per-frame enhancer, whatever the enhancer would say.
+        if options.upscaleTier.isVideoOnly {
+            throw ForgeError.upscaleTierUnavailable(options.upscaleTier, UpscaleTier.liveActionStillReason)
+        }
         let verdict = await enhancer.availability(of: options.upscaleTier)
         if let why = verdict.unavailableReason {
             throw ForgeError.upscaleTierUnavailable(options.upscaleTier, why)
@@ -1688,6 +1706,113 @@ public struct ForgeOptimizer: Sendable {
         return OptimizeResult(
             input: url, kind: .video, output: .file(outURL),
             recipe: recipe, before: before, after: after,
+            status: .optimized,
+            elapsed: Date().timeIntervalSince(start),
+            outputType: .mpeg4Movie)
+    }
+
+    /// The live-action tier — a whole-clip upscale through the injected `VideoUpscaler` (ForgeCore: FlashVSR).
+    ///
+    /// Asks the upscaler first, with this clip's size (a streaming model's memory follows the output frame), and
+    /// fails the item on a refusal with its reason — no per-frame stand-in. The upscaler writes video only, so the
+    /// source's audio is muxed back by passthrough. `.native` delivers that file as it is (the upscale is the
+    /// deliverable, as in V4b); `.web` runs the target-quality H.264 search over it, the floor measured against the
+    /// upscaled clip. The receipt's tier and model are what the upscaler REPORTED; the factor and the codec are
+    /// measured from the delivered file.
+    private func upscaleVideoClip(_ url: URL, to destination: Destination, _ options: Options,
+                                  start: Date, profile: OutputProfile,
+                                  emit: ProgressEmit?) async throws -> OptimizeResult {
+        let tier = options.upscaleTier
+        guard let upscaler = videoUpscaler else {
+            throw ForgeError.upscaleTierUnavailable(tier, "no video upscaler is attached to this optimizer")
+        }
+        let outURL = try resolveVideoOutputURL(for: url, to: destination)
+        let src = await Self.videoDimensions(url)
+        let verdict = await upscaler.availability(of: tier, width: src.w, height: src.h, factor: options.upscale)
+        if let why = verdict.unavailableReason {
+            throw ForgeError.upscaleTierUnavailable(tier, why)
+        }
+        let inBytes = fileSize(url)
+        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
+        let tmp = FileManager.default.temporaryDirectory
+        let upscaled = tmp.appendingPathComponent("forge-clipup-\(UUID().uuidString).mp4")
+        let muxed = tmp.appendingPathComponent("forge-clipmux-\(UUID().uuidString).mp4")
+        defer {
+            try? FileManager.default.removeItem(at: upscaled)
+            try? FileManager.default.removeItem(at: muxed)
+        }
+
+        // The upscale dominates the item (FlashVSR: ~0.7 s per 1280×768 output frame on an M5 Max), so it gets most
+        // of the bar, and its detail line counts frames as the model emits them.
+        let factorLabel = options.upscale == .x2 ? "×2" : "×4"
+        let backer = verdict.model ?? "the \(tier.rawValue) tier"
+        let span = profile == .web ? 0.50 : 0.85
+        emit?(.encoding, 0.05, "Upscaling the whole clip \(factorLabel) with \(backer) — live action")
+        let report = try await upscaler.upscale(url, factor: options.upscale, tier: tier, output: upscaled) {
+            done, total in
+            guard total > 0 else { return }
+            emit?(.encoding, 0.05 + span * min(Double(done) / Double(total), 1),
+                  "Upscaling \(factorLabel) with \(backer) — frame \(done) of \(total)")
+        }
+
+        var recipe = AppliedRecipe()
+        recipe.setUpscaleBacker(reportedTier: report.tier, reportedModel: report.model, options: options)
+        guard fileSize(upscaled) > 0 else {
+            recipe.codec = profile == .web ? "H.264" : await Self.videoCodecLabel(upscaled)
+            recipe.setUpscale(measuredFrom: src.w, to: 0, requested: options.upscale)
+            return OptimizeResult(
+                input: url, kind: .video, output: .none, recipe: recipe, before: before,
+                after: before,   // nothing was produced — the kept original is the after-state
+                status: .skipped("upscale produced no output"),
+                elapsed: Date().timeIntervalSince(start))
+        }
+
+        emit?(.finalizing, 0.05 + span, "Muxing the source audio back in")
+        let withAudio = try await Self.muxingSourceAudio(video: upscaled, audioFrom: url, to: muxed)
+        let clip = withAudio ? muxed : upscaled
+
+        if profile == .web {
+            // Same composition as V4b's web branch: the floor gates the ENCODE, against the upscaled clip.
+            let r = try await VideoQualityTarget.encode(input: clip, output: outURL,
+                                                        targetScore: options.quality.floor,
+                                                        profile: .webH264,
+                                                        onProgress: Self.searchProgressAdapter(emit: emit,
+                                                                                               base: 0.58,
+                                                                                               span: 0.37))
+            let dst = r.delivered ? await Self.videoDimensions(outURL) : (w: 0, h: 0)
+            recipe.codec = "H.264"
+            recipe.qualityFloor = options.quality.floor
+            recipe.strippedMetadata = options.stripMetadata && r.delivered   // writer-clean
+            recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
+            let aggregation = MediaStats.QualityAggregation(percentile: r.aggregation.percentile,
+                                                            minimum: r.aggregation.minimum,
+                                                            mean: r.aggregation.mean,
+                                                            framesScored: r.aggregation.framesScored,
+                                                            frameCount: r.aggregation.frameCount)
+            let after = r.delivered
+                ? MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
+                             qualityScore: r.score, qualityAggregation: aggregation)
+                : MediaStats(bytes: before.bytes, width: src.w, height: src.h,
+                             qualityScore: r.score, qualityAggregation: aggregation)
+            return OptimizeResult(
+                input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
+                recipe: recipe, before: before, after: after,
+                status: r.delivered ? .optimized : .skipped(Self.floorMissReason(options.quality.floor)),
+                elapsed: Date().timeIntervalSince(start),
+                outputType: r.delivered ? .mpeg4Movie : nil)
+        }
+
+        try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: outURL)
+        try FileManager.default.moveItem(at: clip, to: outURL)
+        let dst = await Self.videoDimensions(outURL)
+        recipe.codec = await Self.videoCodecLabel(outURL)
+        recipe.strippedMetadata = options.stripMetadata   // writer-clean: neither the upscaler nor the mux copies metadata
+        recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
+        return OptimizeResult(
+            input: url, kind: .video, output: .file(outURL),
+            recipe: recipe, before: before, after: MediaStats(bytes: fileSize(outURL), width: dst.w, height: dst.h),
             status: .optimized,
             elapsed: Date().timeIntervalSince(start),
             outputType: .mpeg4Movie)
