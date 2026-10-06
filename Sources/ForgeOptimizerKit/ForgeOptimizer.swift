@@ -1140,7 +1140,7 @@ public struct ForgeOptimizer: Sendable {
         // present, run the temporally-consistent per-frame SR pipeline (V1: standalone HEVC deliverable).
         if options.upscale != .none, let enhancer {
             return try await upscaleVideo(url, to: destination, options, enhancer: enhancer,
-                                          start: start, profile: profile)
+                                          start: start, profile: profile, emit: emit)
         }
 
         let encodeProfile: VideoQualityTarget.EncodeProfile
@@ -1615,31 +1615,29 @@ public struct ForgeOptimizer: Sendable {
     }
 
     /// V4b — temporally-consistent video upscale: per-frame engine SR (the `ImageEnhancer`, applying the
-    /// requested upscale factor) + SEA-RAFT flow-guided stabilization, written as an opaque HEVC deliverable.
-    /// Standalone (V1): the upscaled clip IS the output — composing with the SSIMULACRA2 quality-target encode
-    /// is a later refinement. Net-clean: the SR + flow models are the injected seams.
-    /// `.web` composes exactly that refinement out of necessity: the SR pipeline writes HEVC, so the
-    /// upscale lands in a temp intermediate and the web target-quality encode (H.264 + AAC, floor
-    /// measured against the upscaled intermediate) produces the deliverable.
+    /// requested upscale factor) + SEA-RAFT flow-guided stabilization. Net-clean: the SR + flow models are the
+    /// injected seams. The pipeline writes video only, into a temp intermediate; `deliverUpscaledClip` puts the
+    /// source's audio back and delivers it — as it is under `.native` (the upscale IS the deliverable), through
+    /// the H.264 floor search under `.web`.
     private func upscaleVideo(_ url: URL, to destination: Destination, _ options: Options,
                               enhancer: any ImageEnhancer, start: Date,
-                              profile: OutputProfile) async throws -> OptimizeResult {
+                              profile: OutputProfile, emit: ProgressEmit?) async throws -> OptimizeResult {
         try await Self.requireUpscaleTier(options, of: enhancer)
         let outURL = try resolveVideoOutputURL(for: url, to: destination)
         // Measure the SOURCE before the pipeline runs. `outURL` can resolve to the input's own path, in
         // which case reading it afterwards reports the output's geometry as the input's — which is how
         // `before` came to describe the file that replaced it.
         let src = await Self.videoDimensions(url)
-        let inBytes = fileSize(url)
+        let before = MediaStats(bytes: fileSize(url), width: src.w, height: src.h)
         let flowProv = self.flowProvider
-        let sinkURL = profile == .web
-            ? FileManager.default.temporaryDirectory
-                .appendingPathComponent("forge-upweb-\(UUID().uuidString).mp4")
-            : outURL
-        defer { if profile == .web { try? FileManager.default.removeItem(at: sinkURL) } }
+        let frames = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-upframes-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: frames) }
         let backers = BackerTally()
+        emit?(.encoding, 0.05, "Upscaling frame by frame"
+              + (flowProv == nil ? "" : ", flow-stabilized") + " — \(options.upscaleTier.rawValue) tier")
         let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
-            input: url, output: sinkURL,
+            input: url, output: frames,
             enhance: {
                 let frame = try await enhancer.enhanceReporting($0, options: options)
                 backers.note(frame)
@@ -1654,71 +1652,17 @@ public struct ForgeOptimizer: Sendable {
         var recipe = AppliedRecipe()
         let reported = backers.summary
         recipe.setUpscaleBacker(reportedTier: reported.tier, reportedModel: reported.model, options: options)
-        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
-        guard outcome.framesWritten > 0, fileSize(sinkURL) > 0 else {
-            try? FileManager.default.removeItem(at: sinkURL)
-            recipe.codec = profile == .web ? "H.264" : "HEVC"
-            recipe.setUpscale(measuredFrom: src.w, to: 0, requested: options.upscale)
-            return OptimizeResult(
-                input: url, kind: .video, output: .none, recipe: recipe, before: before,
-                after: before,   // nothing was produced — the kept original is the after-state
-                status: .skipped("upscale produced no output"),
-                elapsed: Date().timeIntervalSince(start))
-        }
-
-        if profile == .web {
-            // Web deliverable from the upscaled intermediate; the floor gates the *encode* (reference
-            // = the upscaled clip — visually-the-same means "same as what the SR produced").
-            let r = try await VideoQualityTarget.encode(input: sinkURL, output: outURL,
-                                                        targetScore: options.quality.floor,
-                                                        profile: .webH264)
-            let dst = r.delivered ? await Self.videoDimensions(outURL) : (w: 0, h: 0)
-            recipe.codec = "H.264"
-            recipe.qualityFloor = options.quality.floor
-            recipe.strippedMetadata = options.stripMetadata && r.delivered   // writer-clean
-            recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
-            let aggregation = MediaStats.QualityAggregation(percentile: r.aggregation.percentile,
-                                                            minimum: r.aggregation.minimum,
-                                                            mean: r.aggregation.mean,
-                                                            framesScored: r.aggregation.framesScored,
-                                                            frameCount: r.aggregation.frameCount)
-            // Non-delivery keeps the original → `after` = source bytes/dims; the floor evidence
-            // (score/aggregation) still rides along.
-            let after = r.delivered
-                ? MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
-                             qualityScore: r.score, qualityAggregation: aggregation)
-                : MediaStats(bytes: before.bytes, width: src.w, height: src.h,
-                             qualityScore: r.score, qualityAggregation: aggregation)
-            return OptimizeResult(
-                input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
-                recipe: recipe, before: before, after: after,
-                status: r.delivered ? .optimized : .skipped(Self.floorMissReason(options.quality.floor)),
-                elapsed: Date().timeIntervalSince(start),
-                outputType: r.delivered ? .mpeg4Movie : nil)
-        }
-
-        let outBytes = fileSize(outURL)
-        let dst = await Self.videoDimensions(outURL)
-        recipe.codec = "HEVC"
-        recipe.strippedMetadata = options.stripMetadata   // writer-clean delivery
-        recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
-        let after = MediaStats(bytes: outBytes, width: dst.w, height: dst.h)
-        return OptimizeResult(
-            input: url, kind: .video, output: .file(outURL),
-            recipe: recipe, before: before, after: after,
-            status: .optimized,
-            elapsed: Date().timeIntervalSince(start),
-            outputType: .mpeg4Movie)
+        return try await deliverUpscaledClip(frames, produced: outcome.framesWritten > 0, source: url, to: outURL,
+                                             recipe: recipe, before: before, options, start: start,
+                                             profile: profile, emit: emit, after: profile == .web ? 0.55 : 0.85)
     }
 
     /// The live-action tier — a whole-clip upscale through the injected `VideoUpscaler` (ForgeCore: FlashVSR).
     ///
     /// Asks the upscaler first, with this clip's size (a streaming model's memory follows the output frame), and
-    /// fails the item on a refusal with its reason — no per-frame stand-in. The upscaler writes video only, so the
-    /// source's audio is muxed back by passthrough. `.native` delivers that file as it is (the upscale is the
-    /// deliverable, as in V4b); `.web` runs the target-quality H.264 search over it, the floor measured against the
-    /// upscaled clip. The receipt's tier and model are what the upscaler REPORTED; the factor and the codec are
-    /// measured from the delivered file.
+    /// fails the item on a refusal with its reason — no per-frame stand-in. The upscaler writes video only;
+    /// `deliverUpscaledClip` puts the source's audio back and delivers, exactly as for V4b. The receipt's tier
+    /// and model are what the upscaler REPORTED; the factor and the codec are measured from the delivered file.
     private func upscaleVideoClip(_ url: URL, to destination: Destination, _ options: Options,
                                   start: Date, profile: OutputProfile,
                                   emit: ProgressEmit?) async throws -> OptimizeResult {
@@ -1732,15 +1676,10 @@ public struct ForgeOptimizer: Sendable {
         if let why = verdict.unavailableReason {
             throw ForgeError.upscaleTierUnavailable(tier, why)
         }
-        let inBytes = fileSize(url)
-        let before = MediaStats(bytes: inBytes, width: src.w, height: src.h)
-        let tmp = FileManager.default.temporaryDirectory
-        let upscaled = tmp.appendingPathComponent("forge-clipup-\(UUID().uuidString).mp4")
-        let muxed = tmp.appendingPathComponent("forge-clipmux-\(UUID().uuidString).mp4")
-        defer {
-            try? FileManager.default.removeItem(at: upscaled)
-            try? FileManager.default.removeItem(at: muxed)
-        }
+        let before = MediaStats(bytes: fileSize(url), width: src.w, height: src.h)
+        let upscaled = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-clipup-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: upscaled) }
 
         // The upscale dominates the item (FlashVSR: ~0.7 s per 1280×768 output frame on an M5 Max), so it gets most
         // of the bar, and its detail line counts frames as the model emits them.
@@ -1757,9 +1696,25 @@ public struct ForgeOptimizer: Sendable {
 
         var recipe = AppliedRecipe()
         recipe.setUpscaleBacker(reportedTier: report.tier, reportedModel: report.model, options: options)
-        guard fileSize(upscaled) > 0 else {
+        return try await deliverUpscaledClip(upscaled, produced: true, source: url, to: outURL,
+                                             recipe: recipe, before: before, options, start: start,
+                                             profile: profile, emit: emit, after: 0.05 + span)
+    }
+
+    /// The tail both video upscale routes share, given the upscaled clip (video only, in a temp file the caller
+    /// owns). The source's audio is muxed back in by passthrough — before 2026-10-05 the V4b route shipped its
+    /// upscale silent. Then `.native` delivers the clip as it is, and `.web` runs the target-quality H.264 search
+    /// over it, the floor measured against the upscaled clip ("visually the same" means the same as what the SR
+    /// produced). The factor and codec on the receipt are measured from the delivered file. `after` is where the
+    /// upscale's share of the item's progress ended.
+    private func deliverUpscaledClip(_ upscaled: URL, produced: Bool, source url: URL, to outURL: URL,
+                                     recipe: AppliedRecipe, before: MediaStats, _ options: Options, start: Date,
+                                     profile: OutputProfile, emit: ProgressEmit?,
+                                     after: Double) async throws -> OptimizeResult {
+        var recipe = recipe
+        guard produced, fileSize(upscaled) > 0 else {
             recipe.codec = profile == .web ? "H.264" : await Self.videoCodecLabel(upscaled)
-            recipe.setUpscale(measuredFrom: src.w, to: 0, requested: options.upscale)
+            recipe.setUpscale(measuredFrom: before.width, to: 0, requested: options.upscale)
             return OptimizeResult(
                 input: url, kind: .video, output: .none, recipe: recipe, before: before,
                 after: before,   // nothing was produced — the kept original is the after-state
@@ -1767,36 +1722,40 @@ public struct ForgeOptimizer: Sendable {
                 elapsed: Date().timeIntervalSince(start))
         }
 
-        emit?(.finalizing, 0.05 + span, "Muxing the source audio back in")
+        let muxed = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-upmux-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: muxed) }
+        emit?(.finalizing, after, "Muxing the source audio back in")
         let withAudio = try await Self.muxingSourceAudio(video: upscaled, audioFrom: url, to: muxed)
         let clip = withAudio ? muxed : upscaled
 
         if profile == .web {
-            // Same composition as V4b's web branch: the floor gates the ENCODE, against the upscaled clip.
             let r = try await VideoQualityTarget.encode(input: clip, output: outURL,
                                                         targetScore: options.quality.floor,
                                                         profile: .webH264,
-                                                        onProgress: Self.searchProgressAdapter(emit: emit,
-                                                                                               base: 0.58,
-                                                                                               span: 0.37))
+                                                        onProgress: Self.searchProgressAdapter(
+                                                            emit: emit, base: max(after, 0.58),
+                                                            span: 0.95 - max(after, 0.58)))
             let dst = r.delivered ? await Self.videoDimensions(outURL) : (w: 0, h: 0)
             recipe.codec = "H.264"
             recipe.qualityFloor = options.quality.floor
             recipe.strippedMetadata = options.stripMetadata && r.delivered   // writer-clean
-            recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
+            recipe.setUpscale(measuredFrom: before.width, to: dst.w, requested: options.upscale)
             let aggregation = MediaStats.QualityAggregation(percentile: r.aggregation.percentile,
                                                             minimum: r.aggregation.minimum,
                                                             mean: r.aggregation.mean,
                                                             framesScored: r.aggregation.framesScored,
                                                             frameCount: r.aggregation.frameCount)
-            let after = r.delivered
+            // Non-delivery keeps the original → `after` = source bytes/dims; the floor evidence
+            // (score/aggregation) still rides along.
+            let afterStats = r.delivered
                 ? MediaStats(bytes: r.outputBytes, width: dst.w, height: dst.h,
                              qualityScore: r.score, qualityAggregation: aggregation)
-                : MediaStats(bytes: before.bytes, width: src.w, height: src.h,
+                : MediaStats(bytes: before.bytes, width: before.width, height: before.height,
                              qualityScore: r.score, qualityAggregation: aggregation)
             return OptimizeResult(
                 input: url, kind: .video, output: r.delivered ? .file(outURL) : .none,
-                recipe: recipe, before: before, after: after,
+                recipe: recipe, before: before, after: afterStats,
                 status: r.delivered ? .optimized : .skipped(Self.floorMissReason(options.quality.floor)),
                 elapsed: Date().timeIntervalSince(start),
                 outputType: r.delivered ? .mpeg4Movie : nil)
@@ -1808,8 +1767,8 @@ public struct ForgeOptimizer: Sendable {
         try FileManager.default.moveItem(at: clip, to: outURL)
         let dst = await Self.videoDimensions(outURL)
         recipe.codec = await Self.videoCodecLabel(outURL)
-        recipe.strippedMetadata = options.stripMetadata   // writer-clean: neither the upscaler nor the mux copies metadata
-        recipe.setUpscale(measuredFrom: src.w, to: dst.w, requested: options.upscale)
+        recipe.strippedMetadata = options.stripMetadata   // writer-clean: neither the upscalers nor the mux copy metadata
+        recipe.setUpscale(measuredFrom: before.width, to: dst.w, requested: options.upscale)
         return OptimizeResult(
             input: url, kind: .video, output: .file(outURL),
             recipe: recipe, before: before, after: MediaStats(bytes: fileSize(outURL), width: dst.w, height: dst.h),

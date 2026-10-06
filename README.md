@@ -234,7 +234,9 @@ first (`ImageEnhancer.availability(of:)`) and **fails the item** on a tier it ca
 enhancer's reason; it never runs the other tier instead. The receipt names the tier and model the
 enhancer **reported** running (`recipe.upscaleTier` / `upscaleModel`; `upscale_tier` / `upscale_model`
 in NDJSON, beside the measured `upscaled` factor) — never the request, and nothing at all when the
-enhancer does not report. An enhancer that predates tiers offers `.fast` only.
+enhancer does not report. An enhancer that predates tiers offers `.fast` only. On video, Fast and Best run per
+frame (SEA-RAFT-stabilized when a `VideoFlowProvider` is attached), and the source's audio is muxed back into the
+upscaled clip — the same step the Live action route below uses (before 0.20.1 this route shipped silent).
 
 `.liveAction` is the third tier, and the odd one: **video only, whole clip, and a content declaration.** It routes the
 clip to an injected `VideoUpscaler` (`ForgeOptimizer(videoUpscaler:)`; ForgeCore's runs FlashVSR) instead of the

@@ -124,6 +124,43 @@ final class UpscaleHonestyTests: XCTestCase {
         }
     }
 
+    /// V4b's pipeline writes video only. Until 2026-10-05 its deliverable shipped silent on both profiles; the
+    /// source's soundtrack must come back, as on the Live action route, and the receipt still describes the file.
+    func testPerFrameVideoUpscaleKeepsTheSourceAudioOnBothProfiles() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("clip.mp4")
+        try writeClip(to: src, w: 64, h: 48, frames: 15, audio: true)
+        let forge = ForgeOptimizer(enhancer: TieredEnhancer(), flowProvider: ZeroFlowProvider())
+        let ask = Options(quality: .aggressive, upscale: .x2)
+
+        for profile in ["native", "web"] {
+            let out = dir.appendingPathComponent(profile)
+            let stream = profile == "web"
+                ? try forge.webOptimize(.url(src), to: .directory(out), ask)
+                : try forge.optimize(.url(src), to: .directory(out), ask)
+            var result: OptimizeResult?
+            for await r in stream { result = r }
+            let r = try XCTUnwrap(result, profile)
+            guard case .file(let delivered) = r.output else {
+                XCTFail("\(profile): expected a delivered file, got \(r.status)"); continue
+            }
+            let asset = AVURLAsset(url: delivered)
+            let audio = try await asset.loadTracks(withMediaType: .audio)
+            XCTAssertEqual(audio.count, 1, "\(profile): the source's audio track came back")
+            if let track = audio.first {
+                let range = try await track.load(.timeRange)
+                XCTAssertGreaterThan(range.duration.seconds, 0.3, "\(profile): real audio, not an empty track")
+            }
+            let video = try await asset.loadTracks(withMediaType: .video)
+            let size = try await XCTUnwrap(video.first, profile).load(.naturalSize)
+            XCTAssertEqual(Int(size.width), 2 * 64, profile)
+            XCTAssertEqual(r.recipe.upscaled, 2, profile)
+            XCTAssertEqual(r.recipe.upscaleModel, "FastModel", profile)
+            XCTAssertEqual(r.recipe.codec, profile == "web" ? "H.264" : "HEVC", "\(profile): the codec in the file")
+        }
+    }
+
     /// `optimize` with the fixed-4× model asked for ×2, then the deliverable read back: the receipt —
     /// struct, prose and NDJSON — must describe what is in the file.
     private func assertStillAskedForTwoReceiptsFour(_ src: URL) async throws {
