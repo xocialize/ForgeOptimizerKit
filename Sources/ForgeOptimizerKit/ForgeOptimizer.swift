@@ -14,8 +14,9 @@ import MediaMetrics
 public struct ForgeOptimizer: Sendable {
 
     /// Phase-B engine-backed restore/upscale (supplied by the UI/app layer). `nil` = media-bridge-only;
-    /// the Kit stays engine-free. Applied before encode when `Options.enhance != .off`.
-    private let enhancer: (any ImageEnhancer)?
+    /// the Kit stays engine-free. Applied before encode when `Options.enhance != .off`, and serves a
+    /// `.quality` conform's upscale (upscale-only, `ImageEnhancer.upscaleReporting`).
+    let enhancer: (any ImageEnhancer)?
 
     /// Phase-B optical-flow seam (SEA-RAFT) for temporally-consistent *video* upscale. `nil` → the video
     /// upscale path runs per-frame SR without flicker stabilization (zero flow).
@@ -1604,13 +1605,18 @@ public struct ForgeOptimizer: Sendable {
     /// the other tier instead (`ForgeError.upscaleTierUnavailable`). No-op when no upscale is asked for.
     static func requireUpscaleTier(_ options: Options, of enhancer: any ImageEnhancer) async throws {
         guard options.upscale != .none else { return }
+        try await requireStillUpscaleTier(options.upscaleTier, of: enhancer)
+    }
+
+    /// The tier half of `requireUpscaleTier`, shared with a `.quality` conform's upscale.
+    static func requireStillUpscaleTier(_ tier: UpscaleTier, of enhancer: any ImageEnhancer) async throws {
         // A whole-clip tier never reaches a per-frame enhancer, whatever the enhancer would say.
-        if options.upscaleTier.isVideoOnly {
-            throw ForgeError.upscaleTierUnavailable(options.upscaleTier, UpscaleTier.liveActionStillReason)
+        if tier.isVideoOnly {
+            throw ForgeError.upscaleTierUnavailable(tier, UpscaleTier.liveActionStillReason)
         }
-        let verdict = await enhancer.availability(of: options.upscaleTier)
+        let verdict = await enhancer.availability(of: tier)
         if let why = verdict.unavailableReason {
-            throw ForgeError.upscaleTierUnavailable(options.upscaleTier, why)
+            throw ForgeError.upscaleTierUnavailable(tier, why)
         }
     }
 

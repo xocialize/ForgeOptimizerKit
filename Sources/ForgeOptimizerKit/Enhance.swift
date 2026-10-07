@@ -5,7 +5,8 @@ import Foundation
 /// engine-backed implementation — NAFNet restore → NERVE (`.fast`) or RealPLKSR (`.best`) upscale,
 /// driven through `MLXServeEngine` (`register → prepare → run`) — lives in ForgeCore, which links
 /// the engine. `optimize()` applies it to the decoded image *before* encode, but only when
-/// `Options.enhance != .off` **and** an enhancer is supplied. This keeps the Kit headless + net-clean
+/// `Options.enhance != .off` **and** an enhancer is supplied; a `.quality` conform calls the
+/// upscale-only `upscaleReporting` instead. This keeps the Kit headless + net-clean
 /// (no MLX/engine dependency) while letting the app inject real model inference.
 ///
 /// Async (the engine is async); `CGImage` is the Kit's still currency — the engine adapter converts
@@ -30,11 +31,26 @@ public protocol ImageEnhancer: Sendable {
     /// this seam exists to prevent. `.liveAction` is never an enhancer's: it is a whole-clip video
     /// tier (`VideoUpscaler`), and the Kit refuses it on a still before asking.
     func availability(of tier: UpscaleTier) async -> UpscaleTierAvailability
+
+    /// Upscale `image` by `factor` on `tier`'s backer and nothing else — no restore — reporting what
+    /// ran as `enhanceReporting` does. `conform(_:to:quality:)` calls this: a conform is resize glue
+    /// between pipeline stages, and a restore inside it would change the content the next stage gets.
+    /// The Kit asks `availability(of:)` first, and never passes `.none` or a video-only tier.
+    ///
+    /// Default: throws `ForgeError.upscaleTierUnavailable`. An enhancer that predates this method has
+    /// only `enhance`, which restores before it upscales, so serving a conform with it would add a
+    /// restore nobody asked for, and interpolating instead would be a silent `.fast`.
+    func upscaleReporting(_ image: CGImage, factor: UpscaleFactor, tier: UpscaleTier) async throws -> EnhanceOutcome
 }
 
 public extension ImageEnhancer {
     func enhanceReporting(_ image: CGImage, options: Options) async throws -> EnhanceOutcome {
         EnhanceOutcome(image: try await enhance(image, options: options))
+    }
+
+    func upscaleReporting(_ image: CGImage, factor: UpscaleFactor, tier: UpscaleTier) async throws -> EnhanceOutcome {
+        throw ForgeError.upscaleTierUnavailable(
+            tier, "this enhancer has no upscale-only path (it restores before it upscales), so it cannot serve a conform")
     }
 
     func availability(of tier: UpscaleTier) async -> UpscaleTierAvailability {

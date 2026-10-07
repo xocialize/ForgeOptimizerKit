@@ -8,7 +8,7 @@ stack. Three verbs over one media foundation:
 | **analyze** | probe + **verify integrity** + recommend, read-only → `Analysis` (corrupt files yield a diagnosis, never vanish) | probe + millisecond byte walks (box chains · PNG CRCs · JPEG EOI · EBML sizes); `Options(integrity: .deep)` adds decode-to-EOF |
 | **optimize** | smallest file that clears a perceptual floor → `OptimizeResult` receipt | target-quality HEIC (stills) · target-quality HEVC mp4 (video), SSIMULACRA2-guided |
 | **webOptimize** | same optimizer, web-universal outputs — stills race **WebP (or JPEG) vs PNG**, video → **H.264 + AAC mp4**, animated **GIF → mp4** | the full pipeline below |
-| **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage` | `.fast` CoreGraphics resample |
+| **conform** | resize/crop an image to a pipeline stage's input spec → `CGImage`, or a `ConformResult` naming the model that ran | `.fast` CoreGraphics resample · `.quality(tier)`: the upscale part through the injected enhancer (upscale-only, Fast/Best tiers), then resampled to the spec |
 
 **Depends on [`media-bridge`](https://github.com/xocialize/media-bridge) only** — pure-Swift, FFmpeg-free,
 zero vendored binaries. Builds and tests headless (no MLX, no metallib). The perceptual/enhance tier
@@ -202,6 +202,12 @@ for await a in forge.analyze(.urls(files)) { print(a.recommendation, a.estimate.
 
 // conform — in-memory glue between pipeline segments
 let next = try forge.conform(image, to: MediaSpec(size: .fit(maxWidth: 1024, maxHeight: 1024)))
+
+// …or with the upscale part run by a model tier (downscales and crops stay CoreGraphics). Refused with
+// the reason — no enhancer, tier unavailable, past ×4 — rather than interpolated.
+let r = try await forge.conform(image, to: MediaSpec(size: .exact(width: 2048, height: 2048)),
+                                quality: .quality(.best))
+print(r)                              // "upscale×4 [best · RealPLKSR] → 2048×2048"
 ```
 
 Bulk runs return an `AsyncStream` of receipts: a per-item failure is isolated (`.failed`) and never
@@ -237,6 +243,16 @@ in NDJSON, beside the measured `upscaled` factor) — never the request, and not
 enhancer does not report. An enhancer that predates tiers offers `.fast` only. On video, Fast and Best run per
 frame (SEA-RAFT-stabilized when a `VideoFlowProvider` is attached), and the source's audio is muxed back into the
 upscaled clip — the same step the Live action route below uses (before 0.20.1 this route shipped silent).
+
+`conform(_:to:quality: .quality(tier))` runs the same tiers for a conform's **upscale part only**, through
+`ImageEnhancer.upscaleReporting` — upscale-only, because a conform is resize glue and a restore would change the
+content the next stage receives. The model runs ×2 when the spec needs at most twice the source in both axes, ×4 up
+to four times, and its pixels are then resampled to exactly the spec; a conform that does not enlarge the source
+needs no model and says so (`modelScale` / `upscaleTier` / `upscaleModel` nil). It **throws** rather than fall back
+to `.fast`: no enhancer attached, an unavailable or video-only tier, an enhancer without an upscale-only path (the
+protocol default refuses), more than ×4 (conform in two steps), and an enhancer that reports another tier or returns
+fewer pixels than the spec needs. The `ConformResult` names the tier and model the enhancer reported, and the
+factor measured from its pixels. Before 0.21.0 `.quality` silently ran the CoreGraphics resample.
 
 `.liveAction` is the third tier, and the odd one: **video only, whole clip, and a content declaration.** It routes the
 clip to an injected `VideoUpscaler` (`ForgeOptimizer(videoUpscaler:)`; ForgeCore's runs FlashVSR) instead of the

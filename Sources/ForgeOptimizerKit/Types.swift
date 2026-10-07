@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import UniformTypeIdentifiers
 
 // The ForgeOptimizer I/O contract (PRD §4). Three verbs — analyze / optimize / conform — share this
@@ -111,7 +112,8 @@ public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine 
 ///
 /// A tier the enhancer cannot run fails the item. It is never swapped for the other tier (see
 /// `ImageEnhancer.availability(of:)`), and the receipt records the tier and model the enhancer
-/// reports having run (`AppliedRecipe.upscaleTier` / `upscaleModel`) — never this request.
+/// reports having run (`AppliedRecipe.upscaleTier` / `upscaleModel`) — never this request. A `.quality`
+/// conform's upscale takes the same still tiers (`ConformQuality.quality`), reported in its `ConformResult`.
 ///
 /// `.liveAction` is the one tier that is a **content declaration** as well as a choice: a video-only,
 /// whole-clip tier served by the injected `VideoUpscaler` (ForgeCore runs FlashVSR), never by the
@@ -797,9 +799,49 @@ public enum SizePolicy: Sendable {
     case fill(width: Int, height: Int)       // scale to cover, then center-crop to W×H
 }
 
-public enum ConformQuality: Sendable {
-    case fast       // CoreGraphics high-quality resample — no model
-    case quality    // Phase B: route spec upscales through Real-ESRGAN (engine)
+/// How `conform` performs the upscale part of a resize. Downscales and crops are CoreGraphics either way.
+public enum ConformQuality: Sendable, Equatable {
+    /// CoreGraphics high-quality resample — no model.
+    case fast
+    /// The upscale runs through the injected `ImageEnhancer`'s upscale-only path on this tier's
+    /// backer (ForgeCore: NERVE for `.fast`, RealPLKSR for `.best`), then is resampled to exactly the
+    /// spec. Fails with the reason when it cannot run — never interpolated in its place (AB-T-0195).
+    case quality(UpscaleTier)
+}
+
+/// What a conform produced and what ran to produce it — the conform's receipt.
+///
+/// The tier and model are what the enhancer **reported** running (`EnhanceOutcome`), never copied
+/// from the request; `modelScale` is measured from the pixels the model returned, before the
+/// resample to the spec. All three are nil when no model ran: a `.fast` conform, or a `.quality`
+/// one that did not enlarge the source.
+public struct ConformResult: Sendable, CustomStringConvertible {
+    public let image: CGImage
+    /// What the caller asked for.
+    public let quality: ConformQuality
+    /// The factor the model applied (output width ÷ input width, rounded); nil when no model ran.
+    public let modelScale: Int?
+    /// The tier the enhancer reports having run; nil when no model ran or it does not report one.
+    public let upscaleTier: UpscaleTier?
+    /// The model the enhancer reports having run ("NERVE", "RealPLKSR"); nil likewise.
+    public let upscaleModel: String?
+
+    public init(image: CGImage, quality: ConformQuality, modelScale: Int? = nil,
+                upscaleTier: UpscaleTier? = nil, upscaleModel: String? = nil) {
+        self.image = image
+        self.quality = quality
+        self.modelScale = modelScale
+        self.upscaleTier = upscaleTier
+        self.upscaleModel = upscaleModel
+    }
+
+    /// `upscale×2 [best · RealPLKSR] → 1024×768`, or `resample → 512×384` when no model ran.
+    public var description: String {
+        let size = "\(image.width)×\(image.height)"
+        guard let scale = modelScale else { return "resample → \(size)" }
+        let backer = [upscaleTier?.rawValue, upscaleModel].compactMap { $0 }.joined(separator: " · ")
+        return "upscale×\(scale)\(backer.isEmpty ? "" : " [\(backer)]") → \(size)"
+    }
 }
 
 public struct MediaSpec: Sendable {

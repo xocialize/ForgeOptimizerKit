@@ -1,9 +1,13 @@
 import Foundation
 import CoreGraphics
+import MediaMetrics
 
 // conform — the in-memory inter-segment glue (PRD §"conform"). Resize/crop an artifact to the next
-// pipeline stage's input spec. Phase A is image + `.fast` (CoreGraphics high-quality resample, fully
-// headless — no CoreImage/Metal). `.quality` upscales route through Real-ESRGAN in Phase B.
+// pipeline stage's input spec. `.fast` is a CoreGraphics high-quality resample, fully headless (no
+// CoreImage/Metal). `.quality(tier)` runs only the UPSCALE part of a conform through the injected
+// `ImageEnhancer`'s upscale-only path at the tier the caller names (ForgeCore: NERVE for `.fast`,
+// RealPLKSR for `.best`), then resamples the model's pixels to exactly the spec. Downscales and crops
+// never touch a model, and a quality upscale that cannot run fails — it is never interpolated instead.
 //
 // METAL-FRIENDLY DIRECTION (CLAUDE.md doctrine): this `CGImage` form is the headless/CLI + stills
 // backend and the CPU fallback. The real pipeline/preview currency is `CVPixelBuffer`/`IOSurface`
@@ -13,30 +17,138 @@ import CoreGraphics
 
 public extension ForgeOptimizer {
 
-    /// Conform an image to `spec`. `.quality` currently falls back to `.fast` (engine routing = Phase B).
-    func conform(_ image: CGImage, to spec: MediaSpec, _ quality: ConformQuality = .fast) throws -> CGImage {
-        let srcW = Double(image.width), srcH = Double(image.height)
+    /// Conform an image to `spec` with a CoreGraphics high-quality resample — the `.fast` path,
+    /// synchronous and model-free. A model-backed upscale is `conform(_:to:quality:)`.
+    func conform(_ image: CGImage, to spec: MediaSpec) throws -> CGImage {
+        try ConformPlan(spec, sourceWidth: image.width, sourceHeight: image.height).resample(image)
+    }
+
+    /// Conform an image to `spec`, reporting what ran.
+    ///
+    /// `.fast` is the CoreGraphics resample. `.quality(tier)` runs the conform's upscale through the
+    /// injected enhancer's upscale-only path (`ImageEnhancer.upscaleReporting` — no restore: a conform
+    /// is resize glue and must not change the content the next stage receives). The model runs ×2 when
+    /// the spec needs at most twice the source in both axes and ×4 up to four times; its pixels are then
+    /// resampled to exactly the spec. A conform that does not enlarge the source in either axis (a
+    /// downscale, a crop) needs no model: it runs the CoreGraphics resample and the result names none.
+    ///
+    /// A quality upscale fails rather than run `.fast` in its place:
+    /// - no enhancer attached, the tier video-only, the tier unavailable (`availability(of:)`'s reason),
+    ///   or an enhancer without an upscale-only path → `ForgeError.upscaleTierUnavailable`;
+    /// - more than ×4 in either axis → `ForgeError.invalidOptions` (one model pass; conform in two steps);
+    /// - the enhancer reporting a different tier from the one asked, or returning fewer pixels than the
+    ///   spec needs → `ForgeError.renderFailed`, because either would put another model's pixels, or
+    ///   interpolated ones, under the requested tier's name.
+    func conform(_ image: CGImage, to spec: MediaSpec, quality: ConformQuality) async throws -> ConformResult {
+        let plan = ConformPlan(spec, sourceWidth: image.width, sourceHeight: image.height)
+        guard case .quality(let tier) = quality else {
+            return ConformResult(image: try plan.resample(image), quality: quality)
+        }
+        // A whole-clip tier can never serve a still, whatever the geometry: refused on every call.
+        if tier.isVideoOnly {
+            throw ForgeError.upscaleTierUnavailable(tier, UpscaleTier.liveActionStillReason)
+        }
+        guard plan.upscales(image.width, image.height) else {
+            return ConformResult(image: try plan.resample(image), quality: quality)
+        }
+        guard let factor = plan.modelFactor(image.width, image.height) else {
+            throw ForgeError.invalidOptions(
+                "a quality conform of \(image.width)×\(image.height) to \(plan.width)×\(plan.height) needs more "
+                + "than ×4; a model upscale runs at most ×4 per pass — conform in two steps")
+        }
+        guard let enhancer else {
+            throw ForgeError.upscaleTierUnavailable(
+                tier, "no enhancer is attached to this optimizer — a quality conform's upscale needs one")
+        }
+        try await Self.requireStillUpscaleTier(tier, of: enhancer)
+
+        let outcome = try await MediaMetrics.time("kit.conform.upscale", lane: "gpu",
+                                                  attrs: ["w": "\(image.width)", "h": "\(image.height)",
+                                                          "tier": tier.rawValue]) {
+            try await enhancer.upscaleReporting(image, factor: factor, tier: tier)
+        }
+        let upscaled = outcome.image
+        let backer = [outcome.upscaleTier?.rawValue, outcome.upscaleModel].compactMap { $0 }.joined(separator: " · ")
+
+        // Reported, never assumed: an enhancer that ran another tier anyway is refused, not returned
+        // under the requested name (the receipt surfaces this for optimize; a conform has no receipt
+        // to surface it in, so the call fails).
+        if let ran = outcome.upscaleTier, ran != tier {
+            throw ForgeError.renderFailed(
+                "the enhancer reported running the '\(ran.rawValue)' tier (\(backer)) for a '\(tier.rawValue)' "
+                + "quality conform — refused rather than returned under the wrong tier")
+        }
+        // The model's pixels must cover the spec, so the final resample only ever reduces them. A 2%
+        // tolerance absorbs alignment trims (the Kit's `setUpscale` rule); anything shorter would make
+        // the rest of the upscale an interpolation under the model's name.
+        if Double(upscaled.width) < 0.98 * Double(plan.width) || Double(upscaled.height) < 0.98 * Double(plan.height) {
+            throw ForgeError.renderFailed(
+                "the enhancer's ×\(factor.multiplier) upscale\(backer.isEmpty ? "" : " (\(backer))") returned "
+                + "\(upscaled.width)×\(upscaled.height) from \(image.width)×\(image.height), short of the "
+                + "\(plan.width)×\(plan.height) this conform needs — the rest would be interpolation")
+        }
+        return ConformResult(
+            image: try plan.resample(upscaled), quality: quality,
+            modelScale: Int((Double(upscaled.width) / Double(image.width)).rounded()),
+            upscaleTier: outcome.upscaleTier, upscaleModel: outcome.upscaleModel)
+    }
+}
+
+/// The CoreGraphics resample a spec asks for: draw the source at `width×height`, then center-crop to
+/// `crop` (`.fill` only).
+struct ConformPlan {
+    let width: Int
+    let height: Int
+    let crop: (width: Int, height: Int)?
+
+    init(_ spec: MediaSpec, sourceWidth: Int, sourceHeight: Int) {
+        let srcW = Double(sourceWidth), srcH = Double(sourceHeight)
         switch spec.size {
         case .exact(let w, let h):
-            return try resample(image, to: w, h, cropTo: nil)
+            (width, height, crop) = (w, h, nil)
 
         case .fit(let maxW, let maxH):
             let scale = min(Double(maxW) / srcW, Double(maxH) / srcH)
-            let w = max(1, Int((srcW * scale).rounded()))
-            let h = max(1, Int((srcH * scale).rounded()))
-            return try resample(image, to: w, h, cropTo: nil)
+            width = max(1, Int((srcW * scale).rounded()))
+            height = max(1, Int((srcH * scale).rounded()))
+            crop = nil
 
         case .fill(let w, let h):
             let scale = max(Double(w) / srcW, Double(h) / srcH)   // cover
-            let sw = max(w, Int((srcW * scale).rounded()))
-            let sh = max(h, Int((srcH * scale).rounded()))
-            return try resample(image, to: sw, sh, cropTo: (w, h))
+            width = max(w, Int((srcW * scale).rounded()))
+            height = max(h, Int((srcH * scale).rounded()))
+            crop = (w, h)
+        }
+    }
+
+    /// Whether the draw enlarges a `w×h` source in either axis — the only part of a conform a model serves.
+    func upscales(_ w: Int, _ h: Int) -> Bool { width > w || height > h }
+
+    /// The smallest model factor whose output covers the draw in both axes; nil past ×4.
+    func modelFactor(_ w: Int, _ h: Int) -> UpscaleFactor? {
+        if width <= 2 * w && height <= 2 * h { return .x2 }
+        if width <= 4 * w && height <= 4 * h { return .x4 }
+        return nil
+    }
+
+    func resample(_ image: CGImage) throws -> CGImage {
+        try drawResampled(image, to: width, height, cropTo: crop)
+    }
+}
+
+extension UpscaleFactor {
+    /// The integer factor, 1 for `.none`.
+    var multiplier: Int {
+        switch self {
+        case .none: return 1
+        case .x2: return 2
+        case .x4: return 4
         }
     }
 }
 
 /// Draw `image` into a `w×h` bitmap at high interpolation quality, optionally center-cropping to `cropTo`.
-private func resample(_ image: CGImage, to w: Int, _ h: Int, cropTo: (Int, Int)?) throws -> CGImage {
+private func drawResampled(_ image: CGImage, to w: Int, _ h: Int, cropTo: (width: Int, height: Int)?) throws -> CGImage {
     let rgb = CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(
         data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
