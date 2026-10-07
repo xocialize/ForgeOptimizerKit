@@ -121,12 +121,24 @@ public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine 
 /// point on camera footage and wrong on anime, cartoons, graphics and text — and nothing in Forge can
 /// tell the two apart reliably, so the caller choosing this tier is the statement that the clip is live
 /// action. A still asked for it fails the item (`ForgeError.upscaleTierUnavailable`).
+///
+/// `.generative` and `.generativeClean` are the **generative stills** tiers (AB-D-0111). They invent plausible
+/// detail, and ForgeCore runs each behind a text-legibility guard, because a generative model can rewrite words a
+/// reader could already read. `.generative` is VOSR2, the stronger model. `.generativeClean` is Nacre, whose weights
+/// are provenance-clean end to end: trained only on Wikimedia Commons CC0/PD/CC BY images. It is the choice when
+/// clean provenance matters more than peak quality. Both are stills only: a clip asked for one fails the item, because
+/// per-frame generation has no temporal model; a clip takes Fast, Best or Live action.
 public enum UpscaleTier: String, Sendable, CaseIterable {
     case fast, best
     case liveAction = "live-action"
+    case generative
+    case generativeClean = "generative-clean"
 
     /// Runs on a whole clip through `VideoUpscaler` rather than per frame through `ImageEnhancer`.
     public var isVideoOnly: Bool { self == .liveAction }
+
+    /// A generative stills tier: never run frame by frame on a clip.
+    public var isStillOnly: Bool { self == .generative || self == .generativeClean }
 }
 
 /// The deliverable format. `.auto` = the verb's opinionated default (optimize: HEIC stills /
@@ -478,8 +490,12 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// the same rule as `upscaled` (AB-T-0013), because a tag that echoes the request is accurate
     /// only while every enhancer does exactly as asked.
     public var upscaleTier: UpscaleTier? = nil
-    /// The model the enhancer reports having run the upscale ("NERVE", "RealPLKSR"), or nil likewise.
+    /// The model the enhancer reports having run the upscale ("NERVE", "RealPLKSR"), or nil likewise. For a
+    /// generative tier whose text guard composited two models, it names both ("Nacre + NERVE (protected words)").
     public var upscaleModel: String? = nil
+    /// The text guard's route for a generative tier, as the enhancer reported it: `generative`, `keepBase` or
+    /// `protectWords`. Nil for every other tier and when the enhancer does not report one.
+    public var upscaleGuardRoute: String? = nil
     /// The tier the caller asked for, set only when the enhancer reported running a *different* one.
     /// The Kit refuses a tier the enhancer says it cannot run before asking for it, so a non-nil value
     /// here means an enhancer substituted anyway — surfaced, like `upscaleRequested`, not hidden.
@@ -577,9 +593,10 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
     /// nothing leaves both nil and the receipt says nothing about the backer: unknown is honest, a
     /// guess from the request is the AB-T-0013 defect again.
     public mutating func setUpscaleBacker(reportedTier: UpscaleTier?, reportedModel: String?,
-                                          options: Options) {
+                                          reportedRoute: String? = nil, options: Options) {
         upscaleTier = reportedTier
         upscaleModel = reportedModel
+        upscaleGuardRoute = reportedRoute
         let diverged = options.upscale != .none && reportedTier != nil && reportedTier != options.upscaleTier
         upscaleTierRequested = diverged ? options.upscaleTier : nil
     }

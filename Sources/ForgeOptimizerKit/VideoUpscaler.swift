@@ -51,7 +51,11 @@ public extension UpscaleTier {
     /// Why a still cannot take `.liveAction` — the one wording the Kit's refusal and the default
     /// `ImageEnhancer.availability(of:)` share.
     static let liveActionStillReason =
-        "live action is a whole-clip video tier — a still takes Fast or Best"
+        "live action is a whole-clip video tier — a still takes Fast, Best or Generative"
+
+    /// Why a clip cannot take a generative stills tier (`isStillOnly`).
+    static let generativeClipReason =
+        "generative upscaling is stills only (frame-by-frame generation has no temporal model) — a clip takes Fast, Best or Live action"
 }
 
 extension ForgeOptimizer {

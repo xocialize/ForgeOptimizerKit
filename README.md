@@ -234,7 +234,7 @@ exists for.) The receipt carries what the gate did (`recipe.cameraGate`: `off` /
 `clean` / `fired` / `unavailable`; `camera_gate` in NDJSON), so a host can verify its policy was
 honoured and calibration rows can separate "probed clean" from "never probed".
 
-`Options.upscaleTier` (`.fast` / `.best`) picks which backer runs an `Options.upscale` — a **cost** choice
+`Options.upscaleTier` (`.fast` / `.best`, plus `.liveAction` and the generative tiers below) picks which backer runs an `Options.upscale` — a **cost** choice
 the enhancer maps to a model (ForgeCore: NERVE for Fast, RealPLKSR for Best). The Kit asks the enhancer
 first (`ImageEnhancer.availability(of:)`) and **fails the item** on a tier it cannot run, with the
 enhancer's reason; it never runs the other tier instead. The receipt names the tier and model the
@@ -265,6 +265,21 @@ upscaler attached is a refusal too. The upscaler writes video only, so the Kit m
 (passthrough; LPCM that an mp4 cannot carry becomes AAC). `optimize` delivers that clip; `webOptimize` runs the
 H.264 floor search over it. The receipt reads `upscale_tier: "live-action"` with the reported model, and the factor
 and codec measured from the delivered file. A still asked for `.liveAction` fails the item.
+
+`.generative` and `.generativeClean` are the **generative stills tiers** (0.22.0). They invent plausible detail on a
+damaged still instead of interpolating it. ForgeCore runs `.generative` as VOSR2, the stronger model, and
+`.generativeClean` as Nacre, whose weights are provenance-clean end to end (trained only on Wikimedia Commons
+CC0/PD/CC BY images). Each runs behind a text-legibility guard, because a generative model can rewrite words a reader
+could already read. The enhancer reports the guard's **route** as well as the model:
+- `generative`: the model alone;
+- `protectWords`: the fast tier's pixels inside the protected words;
+- `keepBase`: a legible document page kept on the fast tier.
+
+When two models made the pixels, the model name says so (`Nacre + NERVE (protected words)`). The receipt carries
+`upscale_guard_route` beside `upscale_tier` and `upscale_model`. Both tiers are **stills only**: a clip asked for one
+fails the item before any frame runs, because frame-by-frame generation has no temporal model. A clip takes Fast, Best
+or Live action. An enhancer that predates these tiers refuses them by the protocol default. A `.quality(tier)` conform
+takes them too.
 
 The extension on a `.fileURL` destination is **advisory** — Forge writes its opinionated container
 (HEIC stills, HEVC-in-mp4 video) to the path as given and the host reads the real container back

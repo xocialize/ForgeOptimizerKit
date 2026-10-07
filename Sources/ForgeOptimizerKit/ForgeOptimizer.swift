@@ -615,7 +615,7 @@ public struct ForgeOptimizer: Sendable {
             // about the scale. The backer is what the enhancer reported running (AB-T-0187).
             recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
             recipe.setUpscaleBacker(reportedTier: outcome.upscaleTier, reportedModel: outcome.upscaleModel,
-                                    options: options)
+                                    reportedRoute: outcome.upscaleRoute, options: options)
         }
 
         // A host-dictated URL that NAMES a still format pins it — the host baked the path
@@ -1127,6 +1127,11 @@ public struct ForgeOptimizer: Sendable {
                 before: kept, after: kept,   // nothing was produced — the kept original is the after-state
                 status: .skipped(Self.alphaRefusalReason),
                 elapsed: Date().timeIntervalSince(start))
+        }
+
+        // A generative stills tier never runs frame by frame on a clip: refused before any work (AB-D-0111).
+        if options.upscale != .none, options.upscaleTier.isStillOnly {
+            throw ForgeError.upscaleTierUnavailable(options.upscaleTier, UpscaleTier.generativeClipReason)
         }
 
         // The live-action tier is a whole-clip model behind its own seam. Routed on the tier alone, BEFORE the

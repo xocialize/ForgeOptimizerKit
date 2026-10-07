@@ -58,6 +58,8 @@ public extension ImageEnhancer {
         case .fast: return .available(.fast)
         case .best: return .unavailable(.best, reason: "this enhancer offers a single upscale tier")
         case .liveAction: return .unavailable(.liveAction, reason: UpscaleTier.liveActionStillReason)
+        case .generative, .generativeClean:
+            return .unavailable(tier, reason: "this enhancer offers no generative tier")
         }
     }
 }
@@ -67,13 +69,18 @@ public struct EnhanceOutcome: Sendable {
     public var image: CGImage
     /// The tier whose backer ran the upscale; nil when no upscale ran (or the enhancer cannot say).
     public var upscaleTier: UpscaleTier?
-    /// That backer's model name ("NERVE", "RealPLKSR"); nil likewise.
+    /// That backer's model name ("NERVE", "RealPLKSR"); nil likewise. A generative tier's guard can composite two
+    /// models; the name then says so ("VOSR2 + NERVE (protected words)").
     public var upscaleModel: String?
+    /// The text guard's route for a generative tier (`generative`, `keepBase`, `protectWords`); nil otherwise.
+    public var upscaleRoute: String?
 
-    public init(image: CGImage, upscaleTier: UpscaleTier? = nil, upscaleModel: String? = nil) {
+    public init(image: CGImage, upscaleTier: UpscaleTier? = nil, upscaleModel: String? = nil,
+                upscaleRoute: String? = nil) {
         self.image = image
         self.upscaleTier = upscaleTier
         self.upscaleModel = upscaleModel
+        self.upscaleRoute = upscaleRoute
     }
 }
 

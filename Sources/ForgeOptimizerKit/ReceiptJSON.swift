@@ -78,6 +78,7 @@ public enum ReceiptJSON {
         if let asked = r.recipe.upscaleRequested { o["upscale_requested"] = asked }
         if let tier = r.recipe.upscaleTier { o["upscale_tier"] = tier.rawValue }
         if let model = r.recipe.upscaleModel { o["upscale_model"] = model }
+        if let route = r.recipe.upscaleGuardRoute { o["upscale_guard_route"] = route }
         if let askedTier = r.recipe.upscaleTierRequested { o["upscale_tier_requested"] = askedTier.rawValue }
         if let hintClass = r.recipe.contentHintClass {
             o["hint_class"] = hintClass
