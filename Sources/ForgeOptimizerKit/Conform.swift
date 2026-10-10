@@ -54,7 +54,7 @@ public extension ForgeOptimizer {
         guard let factor = plan.modelFactor(image.width, image.height) else {
             throw ForgeError.invalidOptions(
                 "a quality conform of \(image.width)×\(image.height) to \(plan.width)×\(plan.height) needs more "
-                + "than ×4; a model upscale runs at most ×4 per pass — conform in two steps")
+                + "than ×8; a model upscale runs at most ×8 (×4, then ×2 on the fast fidelity tier — AB-D-0119) — conform in two steps")
         }
         guard let enhancer else {
             throw ForgeError.upscaleTierUnavailable(
@@ -124,10 +124,14 @@ struct ConformPlan {
     /// Whether the draw enlarges a `w×h` source in either axis — the only part of a conform a model serves.
     func upscales(_ w: Int, _ h: Int) -> Bool { width > w || height > h }
 
-    /// The smallest model factor whose output covers the draw in both axes; nil past ×4.
+    /// The smallest model factor whose output covers the draw in both axes; nil past ×8. ×6 and ×8 are
+    /// served by the enhancer as a chain (`UpscaleFactor`), so a conform that needs them asks for them
+    /// the same way and resamples the result to the exact spec as before.
     func modelFactor(_ w: Int, _ h: Int) -> UpscaleFactor? {
         if width <= 2 * w && height <= 2 * h { return .x2 }
         if width <= 4 * w && height <= 4 * h { return .x4 }
+        if width <= 6 * w && height <= 6 * h { return .x6 }
+        if width <= 8 * w && height <= 8 * h { return .x8 }
         return nil
     }
 
@@ -143,6 +147,8 @@ extension UpscaleFactor {
         case .none: return 1
         case .x2: return 2
         case .x4: return 4
+        case .x6: return 6
+        case .x8: return 8
         }
     }
 }

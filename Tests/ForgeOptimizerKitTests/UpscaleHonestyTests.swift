@@ -28,6 +28,22 @@ final class UpscaleHonestyTests: XCTestCase {
         XCTAssertFalse(r.description.contains("asked"))
     }
 
+    /// The chained factors report like any other: the pixels decide, and a met ×6 / ×8 request is quiet.
+    func testChainedFactorsReportFromThePixels() {
+        let six = recipe(from: 512, to: 3072, requested: .x6)
+        XCTAssertEqual(six.upscaled, 6)
+        XCTAssertNil(six.upscaleRequested)
+        XCTAssertTrue(six.description.contains("upscale×6"), six.description)
+        let eight = recipe(from: 512, to: 4096, requested: .x8)
+        XCTAssertEqual(eight.upscaled, 8)
+        XCTAssertNil(eight.upscaleRequested)
+        // An enhancer that predates the chain and stopped at its native ×4 shows the divergence.
+        let short = recipe(from: 512, to: 2048, requested: .x6)
+        XCTAssertEqual(short.upscaled, 4)
+        XCTAssertEqual(short.upscaleRequested, 6)
+        XCTAssertTrue(short.description.contains("upscale×4 (asked ×6)"), short.description)
+    }
+
     /// The original BRIDGE-040 defect: asked 2×, got 4×. The receipt must say 4 and show the divergence.
     func testFixedFourTimesModelAskedForTwoReportsFourAndSaysSo() {
         let r = recipe(from: 512, to: 2048, requested: .x2)
@@ -524,7 +540,7 @@ struct TieredEnhancer: ImageEnhancer {
 
     func enhanceReporting(_ image: CGImage, options: Options) async throws -> EnhanceOutcome {
         calls.increment()
-        let factor: Int = switch options.upscale { case .none: 1; case .x2: 2; case .x4: 4 }
+        let factor: Int = switch options.upscale { case .none: 1; case .x2: 2; case .x4: 4; case .x6: 6; case .x8: 8 }
         guard factor > 1 else { return EnhanceOutcome(image: image) }
         let scaled = try await FixedScaleEnhancer(factor: factor).enhance(image, options: options)
         let ran = substitute ?? options.upscaleTier

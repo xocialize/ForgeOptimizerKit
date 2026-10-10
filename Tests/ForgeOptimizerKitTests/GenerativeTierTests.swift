@@ -151,7 +151,7 @@ struct GuardedStubEnhancer: ImageEnhancer {
 
     func enhanceReporting(_ image: CGImage, options: Options) async throws -> EnhanceOutcome {
         calls.increment()
-        let factor: Int = switch options.upscale { case .none: 1; case .x2: 2; case .x4: 4 }
+        let factor: Int = switch options.upscale { case .none: 1; case .x2: 2; case .x4: 4; case .x6: 6; case .x8: 8 }
         guard factor > 1 else { return EnhanceOutcome(image: image) }
         let scaled = try await FixedScaleEnhancer(factor: factor).enhance(image, options: options)
         return EnhanceOutcome(image: scaled, upscaleTier: options.upscaleTier,
@@ -160,7 +160,7 @@ struct GuardedStubEnhancer: ImageEnhancer {
 
     func upscaleReporting(_ image: CGImage, factor: UpscaleFactor, tier: UpscaleTier) async throws -> EnhanceOutcome {
         calls.increment()
-        let f: Int = switch factor { case .none: 1; case .x2: 2; case .x4: 4 }
+        let f: Int = switch factor { case .none: 1; case .x2: 2; case .x4: 4; case .x6: 6; case .x8: 8 }
         let scaled = try await FixedScaleEnhancer(factor: f).enhance(image, options: Options(quality: .balanced))
         return EnhanceOutcome(image: scaled, upscaleTier: tier, upscaleModel: Self.model(for: tier, route: route),
                               upscaleRoute: route)

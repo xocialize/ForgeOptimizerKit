@@ -100,7 +100,16 @@ public enum QualityTarget: Sendable {
 public enum CameraGate: Sendable { case auto, off }
 
 public enum EnhancePolicy: Sendable { case off, auto, on }   // Phase A honors only `.off`
-public enum UpscaleFactor: Sendable { case none, x2, x4 }    // Phase B (engine — see `UpscaleTier` for which model)
+
+/// The linear upscale factor a caller asks for (Phase B, engine — see `UpscaleTier` for which model).
+///
+/// `.x2` and `.x4` are the factors every tier serves natively. `.x6` and `.x8` go past every model in the
+/// fleet (all cap at ×4), so an enhancer serves them as a **chain**: the chosen tier at ×4, then the fast
+/// fidelity tier at ×2, then — for ×6 — a resample of the ×8 result down to exactly 6× (ForgeCore
+/// `EngineImageEnhancer`, AB-D-0119). The receipt names every model whose pixels shipped; an enhancer
+/// that predates the chain reports what it actually applied and `AppliedRecipe.setUpscale` records the
+/// divergence, as for any other factor.
+public enum UpscaleFactor: Sendable, CaseIterable { case none, x2, x4, x6, x8 }
 
 /// Which upscale backer runs when `Options.upscale` asks for one — a **cost** choice, not a
 /// degradation route.
@@ -572,6 +581,8 @@ public struct AppliedRecipe: Sendable, CustomStringConvertible {
         case .none: nil
         case .x2: 2
         case .x4: 4
+        case .x6: 6
+        case .x8: 8
         }
         guard widthBefore > 0, widthAfter > 0 else { upscaled = nil; return }
         let ratio = Double(widthAfter) / Double(widthBefore)

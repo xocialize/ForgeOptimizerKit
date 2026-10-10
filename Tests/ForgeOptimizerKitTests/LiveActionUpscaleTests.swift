@@ -242,7 +242,7 @@ final class FakeVideoUpscaler: VideoUpscaler, @unchecked Sendable {
 
     init(refusal: String? = nil) { self.refusal = refusal }
 
-    static func factor(_ f: UpscaleFactor) -> Int { switch f { case .none: 1; case .x2: 2; case .x4: 4 } }
+    static func factor(_ f: UpscaleFactor) -> Int { switch f { case .none: 1; case .x2: 2; case .x4: 4; case .x6: 6; case .x8: 8 } }
 
     func availability(of tier: UpscaleTier, width: Int, height: Int,
                       factor: UpscaleFactor) async -> UpscaleTierAvailability {

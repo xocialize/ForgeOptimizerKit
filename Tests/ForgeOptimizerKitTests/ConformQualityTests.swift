@@ -40,6 +40,8 @@ final class ConformQualityTests: XCTestCase {
             (MediaSpec(size: .exact(width: 65, height: 24)), .x2, 65, 24),      // one axis up, one down
             (MediaSpec(size: .exact(width: 200, height: 100)), .x4, 200, 100),  // 200 > 2 × 64
             (MediaSpec(size: .fill(width: 100, height: 100)), .x4, 100, 100),   // draws 133×100, then crops
+            (MediaSpec(size: .exact(width: 320, height: 160)), .x6, 320, 160),  // 320 > 4 × 64: the ×6 chain
+            (MediaSpec(size: .exact(width: 500, height: 100)), .x8, 500, 100),  // 500 > 6 × 64: the ×8 chain
         ]
         for (spec, factor, w, h) in cases {
             let enhancer = UpscaleOnlyEnhancer()
@@ -134,15 +136,16 @@ final class ConformQualityTests: XCTestCase {
         XCTAssertEqual(enhancer.enhances.count, 0)
     }
 
-    /// One model pass is at most ×4. Past that in either axis the conform is refused before any work, with
-    /// the way out named (conform in two steps), rather than finished by interpolation.
-    func testMoreThanFourTimesIsRefusedBeforeAnyWork() async {
+    /// A model pass is at most ×4, and the enhancer chains ×4 → ×2 for ×6 and ×8 (AB-D-0119); so ×8 is the ceiling.
+    /// Past that in either axis the conform is refused before any work, with the way out named (conform in two
+    /// steps), rather than finished by interpolation.
+    func testMoreThanEightTimesIsRefusedBeforeAnyWork() async {
         let enhancer = UpscaleOnlyEnhancer()
-        for spec in [MediaSpec(size: .exact(width: 512, height: 384)),     // ×8 both axes
-                     MediaSpec(size: .exact(width: 300, height: 48))] {   // ×4.7 in one
+        for spec in [MediaSpec(size: .exact(width: 520, height: 384)),     // ×8.1 in one axis
+                     MediaSpec(size: .exact(width: 640, height: 480))] {   // ×10 both — past the ×4→×2 chain (AB-D-0119)
             await assertRefused(ForgeOptimizer(enhancer: enhancer), .best, spec: spec) { error in
                 guard case ForgeError.invalidOptions(let why) = error else { return false }
-                return why.contains("more than ×4") && why.contains("two steps")
+                return why.contains("more than ×8") && why.contains("two steps")
             }
         }
         XCTAssertEqual(enhancer.upscales.count, 0)
