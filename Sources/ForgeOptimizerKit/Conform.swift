@@ -154,11 +154,20 @@ extension UpscaleFactor {
 }
 
 /// Draw `image` into a `w×h` bitmap at high interpolation quality, optionally center-cropping to `cropTo`.
+///
+/// A deeper-than-8-bit image keeps its depth: 16 bits per component in its own RGB colour space (sRGB when it has
+/// none or another model), so a 16-bit source's gradients survive a conform (Gigapixel gap G-6). 8-bit images draw
+/// as before.
 private func drawResampled(_ image: CGImage, to w: Int, _ h: Int, cropTo: (width: Int, height: Int)?) throws -> CGImage {
-    let rgb = CGColorSpaceCreateDeviceRGB()
+    let deep = image.bitsPerComponent > 8
+    let space: CGColorSpace = {
+        guard deep else { return CGColorSpaceCreateDeviceRGB() }
+        if let own = image.colorSpace, own.model == .rgb, own.supportsOutput { return own }
+        return CGColorSpace(name: CGColorSpace.sRGB)!
+    }()
     guard let ctx = CGContext(
-        data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-        space: rgb, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        data: nil, width: w, height: h, bitsPerComponent: deep ? 16 : 8, bytesPerRow: 0, space: space,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | (deep ? CGBitmapInfo.byteOrder16Little.rawValue : 0)
     ) else {
         throw ForgeError.renderFailed("CGContext \(w)×\(h)")
     }

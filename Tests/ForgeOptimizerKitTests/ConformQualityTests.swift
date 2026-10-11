@@ -94,6 +94,21 @@ final class ConformQualityTests: XCTestCase {
 
     // MARK: - Every way it cannot run is a thrown reason
 
+    /// Gigapixel gap G-6: a 16-bit source keeps its depth through a conform's resample, so a gradient finer than
+    /// one 8-bit step survives. An 8-bit source still draws at 8 bits.
+    func testA16BitSourceKeepsItsDepthThroughAConform() async throws {
+        let deep = shallowRamp16(300, 4)
+        let r = try await ForgeOptimizer().conform(deep, to: MediaSpec(size: .exact(width: 600, height: 8)), quality: .fast)
+        XCTAssertEqual(r.image.bitsPerComponent, 16)
+        XCTAssertEqual(r.image.colorSpace?.name, CGColorSpace.sRGB, "its own colour space, not DeviceRGB")
+        // The ramp spans about 2.3 8-bit steps: at 8 bits a row has at most 3 greens, at 16 bits hundreds.
+        let row = greens16(r.image, row: 4)
+        XCTAssertGreaterThan(Set(row).count, 100, "sub-8-bit gradation kept")
+
+        let shallow = try await ForgeOptimizer().conform(source, to: MediaSpec(size: .exact(width: 32, height: 24)), quality: .fast)
+        XCTAssertEqual(shallow.image.bitsPerComponent, 8, "8-bit sources are drawn as before")
+    }
+
     func testQualityUpscaleWithoutAnEnhancerFailsWithTheReason() async {
         await assertRefused(ForgeOptimizer(), .best) { error in
             guard case ForgeError.upscaleTierUnavailable(let tier, let why) = error else { return false }
@@ -252,4 +267,30 @@ final class FactorLog: @unchecked Sendable {
     private var factors: [UpscaleFactor] = []
     var all: [UpscaleFactor] { lock.lock(); defer { lock.unlock() }; return factors }
     func append(_ factor: UpscaleFactor) { lock.lock(); defer { lock.unlock() }; factors.append(factor) }
+}
+
+/// A 16-bit sRGB ramp in green from 30000 to 30600 (of 65535) across `w`.
+private func shallowRamp16(_ w: Int, _ h: Int) -> CGImage {
+    var px = [UInt16](repeating: 65535, count: w * h * 4)
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = (y * w + x) * 4
+            px[i] = 20000; px[i + 1] = UInt16(30000 + x * 600 / (w - 1)); px[i + 2] = 40000
+        }
+    }
+    let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)!
+    return ctx.makeImage()!
+}
+
+/// One row's green values, read back at 16 bits.
+private func greens16(_ image: CGImage, row: Int) -> [UInt16] {
+    let (w, h) = (image.width, image.height)
+    var px = [UInt16](repeating: 0, count: w * h * 4)
+    let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)!
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return (0..<w).map { px[(row * w + $0) * 4 + 1] }
 }
