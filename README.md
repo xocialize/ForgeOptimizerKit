@@ -234,7 +234,7 @@ exists for.) The receipt carries what the gate did (`recipe.cameraGate`: `off` /
 `clean` / `fired` / `unavailable`; `camera_gate` in NDJSON), so a host can verify its policy was
 honoured and calibration rows can separate "probed clean" from "never probed".
 
-`Options.upscaleTier` (`.fast` / `.best`, plus `.liveAction` and the generative tiers below) picks which backer runs an `Options.upscale` — a **cost** choice
+`Options.upscaleTier` (`.fast` / `.best`, plus `.instant`, `.liveAction` and the generative tiers below) picks which backer runs an `Options.upscale` — a **cost** choice
 the enhancer maps to a model (ForgeCore: NERVE for Fast, RealPLKSR for Best). The Kit asks the enhancer
 first (`ImageEnhancer.availability(of:)`) and **fails the item** on a tier it cannot run, with the
 enhancer's reason; it never runs the other tier instead. The receipt names the tier and model the
@@ -277,9 +277,15 @@ could already read. The enhancer reports the guard's **route** as well as the mo
 
 When two models made the pixels, the model name says so (`Nacre + NERVE (protected words)`). The receipt carries
 `upscale_guard_route` beside `upscale_tier` and `upscale_model`. Both tiers are **stills only**: a clip asked for one
-fails the item before any frame runs, because frame-by-frame generation has no temporal model. A clip takes Fast, Best
-or Live action. An enhancer that predates these tiers refuses them by the protocol default. A `.quality(tier)` conform
+fails the item before any frame runs, because frame-by-frame generation has no temporal model. A clip takes Fast, Best,
+Instant or Live action. An enhancer that predates these tiers refuses them by the protocol default. A `.quality(tier)` conform
 takes them too.
+
+`.instant` is the **efficiency tier** (0.25.0, AB-D-0146): instant and model-free, for when speed is all a job
+needs. ForgeCore runs it as Anime4K's upscale-only VL network on Metal shaders (`anime4k-metal`), with no download and
+no memory tier: about 12 ms for a 1024² ×2 on an M5 Max. It makes no quality claim. Fast and Best score higher on every
+content class measured (AB-R-0559), and Instant is clearly better than plain Lanczos. Stills and clips both take it, a
+clip frame by frame like Fast and Best. An enhancer that predates the tier refuses it by the protocol default.
 
 The extension on a `.fileURL` destination is **advisory** — Forge writes its opinionated container
 (HEIC stills, HEVC-in-mp4 video) to the path as given and the host reads the real container back

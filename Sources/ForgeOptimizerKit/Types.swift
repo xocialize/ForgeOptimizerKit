@@ -136,12 +136,18 @@ public enum UpscaleFactor: Sendable, CaseIterable { case none, x2, x4, x6, x8 }
 /// reader could already read. `.generative` is VOSR2, the stronger model. `.generativeClean` is Nacre, whose weights
 /// are provenance-clean end to end: trained only on Wikimedia Commons CC0/PD/CC BY images. It is the choice when
 /// clean provenance matters more than peak quality. Both are stills only: a clip asked for one fails the item, because
-/// per-frame generation has no temporal model; a clip takes Fast, Best or Live action.
+/// per-frame generation has no temporal model; a clip takes Fast, Best, Instant or Live action.
+///
+/// `.instant` is the **efficiency** tier (AB-D-0146): instant and model-free, for when speed is all a job needs.
+/// ForgeCore runs it as Anime4K's upscale-only VL network on Metal shaders (`anime4k-metal`): no download, no memory
+/// tier, about 12 ms for a 1024² ×2 on an M5 Max. It is not a quality rival to Fast or Best, which score higher on
+/// every content class measured (AB-R-0559). Stills and clips both take it, a clip frame by frame like Fast and Best.
 public enum UpscaleTier: String, Sendable, CaseIterable {
     case fast, best
     case liveAction = "live-action"
     case generative
     case generativeClean = "generative-clean"
+    case instant
 
     /// Runs on a whole clip through `VideoUpscaler` rather than per frame through `ImageEnhancer`.
     public var isVideoOnly: Bool { self == .liveAction }
