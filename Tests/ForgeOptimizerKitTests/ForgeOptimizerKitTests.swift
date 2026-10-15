@@ -192,7 +192,7 @@ final class ForgeOptimizerKitTests: XCTestCase {
         let forge = ForgeOptimizer(enhancer: DoublingEnhancer(), flowProvider: ZeroFlowProvider())
         var result: OptimizeResult?
         for await r in try forge.optimize(.url(src), to: .directory(tmp),
-                                          Options(quality: .balanced, upscale: .x2)) { result = r }
+                                          Options(quality: .balanced, enhance: .on, upscale: .x2)) { result = r }
 
         let r = try XCTUnwrap(result)
         XCTAssertEqual(r.kind, .video)

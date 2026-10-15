@@ -53,7 +53,7 @@ final class InstantTierTests: XCTestCase {
         var result: OptimizeResult?
         for await r in try ForgeOptimizer(enhancer: enhancer, flowProvider: ZeroFlowProvider())
             .optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
-                      Options(quality: .aggressive, upscale: .x2, upscaleTier: .instant)) {
+                      Options(quality: .aggressive, enhance: .on, upscale: .x2, upscaleTier: .instant)) {
             result = r
         }
         let r = try XCTUnwrap(result)
@@ -88,6 +88,69 @@ final class InstantTierTests: XCTestCase {
         let r = try XCTUnwrap(result)
         XCTAssertNil(r.recipe.upscaleTier)
         XCTAssert("\(r.status)".contains("no instant tier"), "\(r.status)")
+    }
+
+    // MARK: - Enhance off: the upscale alone (0.26.0)
+
+    /// With Enhance off, a still's upscale runs through the upscale-only path: the restore does not run, the factor
+    /// does. Before 0.26.0 this request was dropped without a word.
+    func testStillWithEnhanceOffTakesTheUpscaleAlone() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(width: 64, height: 48, to: src)
+        let enhancer = UpscaleOnlyEnhancer()
+        var result: OptimizeResult?
+        for await r in try ForgeOptimizer(enhancer: enhancer)
+            .optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
+                      Options(quality: .balanced, upscale: .x2, upscaleTier: .instant)) {
+            result = r
+        }
+        let r = try XCTUnwrap(result)
+        XCTAssertFalse(r.recipe.restored, "Enhance off: no restore")
+        XCTAssertEqual(enhancer.enhances.count, 0, "the restore path never ran")
+        XCTAssertEqual(enhancer.upscales.count, 1)
+        XCTAssertEqual(r.recipe.upscaleTier, .instant)
+        XCTAssertEqual(r.after.width, 128)
+    }
+
+    /// An enhancer that only restores-then-upscales cannot take an upscale with Enhance off: the item fails with the
+    /// reason rather than restoring unasked or dropping the upscale.
+    func testEnhanceOffWithoutAnUpscaleOnlyPathFailsWithTheReason() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("input.png")
+        try writePNG(width: 64, height: 48, to: src)
+        var result: OptimizeResult?
+        for await r in try ForgeOptimizer(enhancer: RestoreThenUpscaleEnhancer())
+            .optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
+                      Options(quality: .balanced, upscale: .x2, upscaleTier: .fast)) {
+            result = r
+        }
+        let r = try XCTUnwrap(result)
+        XCTAssert("\(r.status)".contains("no upscale-only path"), "\(r.status)")
+        XCTAssertFalse(r.recipe.restored)
+    }
+
+    /// With Enhance off, each frame of a clip takes the upscale alone.
+    func testClipWithEnhanceOffUpscalesEachFrameAlone() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("clip.mp4")
+        try writeClip(to: src, w: 64, h: 48, frames: 6, audio: false)
+        let enhancer = UpscaleOnlyEnhancer()
+        var result: OptimizeResult?
+        for await r in try ForgeOptimizer(enhancer: enhancer, flowProvider: ZeroFlowProvider())
+            .optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
+                      Options(quality: .aggressive, upscale: .x2, upscaleTier: .instant)) {
+            result = r
+        }
+        let r = try XCTUnwrap(result)
+        guard case .file = r.output else { return XCTFail("expected a delivered clip, got \(r.status)") }
+        XCTAssertEqual(enhancer.enhances.count, 0, "no frame took the restore path")
+        XCTAssertGreaterThan(enhancer.upscales.count, 0)
+        XCTAssertEqual(r.recipe.upscaleTier, .instant)
+        XCTAssertEqual(r.after.width, 128)
     }
 
     func testReasonsNameInstantAmongTheTiersOnOffer() {

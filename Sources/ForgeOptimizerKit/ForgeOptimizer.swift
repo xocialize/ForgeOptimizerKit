@@ -616,6 +616,20 @@ public struct ForgeOptimizer: Sendable {
             recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
             recipe.setUpscaleBacker(reportedTier: outcome.upscaleTier, reportedModel: outcome.upscaleModel,
                                     reportedRoute: outcome.upscaleRoute, options: options)
+        } else if options.upscale != .none, let enhancer {
+            // Enhance off, an upscale asked: the upscale alone, through the enhancer's upscale-only path — no restore
+            // (0.26.0, AB-T-0294). Before, this request was dropped without a word. An enhancer with no upscale-only
+            // path refuses by the protocol default, and the item fails with that reason.
+            try await Self.requireUpscaleTier(options, of: enhancer)
+            let widthBefore = cg.width
+            let outcome = try await MediaMetrics.time("kit.upscale", lane: "gpu",
+                                                      attrs: ["w": "\(cg.width)", "h": "\(cg.height)"]) {
+                try await enhancer.upscaleReporting(cg, factor: options.upscale, tier: options.upscaleTier)
+            }
+            cg = outcome.image
+            recipe.setUpscale(measuredFrom: widthBefore, to: cg.width, requested: options.upscale)
+            recipe.setUpscaleBacker(reportedTier: outcome.upscaleTier, reportedModel: outcome.upscaleModel,
+                                    reportedRoute: outcome.upscaleRoute, options: options)
         }
 
         // A host-dictated URL that NAMES a still format pins it — the host baked the path
@@ -1650,7 +1664,10 @@ public struct ForgeOptimizer: Sendable {
         let outcome = try await VideoConsistencyPipeline.enhanceToVideo(
             input: url, output: frames,
             enhance: {
-                let frame = try await enhancer.enhanceReporting($0, options: options)
+                // Enhance decides the restore, as for a still (0.26.0): off → each frame takes the upscale alone.
+                let frame = options.enhance != .off
+                    ? try await enhancer.enhanceReporting($0, options: options)
+                    : try await enhancer.upscaleReporting($0, factor: options.upscale, tier: options.upscaleTier)
                 backers.note(frame)
                 return frame.image
             },

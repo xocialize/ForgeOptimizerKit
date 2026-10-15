@@ -35,6 +35,8 @@ public protocol ImageEnhancer: Sendable {
     /// Upscale `image` by `factor` on `tier`'s backer and nothing else — no restore — reporting what
     /// ran as `enhanceReporting` does. `conform(_:to:quality:)` calls this: a conform is resize glue
     /// between pipeline stages, and a restore inside it would change the content the next stage gets.
+    /// `optimize` calls it too when an upscale is asked with `Options.enhance == .off` (0.26.0): Enhance
+    /// decides the restore, the factor decides the upscale, for a still and for each frame of a clip.
     /// The Kit asks `availability(of:)` first, and never passes `.none` or a video-only tier.
     ///
     /// Default: throws `ForgeError.upscaleTierUnavailable`. An enhancer that predates this method has
@@ -50,7 +52,8 @@ public extension ImageEnhancer {
 
     func upscaleReporting(_ image: CGImage, factor: UpscaleFactor, tier: UpscaleTier) async throws -> EnhanceOutcome {
         throw ForgeError.upscaleTierUnavailable(
-            tier, "this enhancer has no upscale-only path (it restores before it upscales), so it cannot serve a conform")
+            tier, "this enhancer has no upscale-only path (it restores before it upscales), so it cannot upscale without "
+                + "a restore — a conform, or an upscale with Enhance off")
     }
 
     func availability(of tier: UpscaleTier) async -> UpscaleTierAvailability {

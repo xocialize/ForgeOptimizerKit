@@ -244,6 +244,12 @@ enhancer does not report. An enhancer that predates tiers offers `.fast` only. O
 frame (SEA-RAFT-stabilized when a `VideoFlowProvider` is attached), and the source's audio is muxed back into the
 upscaled clip — the same step the Live action route below uses (before 0.20.1 this route shipped silent).
 
+**Enhance decides the restore; the factor decides the upscale** (0.26.0). With `Options.enhance == .off`, an upscale
+runs alone through `ImageEnhancer.upscaleReporting`, for a still and for each frame of a clip, and the recipe records no
+restore. With Enhance on, the enhancer restores and then upscales, as before. Before 0.26.0 a still's upscale with
+Enhance off was dropped without a word, and a clip's frames were restored whatever Enhance said. An enhancer with no
+upscale-only path refuses an Enhance-off upscale by the protocol default, and the item fails with that reason.
+
 `conform(_:to:quality: .quality(tier))` runs the same tiers for a conform's **upscale part only**, through
 `ImageEnhancer.upscaleReporting` — upscale-only, because a conform is resize glue and a restore would change the
 content the next stage receives. The model runs ×2 when the spec needs at most twice the source in both axes, ×4 up

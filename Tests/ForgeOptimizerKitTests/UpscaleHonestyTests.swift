@@ -117,7 +117,7 @@ final class UpscaleHonestyTests: XCTestCase {
         let src = dir.appendingPathComponent("clip.mp4")
         try writeGradientClip(to: src, w: 64, h: 48, frames: 4)
         let forge = ForgeOptimizer(enhancer: FixedScaleEnhancer(factor: 4), flowProvider: ZeroFlowProvider())
-        let ask = Options(quality: .aggressive, upscale: .x2)
+        let ask = Options(quality: .aggressive, enhance: .on, upscale: .x2)
 
         for profile in ["native", "web"] {
             let out = dir.appendingPathComponent(profile)
@@ -148,7 +148,7 @@ final class UpscaleHonestyTests: XCTestCase {
         let src = dir.appendingPathComponent("clip.mp4")
         try writeClip(to: src, w: 64, h: 48, frames: 15, audio: true)
         let forge = ForgeOptimizer(enhancer: TieredEnhancer(), flowProvider: ZeroFlowProvider())
-        let ask = Options(quality: .aggressive, upscale: .x2)
+        let ask = Options(quality: .aggressive, enhance: .on, upscale: .x2)
 
         for profile in ["native", "web"] {
             let out = dir.appendingPathComponent(profile)
@@ -367,7 +367,7 @@ final class UpscaleHonestyTests: XCTestCase {
         let src = dir.appendingPathComponent("clip.mp4")
         try writeGradientClip(to: src, w: 64, h: 48, frames: 4)
         let forge = ForgeOptimizer(enhancer: TieredEnhancer(), flowProvider: ZeroFlowProvider())
-        let ask = Options(quality: .aggressive, upscale: .x2, upscaleTier: .best)
+        let ask = Options(quality: .aggressive, enhance: .on, upscale: .x2, upscaleTier: .best)
 
         for profile in ["native", "web"] {
             let out = dir.appendingPathComponent(profile)
@@ -392,7 +392,7 @@ final class UpscaleHonestyTests: XCTestCase {
         let forge = ForgeOptimizer(enhancer: AlternatingModelEnhancer(), flowProvider: ZeroFlowProvider())
         var result: OptimizeResult?
         for await r in try forge.optimize(.url(src), to: .directory(dir.appendingPathComponent("out")),
-                                          Options(quality: .aggressive, upscale: .x2)) { result = r }
+                                          Options(quality: .aggressive, enhance: .on, upscale: .x2)) { result = r }
         let r = try XCTUnwrap(result)
         XCTAssertEqual(r.recipe.upscaleTier, .fast, "every frame reported fast")
         XCTAssertEqual(r.recipe.upscaleModel, "ModelA+ModelB", "two backers ran, so the receipt names both")
