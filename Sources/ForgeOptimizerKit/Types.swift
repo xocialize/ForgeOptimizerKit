@@ -188,6 +188,24 @@ public enum OutputFormat: Sendable { case auto, heic, jpeg, png, webp, hevc }
 /// the guarantee, and the receipt names whichever codec kept it. A `.webp` **pin** never does this.
 public enum WebLossyCodec: Sendable { case auto, webp, jpeg }
 
+/// Which lossless candidates the web still race runs — the leg that keeps a still exact when no lossy
+/// encode beats it (flat graphics, slides, UI captures, transparency).
+///
+/// `.png` keeps PNG as the only lossless candidate — byte-for-byte the race every release before this
+/// one ran. `.smallest` adds **lossless WebP** (VP8L) beside PNG whenever the race's lossy lane is
+/// WebP and the registered encoder `supportsLossless`: both are exact, so there is no floor search —
+/// both are encoded (concurrently), both round-trips are measured, and the smaller ships. The receipt's
+/// `codec` names the winner: `"PNG"` or `"WebP-lossless"`, never the bare `"WebP"` the lossy lane
+/// writes, so a consumer mirroring the race can tell the two WebP modes apart.
+///
+/// Lossless WebP only races where it can be exact: an 8-bit sRGB (or untagged) source. A wider-gamut or
+/// deeper-than-8-bit still keeps PNG, which holds its pixels and profile as they are. It never runs where
+/// the lossy lane is JPEG — a caller who chose JPEG chose a destination where WebP does not play — nor
+/// under a `.png` or `.jpeg` pin. Under a `.webp` pin it lets the pinned format keep the guarantee: the
+/// smaller of the lossy WebP and the lossless one ships, and a lossy search that missed the floor ships
+/// the lossless WebP instead of a WebP below the floor.
+public enum WebLosslessCodec: Sendable { case png, smallest }
+
 /// How hard `analyze` verifies file integrity. `.structural` (the default) runs millisecond byte
 /// walks — box chains, PNG CRCs, JPEG EOI, EBML sizes — safe on every ingest; `.deep` adds a full
 /// decode-to-EOF pass (costs a decode of the whole file) for incident triage and must-validate
@@ -281,6 +299,19 @@ public struct Options: Sendable {
     /// `optimize`, whose native deliverable is HEIC, or on video.
     public var webLossy: WebLossyCodec
 
+    /// The web race's lossless leg (see `WebLosslessCodec`). `Options.defaultWebLossless` by default;
+    /// no effect under `optimize`, or on video.
+    public var webLossless: WebLosslessCodec
+
+    /// The lossless leg a default `Options` races: `.smallest`. Gated before it became the default
+    /// (≥ 20 % fewer bytes than PNG at ≤ 300 ms per 1080p frame, effort tuned) and measured on the
+    /// ten-still signage corpus with webp-swift's registered default (`.webRace`, lossless method 1):
+    /// −29 % to −40 % under PNG on 10/10, a 205–278 ms encode, and 0.18–0.25 s more wall per item
+    /// (the candidate is encoded even when the lossy lane wins). At the max preset (floor 90) the race
+    /// then ships lossless WebP on 10/10 stills, 14–33 % under the JPEG/PNG it shipped before.
+    /// Register webp-swift's `.chrome` settings instead and the lossless encode is ~2× slower.
+    public static let defaultWebLossless: WebLosslessCodec = .smallest
+
     public init(quality: QualityTarget = .balanced, resolution: ResolutionTarget = .source,
                 enhance: EnhancePolicy = .off, upscale: UpscaleFactor = .none,
                 upscaleTier: UpscaleTier = .fast,
@@ -289,7 +320,9 @@ public struct Options: Sendable {
                 contentClass: ContentClassifier.ContentClass? = nil,
                 cameraGate: CameraGate = .auto,
                 secondary: SecondaryRendition? = nil,
-                webLossy: WebLossyCodec = .auto) {
+                webLossy: WebLossyCodec = .auto,
+                webLossless: WebLosslessCodec = Options.defaultWebLossless) {
+        self.webLossless = webLossless
         self.contentClass = contentClass
         self.cameraGate = cameraGate
         self.secondary = secondary

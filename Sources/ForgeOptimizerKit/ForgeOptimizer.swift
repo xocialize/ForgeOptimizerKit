@@ -722,13 +722,29 @@ public struct ForgeOptimizer: Sendable {
             // construction. No content classifier to mis-tune; the outcome decides.
             // An explicit `Options.output` pin folds in exactly like a host-pinned URL: it benches
             // the other lane rather than changing the mechanics (`pin` resolves both, above).
-            let png = try await ImageQualityTarget.encodePNG(cg, channelScalars: scalars)
             // Gate on TRUE transparency, not channel presence: opaque-RGBA is everywhere in
             // consumer content (screenshots, decoded video frames, editor exports), and treating
             // the mere existence of an alpha channel as transparency silently benched the JPEG
             // race on exactly the photos it exists for (a real 6 MP frame shipped 2.3 MB PNG
             // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
             let lane = try Self.webLossyLane(pin: pin, preference: options.webLossy)
+            // The lossless leg: PNG always; lossless WebP beside it when `Options.webLossless` asks
+            // and the lane is WebP (AB-T-0142). Both are exact, so neither searches — the two
+            // encodes run concurrently and the smaller exact one is the leg's candidate.
+            let losslessWebP = Self.webPLosslessEncoder(lane: lane, preference: options.webLossless,
+                                                       image: cg)
+            let pixels = cg
+            async let pngResult = ImageQualityTarget.encodePNG(pixels, channelScalars: scalars)
+            async let webpLosslessResult = Self.encodeWebPLossless(pixels, encoder: losslessWebP,
+                                                                   scalars: scalars)
+            let png = try await pngResult
+            let webpLossless = try await webpLosslessResult
+            let losslessIsWebP = webpLossless.map {
+                Self.losslessWebPWins(webpBytes: $0.data.count, webpScore: $0.score,
+                                      pngBytes: png.data.count, pngScore: png.score,
+                                      pinnedWebP: pin == .webp)
+            } ?? false
+            let lossless = losslessIsWebP ? webpLossless! : png
             let transparent = Self.hasRealTransparency(cg)
             var lossy: ImageQualityTarget.Result?
             var lossyFormat: StillFormat?
@@ -753,13 +769,23 @@ public struct ForgeOptimizer: Sendable {
                                                                    channelScalars: scalars)
                 if jpeg.metTarget { lossy = jpeg; lossyFormat = .jpeg }
             }
+            // A `.webp` pin is honoured by either WebP mode: when the lossless leg is a WebP, the pin
+            // no longer forces the lossy encode — the smaller WebP that keeps the guarantee ships,
+            // and a lossy search that missed the floor yields to the exact one.
+            let pinHonouredByLossless = pin == .webp && losslessIsWebP
             if let lossy, let lossyFormat,
-               pin == lossyFormat || (lossy.metTarget && lossy.data.count < png.data.count) {
+               (pin == lossyFormat && !pinHonouredByLossless)
+                || (lossy.metTarget && lossy.data.count < lossless.data.count) {
                 data = lossy.data; score = lossy.score
                 recipe.codec = lossyFormat == .webp ? "WebP" : "JPEG"
                 recipe.qualityFloor = options.quality.floor
                 outExt = lossyFormat == .webp ? "webp" : "jpg"
                 outType = lossyFormat == .webp ? .webP : .jpeg
+            } else if losslessIsWebP {
+                data = lossless.data; score = lossless.score
+                recipe.codec = Self.webPLosslessCodecName
+                recipe.qualityFloor = nil                       // exact: no floor to carry
+                outExt = "webp"; outType = .webP
             } else {
                 data = png.data; score = png.score
                 recipe.codec = "PNG"
@@ -996,6 +1022,56 @@ public struct ForgeOptimizer: Sendable {
                                                    channelScalars: scalars) { cg, knob in
             try encoder.encode(cg, quality: knob)
         }
+    }
+
+    /// The receipt's `codec` for a lossless WebP deliverable — distinct from the lossy lane's `"WebP"`,
+    /// which shares the `image/webp` mime, so a consumer mirroring the race can match the mode exactly.
+    static let webPLosslessCodecName = "WebP-lossless"
+
+    /// How far below PNG's measured round-trip a lossless WebP may score and still count as exact.
+    /// Both are bit-exact on an 8-bit sRGB source and score the same; the tolerance absorbs only the
+    /// straight-alpha rounding libwebp's import needs under low alpha, never a colour conversion.
+    static let webPLosslessScoreTolerance = 0.01
+
+    /// The encoder for the race's lossless WebP candidate, or nil when it does not race: the caller
+    /// keeps `.png`, the lossy lane is not WebP (JPEG chosen, or a `.png`/`.jpeg` pin), no registered
+    /// encoder supports lossless, or the source cannot round-trip exactly through an 8-bit sRGB
+    /// bitstream.
+    static func webPLosslessEncoder(lane: StillFormat?, preference: WebLosslessCodec,
+                                    image: CGImage) -> (@Sendable (CGImage) throws -> Data)? {
+        guard preference == .smallest, lane == .webp,
+              let encoder = MediaBridge.externalStillEncoder(for: .webp), encoder.supportsLossless,
+              webPLosslessCanBeExact(image) else { return nil }
+        return { try encoder.encodeLossless($0) }
+    }
+
+    /// WebP's bitstream is 8-bit and carries no ICC profile (the encoder delivers sRGB), so only an
+    /// 8-bit RGB source that already is sRGB — or carries no profile at all — survives it exactly.
+    /// Everything else keeps PNG rather than racing a candidate that would lose the pixels it was
+    /// asked to keep.
+    static func webPLosslessCanBeExact(_ image: CGImage) -> Bool {
+        guard image.bitsPerComponent == 8 else { return false }
+        guard let space = image.colorSpace else { return true }
+        guard space.model == .rgb else { return false }
+        guard let name = space.name as String? else { return false }
+        return name == (CGColorSpace.sRGB as String)
+    }
+
+    /// Whether the lossless WebP candidate takes the lossless leg: its measured round-trip must be as
+    /// exact as PNG's, and — unless a `.webp` pin rules PNG out — it must be strictly smaller (a tie
+    /// keeps PNG, the race every earlier release ran).
+    static func losslessWebPWins(webpBytes: Int, webpScore: Double, pngBytes: Int, pngScore: Double,
+                                 pinnedWebP: Bool) -> Bool {
+        guard webpScore >= pngScore - webPLosslessScoreTolerance else { return false }
+        return pinnedWebP || webpBytes < pngBytes
+    }
+
+    /// The lossless WebP candidate's encode and measured round-trip, nil when `encoder` is nil.
+    static func encodeWebPLossless(_ image: CGImage, encoder: (@Sendable (CGImage) throws -> Data)?,
+                                   scalars: SSIMULACRA2.ChannelScalars?) async throws -> ImageQualityTarget.LosslessResult? {
+        guard let encoder else { return nil }
+        return try await ImageQualityTarget.encodeLossless(image, codec: "webp-lossless",
+                                                           channelScalars: scalars, encoder: encoder)
     }
 
     /// The still format an explicit `Options.output` names — nil for `.auto` (and `.hevc`, which

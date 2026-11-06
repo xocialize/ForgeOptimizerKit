@@ -62,6 +62,14 @@ provenance, measured-not-requested transforms, and honest skips with sizes
   `Options(webLossy: .jpeg)` / `--web-lossy jpeg` keeps JPEG on purpose (email, Office);
   `.webp` / `--format webp` pins it and fails honestly without an encoder. WebP deliverables are
   metadata-clean (no ImageIO rewrap for WebP) and the receipt says so.
+- **Lossless WebP beside PNG** — with a WebP lane, the race's lossless leg encodes PNG *and* lossless
+  WebP (concurrently; both exact, so no search) and keeps the smaller, measured on the round-trip.
+  On the signage corpus lossless WebP is 29–40 % under PNG; at the max preset (floor 90) the race then
+  ships it on every still, 14–33 % under the JPEG/PNG it shipped before. The receipt's `codec` says
+  `WebP-lossless` — distinct from the lossy lane's `WebP` — and carries no floor. It runs only on 8-bit
+  sRGB (or untagged) sources, never on the JPEG lane or under a `.png`/`.jpeg` pin;
+  `Options(webLossless: .png)` keeps the PNG-only leg. It costs ~0.2 s per 1080p item, spent even
+  when the lossy lane wins.
 - **Animated GIF → mp4** — browser-convention timing (delays ≤ 10 ms play as 100 ms), floor-searched
   like any video. Single-frame GIFs are stills. **This is the one route that knowingly flattens
   transparency** — over white, the background a web GIF was authored against (a `<video>` has no
