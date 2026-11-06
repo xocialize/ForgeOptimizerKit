@@ -68,8 +68,9 @@ provenance, measured-not-requested transforms, and honest skips with sizes
   ships it on every still, 14–33 % under the JPEG/PNG it shipped before. The receipt's `codec` says
   `WebP-lossless` — distinct from the lossy lane's `WebP` — and carries no floor. It runs only on 8-bit
   sRGB (or untagged) sources, never on the JPEG lane or under a `.png`/`.jpeg` pin;
-  `Options(webLossless: .png)` keeps the PNG-only leg. It costs ~0.2 s per 1080p item, spent even
-  when the lossy lane wins.
+  `Options(webLossless: .png)` keeps the PNG-only leg. The lossless leg runs alongside the lossy
+  search (0.27.1), so a 1080p item spends no wall time on it when the lossy lane wins: ~0.2 s per
+  item faster than 0.27.0 on the signage corpus, deliverables byte-identical.
 - **Animated GIF → mp4** — browser-convention timing (delays ≤ 10 ms play as 100 ms), floor-searched
   like any video. Single-frame GIFs are stills. **This is the one route that knowingly flattens
   transparency** — over white, the background a web GIF was authored against (a `<video>` has no

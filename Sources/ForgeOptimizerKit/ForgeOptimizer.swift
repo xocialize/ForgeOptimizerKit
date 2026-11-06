@@ -729,46 +729,29 @@ public struct ForgeOptimizer: Sendable {
             // where JPEG@floor measured 0.5 MB — caught by the skip receipt, 2026-08-09).
             let lane = try Self.webLossyLane(pin: pin, preference: options.webLossy)
             // The lossless leg: PNG always; lossless WebP beside it when `Options.webLossless` asks
-            // and the lane is WebP (AB-T-0142). Both are exact, so neither searches — the two
-            // encodes run concurrently and the smaller exact one is the leg's candidate.
+            // and the lane is WebP (AB-T-0142). Both are exact, so neither searches — the smaller
+            // exact one is the leg's candidate. The lossy leg (below) needs nothing from it, so all
+            // three run at once (AB-T-0145): before 0.27.1 the lossy search waited for the lossless
+            // encodes, and every item paid their wall even when lossy won. Each leg's bytes are its
+            // own deterministic encode; only the decision, after both, reads them together.
             let losslessWebP = Self.webPLosslessEncoder(lane: lane, preference: options.webLossless,
                                                        image: cg)
             let pixels = cg
+            let transparent = Self.hasRealTransparency(cg)
             async let pngResult = ImageQualityTarget.encodePNG(pixels, channelScalars: scalars)
             async let webpLosslessResult = Self.encodeWebPLossless(pixels, encoder: losslessWebP,
                                                                    scalars: scalars)
+            async let lossyLeg = Self.webLossyLeg(pixels, lane: lane, floor: options.quality.floor,
+                                                  pin: pin, transparent: transparent, scalars: scalars)
             let png = try await pngResult
             let webpLossless = try await webpLosslessResult
+            let (lossy, lossyFormat) = try await lossyLeg
             let losslessIsWebP = webpLossless.map {
                 Self.losslessWebPWins(webpBytes: $0.data.count, webpScore: $0.score,
                                       pngBytes: png.data.count, pngScore: png.score,
                                       pinnedWebP: pin == .webp)
             } ?? false
             let lossless = losslessIsWebP ? webpLossless! : png
-            let transparent = Self.hasRealTransparency(cg)
-            var lossy: ImageQualityTarget.Result?
-            var lossyFormat: StillFormat?
-            switch lane {
-            case .webp:
-                lossy = try await Self.encodeWebP(cg, floor: options.quality.floor, scalars: scalars)
-                lossyFormat = .webp
-            case .jpeg where !transparent:
-                lossy = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
-                                                                channelScalars: scalars)
-                lossyFormat = .jpeg
-            default:
-                break                       // benched to PNG: a .png pin, or JPEG facing transparency
-            }
-            // WebP lossy is 4:2:0 only, and SSIMULACRA2 scores chroma: at a high floor (the max
-            // preset's 90) its search can miss on photos where JPEG — 4:4:4 at high quality — does
-            // not (measured 2026-09-18: 6/10 corpus photos at floor 90). The promise is the smallest
-            // file that keeps the guarantee, so an unpinned WebP lane that missed tries JPEG before
-            // the race settles for lossless PNG. Transparency stays on WebP/PNG: JPEG has no alpha.
-            if lossyFormat == .webp, let webp = lossy, !webp.metTarget, pin == nil, !transparent {
-                let jpeg = try await ImageQualityTarget.encodeJPEG(cg, targetScore: options.quality.floor,
-                                                                   channelScalars: scalars)
-                if jpeg.metTarget { lossy = jpeg; lossyFormat = .jpeg }
-            }
             // A `.webp` pin is honoured by either WebP mode: when the lossless leg is a WebP, the pin
             // no longer forces the lossy encode — the smaller WebP that keeps the guarantee ships,
             // and a lossy search that missed the floor yields to the exact one.
@@ -1022,6 +1005,37 @@ public struct ForgeOptimizer: Sendable {
                                                    channelScalars: scalars) { cg, knob in
             try encoder.encode(cg, quality: knob)
         }
+    }
+
+    /// The web race's lossy leg: the floor search of `lane` (nil when benched to PNG — a `.png` pin, or
+    /// JPEG facing transparency), and for an unpinned WebP search that missed its floor on opaque
+    /// pixels, the JPEG hand-over. Independent of the lossless leg, so the race runs it concurrently
+    /// with PNG and lossless WebP (AB-T-0145); the race decides between them only after both finish.
+    static func webLossyLeg(_ image: CGImage, lane: StillFormat?, floor: Double, pin: StillFormat?,
+                            transparent: Bool, scalars: SSIMULACRA2.ChannelScalars?)
+        async throws -> (ImageQualityTarget.Result?, StillFormat?) {
+        var lossy: ImageQualityTarget.Result?
+        var lossyFormat: StillFormat?
+        switch lane {
+        case .webp?:
+            lossy = try await encodeWebP(image, floor: floor, scalars: scalars)
+            lossyFormat = .webp
+        case .jpeg? where !transparent:
+            lossy = try await ImageQualityTarget.encodeJPEG(image, targetScore: floor, channelScalars: scalars)
+            lossyFormat = .jpeg
+        default:
+            break                       // benched to PNG: a .png pin, or JPEG facing transparency
+        }
+        // WebP lossy is 4:2:0 only, and SSIMULACRA2 scores chroma: at a high floor (the max
+        // preset's 90) its search can miss on photos where JPEG — 4:4:4 at high quality — does
+        // not (measured 2026-09-18: 6/10 corpus photos at floor 90). The promise is the smallest
+        // file that keeps the guarantee, so an unpinned WebP lane that missed tries JPEG before
+        // the race settles for lossless PNG. Transparency stays on WebP/PNG: JPEG has no alpha.
+        if lossyFormat == .webp, let webp = lossy, !webp.metTarget, pin == nil, !transparent {
+            let jpeg = try await ImageQualityTarget.encodeJPEG(image, targetScore: floor, channelScalars: scalars)
+            if jpeg.metTarget { lossy = jpeg; lossyFormat = .jpeg }
+        }
+        return (lossy, lossyFormat)
     }
 
     /// The receipt's `codec` for a lossless WebP deliverable — distinct from the lossy lane's `"WebP"`,
